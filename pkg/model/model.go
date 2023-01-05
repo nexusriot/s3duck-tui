@@ -17,6 +17,7 @@ type FType int8
 const (
 	File FType = iota
 	Folder
+	Bucket
 )
 
 type Config struct {
@@ -34,11 +35,7 @@ type Object struct {
 }
 
 type Model struct {
-	Path    *string
-	Bucket  *string
 	Config  *Config
-	Objects []*Object
-	Current *s3.Object
 	Session *session.Session
 	Client  *s3.S3
 }
@@ -61,25 +58,20 @@ func NewModel(config *Config) *Model {
 	if err != nil {
 		log.Fatalf("failed to create a new aws session: %v", sess)
 	}
-	path := ""
 	m := Model{
-		Path:    &path,
-		Bucket:  nil,
 		Config:  config,
-		Objects: make([]*Object, 0),
-		Current: nil,
 		Session: sess,
 		Client:  s3.New(sess),
 	}
 	return &m
 }
 
-func (m *Model) List(path string) ([]*Object, error) {
+func (m *Model) List(path string, bucket *Object) ([]*Object, error) {
 	objs := make([]*Object, 0)
 	ctx := context.Background()
 	// list files under `blog` directory in `work-with-s3` bucket.
 	if err := m.Client.ListObjectsPagesWithContext(ctx, &s3.ListObjectsInput{
-		Bucket:    aws.String(*m.Bucket),
+		Bucket:    aws.String(*bucket.Key),
 		Prefix:    aws.String(path), // list files in the directory.
 		Delimiter: aws.String("/"),
 	}, func(o *s3.ListObjectsOutput, b bool) bool { // callback func to enable paging.
@@ -100,7 +92,6 @@ func (m *Model) List(path string) ([]*Object, error) {
 		}
 		for _, o := range o.Contents {
 			if *o.Key == path {
-				m.Current = o
 				continue
 			}
 			fields := strings.FieldsFunc(strings.TrimSpace(*o.Key), splitFunc)
@@ -121,6 +112,25 @@ func (m *Model) List(path string) ([]*Object, error) {
 		log.Fatalf("failed to list items in s3 directory: %v", err)
 	}
 	return objs, nil
+}
+
+func (m *Model) ListBuckets() ([]*Object, error) {
+	objs := make([]*Object, 0)
+	result, err := m.Client.ListBuckets(nil)
+	for _, b := range result.Buckets {
+		sv := aws.StringValue(b.Name)
+		td := aws.TimeValue(b.CreationDate)
+		ko := &Object{
+			&sv,
+			Bucket,
+			nil,
+			nil,
+			nil,
+			&td,
+		}
+		objs = append(objs, ko)
+	}
+	return objs, err
 }
 
 //func main() {
