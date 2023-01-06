@@ -1,0 +1,6 @@
+Package: s3duck-tui
+Version: _version_
+Architecture: amd64
+Maintainer: Vladislav Ananev <nexus.riot@gmail.com>
+Description: Simple TUI client for S3
+Installed-Size: 15330
