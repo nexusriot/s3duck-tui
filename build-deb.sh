@@ -17,7 +17,7 @@ bin_dir="$folder_name/usr/bin"
 mkdir -p $bin_dir
 go build -ldflags "-linkmode external -extldflags -static" -o s3duck-tui cmd/s3duck-tui/main.go
 
-cp s3duck-tui $bin_dir
+mv s3duck-tui $bin_dir
 sed -i "s/_version_/$version/g" $folder_name/DEBIAN/control
 
 cd build/ && dpkg-deb --build --root-owner-group $project
