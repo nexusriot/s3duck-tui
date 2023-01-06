@@ -30,11 +30,10 @@ func NewView() *View {
 		SetChangedFunc(func() {
 			app.Draw()
 		})
-	tv.SetBorder(true).SetTitle("Details")
-
+	tv.SetBorder(true)
 	main := tview.NewFlex()
-	main.AddItem(list, 0, 2, true)
-	main.AddItem(tv, 0, 3, false)
+	main.AddItem(list, 0, 3, true)
+	main.AddItem(tv, 0, 1, false)
 
 	pages := tview.NewPages().
 		AddPage("main", main, true, true)
@@ -50,7 +49,7 @@ func NewView() *View {
 	}
 
 	frame := tview.NewFrame(pages)
-	frame.AddText("[::b][↓,↑][::-] Down/Up [::b][Enter,l/u][::-] Lower/Upper [::b][c[][::-] Create [::b][d[][::-] Delete [::b][e[][::-] [::b][Ctrl+q][::-] Quit", false, tview.AlignCenter, tcell.ColorWhite)
+	frame.AddText("[::b][↓,↑][::-] Down/Up [::b][Enter/Backspace, u][::-] Lower/Upper [::b][Ctrl+q][::-] Quit", false, tview.AlignCenter, tcell.ColorWhite)
 
 	app.SetRoot(frame, true)
 
