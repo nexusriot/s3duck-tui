@@ -69,7 +69,11 @@ func (c *Controller) updateList() error {
 	}
 	c.view.List.SetTitle(title)
 	err := c.makeObjectMap()
-
+	if err != nil {
+		c.view.Pages.RemovePage("modal")
+		c.error(fmt.Sprintf("Failed to fetch"), err, true)
+		return err
+	}
 	keys := make([]string, 0, len(c.objs))
 	for _, k := range c.objs {
 		keys = append(keys, *k.Key)
@@ -217,4 +221,15 @@ func (c *Controller) Run() error {
 	c.updateList()
 	c.setInput()
 	return c.view.App.Run()
+}
+
+func (c *Controller) error(header string, err error, fatal bool) {
+	errMsg := c.view.NewErrorMessageQ(header, err.Error())
+	errMsg.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+		c.view.Pages.RemovePage("modal")
+		if fatal {
+			c.view.App.Stop()
+		}
+	})
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(errMsg, 8, 3), true, true)
 }

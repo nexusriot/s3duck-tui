@@ -64,3 +64,9 @@ func NewView() *View {
 
 	return &v
 }
+
+func (v *View) NewErrorMessageQ(header string, details string) *tview.Modal {
+	errorQ := tview.NewModal()
+	errorQ.SetText(header + ": " + details).SetBackgroundColor(tcell.ColorRed).AddButtons([]string{"ok"})
+	return errorQ
+}
