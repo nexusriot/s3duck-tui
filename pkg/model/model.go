@@ -67,6 +67,7 @@ func (m *Model) RefreshClient(bucket *string) {
 	conf := aws.NewConfig().
 		WithRegion(*region).
 		//WithEndpoint(endpoint).
+		// TODO: ???
 		WithS3ForcePathStyle(true)
 	sess, _ := session.NewSession(conf)
 	m.Session = sess

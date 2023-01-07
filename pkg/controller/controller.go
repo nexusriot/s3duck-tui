@@ -21,6 +21,7 @@ type Controller struct {
 	objs          map[string]*model.Object
 	currentPath   string
 	currentBucket *model.Object
+	position      map[string]int
 }
 
 func NewController(debug bool) *Controller {
@@ -33,6 +34,7 @@ func NewController(debug bool) *Controller {
 		view:        v,
 		model:       m,
 		currentPath: "",
+		position:    make(map[string]int),
 	}
 	return &controller
 }
@@ -80,10 +82,19 @@ func (c *Controller) updateList() error {
 			cur = strings.TrimSpace(cur)
 			if val, ok := c.objs[cur]; ok {
 				if val.Ot == model.Folder || val.Ot == model.Bucket {
+					if val.Ot == model.Folder {
+						c.position[c.currentPath] = c.view.List.GetCurrentItem()
+					}
 					c.Down(cur)
 				}
 			}
 		})
+	}
+	if c.currentBucket != nil {
+		if val, ok := c.position[c.currentPath]; ok {
+			c.view.List.SetCurrentItem(val)
+			delete(c.position, c.currentPath)
+		}
 	}
 	return err
 }

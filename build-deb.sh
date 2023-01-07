@@ -20,4 +20,4 @@ go build -ldflags "-linkmode external -extldflags -static" -o s3duck-tui cmd/s3d
 mv s3duck-tui $bin_dir
 sed -i "s/_version_/$version/g" $folder_name/DEBIAN/control
 
-cd build/ && dpkg-deb --build --root-owner-group $project
+cd build/ && dpkg-deb --build -Z gzip --root-owner-group $project
