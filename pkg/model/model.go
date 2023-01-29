@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path"
 	"path/filepath"
@@ -58,7 +59,7 @@ func NewModel() *Model {
 	//	WithS3ForcePathStyle(true)
 
 	opts := []optsFunc{
-		config.WithRegion("eu-central-1"),
+		//config.WithRegion("eu-central-1"),
 	}
 
 	cfg, err := config.LoadDefaultConfig(context.TODO(), opts...)
@@ -113,7 +114,6 @@ func (m *Model) ListObjects(key string, bucket *Object) []s3t.Object {
 
 		objects = append(objects, output.Contents...)
 	}
-
 	return objects
 }
 
@@ -240,6 +240,9 @@ func (m *Model) List(path string, bucket *Object) ([]*Object, error) {
 func (m *Model) ListBuckets() ([]*Object, error) {
 	objs := make([]*Object, 0)
 	result, err := m.Client.ListBuckets(context.TODO(), &s3.ListBucketsInput{})
+	if err != nil {
+		return nil, err
+	}
 	for _, b := range result.Buckets {
 		sv := aws.String(*b.Name)
 		td := aws.Time(*b.CreationDate)
@@ -255,4 +258,32 @@ func (m *Model) ListBuckets() ([]*Object, error) {
 		objs = append(objs, ko)
 	}
 	return objs, err
+}
+
+func (m *Model) Delete(key *string, bucket *Object) error {
+
+	var objectIds []s3t.ObjectIdentifier
+
+	if strings.HasSuffix(*key, "/") {
+		ks := m.ListObjects(*key, bucket)
+		for _, o := range ks {
+			objectIds = append(objectIds, s3t.ObjectIdentifier{Key: aws.String(*o.Key)})
+		}
+	} else {
+		objectIds = append(objectIds, s3t.ObjectIdentifier{Key: aws.String(*key)})
+	}
+	_, err := m.Client.DeleteObjects(context.TODO(), &s3.DeleteObjectsInput{
+		Bucket: aws.String(*bucket.Key),
+		Delete: &s3t.Delete{Objects: objectIds},
+	})
+	return err
+}
+
+func (m *Model) DeleteBucket(name *string) error {
+	_, err := m.Client.DeleteBucket(context.TODO(), &s3.DeleteBucketInput{
+		Bucket: aws.String(*name)})
+	if err != nil {
+		log.Printf("Couldn't delete bucket %v because of %v\n", *name, err)
+	}
+	return err
 }

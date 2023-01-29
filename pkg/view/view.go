@@ -7,7 +7,7 @@ import (
 	"github.com/rivo/tview"
 )
 
-const versionText = "S3Duck 🦆 TUI v.0.0.1 - PoC"
+const versionText = "S3Duck 🦆 TUI v.0.0.2 - PoC"
 
 // View ...
 type View struct {
@@ -63,7 +63,6 @@ func NewView() *View {
 		tv,
 		modal,
 	}
-
 	return &v
 }
 

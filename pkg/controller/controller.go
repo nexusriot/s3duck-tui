@@ -25,6 +25,7 @@ type Controller struct {
 	currentPath   string
 	currentBucket *model.Object
 	position      map[string]int
+	userHomeDir   string
 }
 
 func NewController(debug bool) *Controller {
@@ -37,8 +38,18 @@ func NewController(debug bool) *Controller {
 		model:       m,
 		currentPath: "",
 		position:    make(map[string]int),
+		userHomeDir: GetHomeDir(),
 	}
 	return &controller
+}
+
+func GetHomeDir() string {
+	homeDir, err := os.UserHomeDir()
+
+	if err != nil {
+		panic("can't get user homedir")
+	}
+	return homeDir
 }
 
 func (c *Controller) makeObjectMap() error {
@@ -48,6 +59,9 @@ func (c *Controller) makeObjectMap() error {
 
 	if c.currentBucket == nil {
 		list, err = c.model.ListBuckets()
+		if err != nil {
+			c.error("Failed to list buckets", err, true)
+		}
 	} else {
 		list, err = c.model.List(c.currentPath, c.currentBucket)
 	}
@@ -60,21 +74,57 @@ func (c *Controller) makeObjectMap() error {
 	c.objs = dirs
 	return nil
 }
-func (c *Controller) Download() error {
 
+func (c *Controller) getSelectedObjectName() string {
 	i := c.view.List.GetCurrentItem()
 	_, cur := c.view.List.GetItemText(i)
-	cur = strings.TrimSpace(cur)
+	return strings.TrimSpace(cur)
+}
+
+func (c *Controller) Delete() error {
+	if c.view.List.GetItemCount() == 0 {
+		return nil
+	}
+	cur := c.getSelectedObjectName()
+
+	if val, ok := c.objs[cur]; ok {
+		op := path.Join(c.currentPath, cur)
+
+		confirm := c.view.NewConfirm()
+		confirm.SetText(fmt.Sprintf("Do you want to delete to %s", op)).
+			SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+				c.view.Pages.RemovePage("confirm").SwitchToPage("main")
+
+				if buttonLabel == "OK" {
+					go func() {
+						var err error
+						if val.Ot == model.Bucket {
+							err = c.model.DeleteBucket(&cur)
+						} else {
+							if val.Ot == model.Folder {
+								op = op + "/"
+							}
+							err = c.model.Delete(&op, c.currentBucket)
+						}
+						if err != nil {
+							c.error(fmt.Sprintf("Failed to delete %s", cur), err, false)
+						}
+						c.updateList()
+					}()
+				}
+			})
+		c.view.Pages.AddAndSwitchToPage("confirm", confirm, true)
+	}
+	return nil
+}
+
+func (c *Controller) Download() error {
+
+	cur := c.getSelectedObjectName()
 	if val, ok := c.objs[cur]; ok {
 		if val.Ot == model.Folder || val.Ot == model.File {
 
-			homeDir, err := os.UserHomeDir()
-
-			if err != nil {
-				panic("can't get user homedir")
-			}
-
-			cwd := path.Join(homeDir, "Downloads")
+			cwd := path.Join(c.userHomeDir, "Downloads")
 			cwd = cwd + fmt.Sprintf("%c", filepath.Separator)
 			key := c.currentPath + cur
 			if val.Ot == model.Folder {
@@ -147,9 +197,9 @@ func (c *Controller) updateList() error {
 		suff = ""
 	} else {
 		title = fmt.Sprintf("(%s)/%s", *c.currentBucket.Key, c.currentPath)
-		suff = "[::b][d[][::-] Delete"
+		suff = "[::b][d[][::-]Download [::b] "
 	}
-	fText := fmt.Sprintf("[::b][↓,↑][::-] Down/Up [::b][Enter/Backspace, u][::-] Lower/Upper %s[::b][Ctrl+q][::-] Quit", suff)
+	fText := fmt.Sprintf("[::b][↓,↑][::-]Down/Up [::b][Enter/Backspace][::-]Lower/Upper %s[Del[][::-]Delete [::b][Ctrl+q][::-]Quit", suff)
 	c.view.SetFrameText(fText)
 	c.view.List.SetTitle(title)
 	err := c.makeObjectMap()
@@ -253,6 +303,9 @@ func (c *Controller) setInput() {
 		case tcell.KeyCtrlQ:
 			c.Stop()
 			return nil
+		case tcell.KeyDelete:
+			c.Delete()
+			return nil
 		case tcell.KeyBackspace2:
 			c.Up()
 			return nil
@@ -263,8 +316,6 @@ func (c *Controller) setInput() {
 		switch event.Key() {
 		case tcell.KeyRune:
 			switch event.Rune() {
-			case 'u':
-				c.Up()
 			case 'd':
 				c.Download()
 				return nil
