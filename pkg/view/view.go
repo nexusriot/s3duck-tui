@@ -1,9 +1,13 @@
 package view
 
 import (
+	"fmt"
+
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
+
+const versionText = "S3Duck 🦆 TUI v.0.0.1 - PoC"
 
 // View ...
 type View struct {
@@ -49,8 +53,6 @@ func NewView() *View {
 	}
 
 	frame := tview.NewFrame(pages)
-	frame.AddText("[::b][↓,↑][::-] Down/Up [::b][Enter/Backspace, u][::-] Lower/Upper [::b][Ctrl+q][::-] Quit", false, tview.AlignCenter, tcell.ColorWhite)
-
 	app.SetRoot(frame, true)
 
 	v := View{
@@ -69,4 +71,23 @@ func (v *View) NewErrorMessageQ(header string, details string) *tview.Modal {
 	errorQ := tview.NewModal()
 	errorQ.SetText(header + ": " + details).SetBackgroundColor(tcell.ColorRed).AddButtons([]string{"ok"})
 	return errorQ
+}
+
+func (v *View) SetFrameText(helpText string) {
+	v.Frame.Clear()
+	v.SetHeaderVersionText(versionText)
+	v.Frame.AddText(helpText, false, tview.AlignCenter, tcell.ColorWhite)
+}
+
+func (v *View) SetHeaderVersionText(versionText string) {
+	v.Frame.AddText(fmt.Sprintf(versionText), true, tview.AlignCenter, tcell.ColorGreen)
+}
+
+func (v *View) NewProgressMessage() *tview.Modal {
+	return tview.NewModal().
+		SetText("Downloading\n\n").AddButtons([]string{"Done"})
+}
+
+func (v *View) NewConfirm() *tview.Modal {
+	return tview.NewModal().AddButtons([]string{"OK", "Cancel"})
 }

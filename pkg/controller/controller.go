@@ -2,11 +2,14 @@ package controller
 
 import (
 	"fmt"
+	"os"
+	"path"
+	"path/filepath"
 	"sort"
 	"strings"
 
+	"github.com/dustin/go-humanize"
 	"github.com/gdamore/tcell/v2"
-	"github.com/rivo/tview"
 
 	"github.com/nexusriot/s3duck-tui/pkg/model"
 	u "github.com/nexusriot/s3duck-tui/pkg/utils"
@@ -25,9 +28,8 @@ type Controller struct {
 }
 
 func NewController(debug bool) *Controller {
-	m := model.NewModel(nil)
+	m := model.NewModel()
 	v := view.NewView()
-	v.Frame.AddText(fmt.Sprintf("S3Duck TUI v.0.0.1 - PoC"), true, tview.AlignCenter, tcell.ColorGreen)
 
 	controller := Controller{
 		debug:       debug,
@@ -58,15 +60,97 @@ func (c *Controller) makeObjectMap() error {
 	c.objs = dirs
 	return nil
 }
+func (c *Controller) Download() error {
+
+	i := c.view.List.GetCurrentItem()
+	_, cur := c.view.List.GetItemText(i)
+	cur = strings.TrimSpace(cur)
+	if val, ok := c.objs[cur]; ok {
+		if val.Ot == model.Folder || val.Ot == model.File {
+
+			homeDir, err := os.UserHomeDir()
+
+			if err != nil {
+				panic("can't get user homedir")
+			}
+
+			cwd := path.Join(homeDir, "Downloads")
+			cwd = cwd + fmt.Sprintf("%c", filepath.Separator)
+			key := c.currentPath + cur
+			if val.Ot == model.Folder {
+				key = key + "/"
+			}
+			totalSize := int64(0)
+			objects := c.model.ListObjects(key, c.currentBucket)
+
+			for _, o := range objects {
+				totalSize += o.Size
+			}
+			nos := len(objects)
+			progress := c.view.NewProgressMessage()
+
+			confirm := c.view.NewConfirm()
+			confirm.SetText(fmt.Sprintf("Do you want to download to %s\n%d object(s)\ntotal size %s",
+				cwd,
+				nos,
+				humanize.IBytes(uint64(totalSize)),
+			)).
+				SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+					c.view.Pages.RemovePage("confirm").SwitchToPage("main")
+
+					if buttonLabel == "OK" {
+						c.view.Pages.AddAndSwitchToPage("progress", progress, true)
+
+						go func() {
+							downloadedSize := int64(0)
+							title := "Downloading"
+
+							for i, object := range objects {
+								n, err := c.model.Download(object, c.currentPath, cwd, c.currentBucket.Key)
+
+								if err != nil {
+									c.view.Pages.RemovePage("progress").SwitchToPage("main")
+									c.error(fmt.Sprintf("Failed to download %s", *object.Key), err, false)
+								}
+								downloadedSize += n
+								if i+1 == nos {
+									title = "Downloaded"
+								}
+								c.view.App.QueueUpdateDraw(func() {
+									progress.SetText(fmt.Sprintf("%s\n%d/%d objects\n%s/%s",
+										title,
+										i+1,
+										nos,
+										humanize.IBytes(uint64(downloadedSize)),
+										humanize.IBytes(uint64(totalSize)),
+									))
+								})
+							}
+							progress.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+								c.view.Pages.RemovePage("progress").SwitchToPage("main")
+							})
+						}()
+					}
+				})
+			c.view.Pages.AddAndSwitchToPage("confirm", confirm, true)
+		}
+	}
+	return nil
+}
 
 func (c *Controller) updateList() error {
 	c.view.List.Clear()
 	var title string
+	var suff string
 	if c.currentBucket == nil {
 		title = "(buckets)"
+		suff = ""
 	} else {
 		title = fmt.Sprintf("(%s)/%s", *c.currentBucket.Key, c.currentPath)
+		suff = "[::b][d[][::-] Delete"
 	}
+	fText := fmt.Sprintf("[::b][↓,↑][::-] Down/Up [::b][Enter/Backspace, u][::-] Lower/Upper %s[::b][Ctrl+q][::-] Quit", suff)
+	c.view.SetFrameText(fText)
 	c.view.List.SetTitle(title)
 	err := c.makeObjectMap()
 	if err != nil {
@@ -75,10 +159,22 @@ func (c *Controller) updateList() error {
 		return err
 	}
 	keys := make([]string, 0, len(c.objs))
+	objs := make([]*model.Object, 0, len(c.objs))
+
 	for _, k := range c.objs {
-		keys = append(keys, *k.Key)
+		objs = append(objs, k)
 	}
-	sort.Strings(keys)
+	sort.Slice(objs, func(i, j int) bool {
+		if objs[i].Ot != objs[j].Ot {
+			return objs[i].Ot > objs[j].Ot
+		}
+		return *objs[i].Key < *objs[j].Key
+	})
+
+	for _, v := range objs {
+		keys = append(keys, *v.Key)
+
+	}
 	for _, key := range keys {
 		c.view.List.AddItem(key, key, 0, func() {
 			i := c.view.List.GetCurrentItem()
@@ -143,10 +239,8 @@ func (c *Controller) Up() {
 	if len(fields) > 1 {
 		newDir = newDir + "/"
 	}
-
 	c.currentPath = newDir
 	c.updateList()
-
 }
 
 func (c *Controller) Stop() {
@@ -163,7 +257,6 @@ func (c *Controller) setInput() {
 			c.Up()
 			return nil
 		}
-
 		return event
 	})
 	c.view.List.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
@@ -172,6 +265,8 @@ func (c *Controller) setInput() {
 			switch event.Rune() {
 			case 'u':
 				c.Up()
+			case 'd':
+				c.Download()
 				return nil
 			}
 		}
@@ -195,7 +290,7 @@ func (c *Controller) fillDetails(key string) {
 		}
 		fmt.Fprintf(c.view.Details, "[green] Type: [white] %v\n", otype)
 		if val.Ot == model.File {
-			fmt.Fprintf(c.view.Details, "[green] Size: [white] %d\n", val.Size)
+			fmt.Fprintf(c.view.Details, "[green] Size: [white] %s\n", humanize.IBytes(uint64(*val.Size)))
 		}
 		if val.LastModified != nil {
 			fmt.Fprintf(c.view.Details, "[green] Modified: [white] %v\n", val.LastModified)
