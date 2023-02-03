@@ -7,7 +7,7 @@ import (
 	"github.com/rivo/tview"
 )
 
-const versionText = "S3Duck 🦆 TUI v.0.0.2 - PoC"
+const versionText = "S3Duck 🦆 TUI v.0.0.3 - (PoC)"
 
 // View ...
 type View struct {
@@ -89,4 +89,31 @@ func (v *View) NewProgressMessage() *tview.Modal {
 
 func (v *View) NewConfirm() *tview.Modal {
 	return tview.NewModal().AddButtons([]string{"OK", "Cancel"})
+}
+
+func (v *View) NewCreateForm(header string) *tview.Form {
+	form := tview.NewForm()
+
+	form.SetTitle(header)
+	form.AddInputField("Name", "", 52, nil, nil)
+	form.AddInputField("Url", "", 52, nil, nil)
+	form.AddInputField("Region", "", 52, nil, nil)
+	form.AddInputField("Access key", "", 52, nil, nil)
+	form.AddPasswordField("Secret key", "", 52, '*', nil)
+	form.SetBorder(true)
+
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEsc:
+			v.Pages.RemovePage("modal")
+		}
+		return event
+	})
+	return form
+}
+
+func (v *View) NewSuccessMessageQ(header string) *tview.Modal {
+	successQ := tview.NewModal()
+	successQ.SetText(header).SetBackgroundColor(tcell.ColorLime).AddButtons([]string{"ok"})
+	return successQ
 }
