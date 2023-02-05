@@ -2,7 +2,6 @@ package controller
 
 import (
 	"fmt"
-	"github.com/nexusriot/s3duck-tui/pkg/view"
 	"github.com/rivo/tview"
 	"path"
 	"path/filepath"
@@ -15,6 +14,7 @@ import (
 	cfg "github.com/nexusriot/s3duck-tui/internal/config"
 	"github.com/nexusriot/s3duck-tui/pkg/model"
 	u "github.com/nexusriot/s3duck-tui/pkg/utils"
+	"github.com/nexusriot/s3duck-tui/pkg/view"
 )
 
 type Controller struct {
@@ -212,7 +212,7 @@ func (c *Controller) updateList() ([]string, error) {
 	err := c.makeObjectMap()
 	if err != nil {
 		c.view.Pages.RemovePage("modal")
-		c.error(fmt.Sprintf("Failed to fetch"), err, true)
+		c.error("Failed to fetch folder", err, false)
 		return nil, err
 	}
 	keys := make([]string, 0, len(c.objs))
@@ -314,6 +314,7 @@ func (c *Controller) CreateConfigEntry() {
 		reg := cForm.GetFormItem(2).(*tview.InputField).GetText()
 		accessKey := cForm.GetFormItem(3).(*tview.InputField).GetText()
 		secretKey := cForm.GetFormItem(4).(*tview.InputField).GetText()
+		ignoreSsl := cForm.GetFormItem(5).(*tview.Checkbox).IsChecked()
 
 		if reg != "" {
 			region = &reg
@@ -326,6 +327,7 @@ func (c *Controller) CreateConfigEntry() {
 			Region:    region,
 			AccessKey: accessKey,
 			SecretKey: secretKey,
+			IgnoreSsl: ignoreSsl,
 		}
 		err := c.params.NewConfiguration(&conf)
 
@@ -341,7 +343,7 @@ func (c *Controller) CreateConfigEntry() {
 		c.view.Pages.RemovePage("modal")
 	})
 
-	c.view.Pages.AddPage("modal", c.view.ModalEdit(cForm, 60, 15), true, true)
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(cForm, 60, 17), true, true)
 }
 
 func (c *Controller) EditConfigEntry() {
@@ -360,6 +362,7 @@ func (c *Controller) EditConfigEntry() {
 	}
 	cForm.GetFormItem(3).(*tview.InputField).SetText(entry.AccessKey)
 	cForm.GetFormItem(4).(*tview.InputField).SetText(entry.SecretKey)
+	cForm.GetFormItem(5).(*tview.Checkbox).SetChecked(entry.IgnoreSsl)
 
 	cForm.AddButton("Save", func() {
 		name := cForm.GetFormItem(0).(*tview.InputField).GetText()
@@ -367,6 +370,7 @@ func (c *Controller) EditConfigEntry() {
 		reg := cForm.GetFormItem(2).(*tview.InputField).GetText()
 		accessKey := cForm.GetFormItem(3).(*tview.InputField).GetText()
 		secretKey := cForm.GetFormItem(4).(*tview.InputField).GetText()
+		ignoreSsl := cForm.GetFormItem(5).(*tview.Checkbox).IsChecked()
 		var region *string
 		if reg != "" {
 			region = &reg
@@ -377,6 +381,7 @@ func (c *Controller) EditConfigEntry() {
 		entry.Region = region
 		entry.AccessKey = accessKey
 		entry.SecretKey = secretKey
+		entry.IgnoreSsl = ignoreSsl
 
 		c.params.WriteConfig()
 		c.view.Pages.RemovePage("modal")
@@ -387,7 +392,7 @@ func (c *Controller) EditConfigEntry() {
 		c.view.Pages.RemovePage("modal")
 	})
 
-	c.view.Pages.AddPage("modal", c.view.ModalEdit(cForm, 60, 15), true, true)
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(cForm, 60, 17), true, true)
 }
 
 func (c *Controller) CopyProfile() {
@@ -426,7 +431,7 @@ func (c *Controller) CheckProfile() {
 
 	cf := c.params.Config[i]
 
-	mCf := model.NewConfig(cf.BaseUrl, cf.Region, cf.AccessKey, cf.SecretKey)
+	mCf := model.NewConfig(cf.BaseUrl, cf.Region, cf.AccessKey, cf.SecretKey, !cf.IgnoreSsl)
 	c.model = model.NewModel(mCf)
 
 	_, err := c.model.ListBuckets()
@@ -548,6 +553,7 @@ func (c *Controller) fillConfigDetails(cur string) {
 		if item.Region != nil {
 			fmt.Fprintf(c.view.Details, "[blue] Region: [white] %s\n", *item.Region)
 		}
+		fmt.Fprintf(c.view.Details, "[blue] Ssl: [white] %v\n", !item.IgnoreSsl)
 	}
 }
 
@@ -566,7 +572,10 @@ func (c *Controller) fillConfigData() {
 		c.view.List.AddItem(cf.Name, cf.Name, 0, func() {
 			i := c.view.List.GetCurrentItem()
 			conf := c.params.Config[i]
-			_ = c.Duck(conf.BaseUrl, conf.Region, conf.AccessKey, conf.SecretKey)
+			err := c.Duck(conf.BaseUrl, conf.Region, conf.AccessKey, conf.SecretKey, !conf.IgnoreSsl)
+			if err != nil {
+				c.error("Failed to use profile", err, false)
+			}
 		})
 	}
 	c.view.SetFrameText("[::b][↓,↑][::-]Down/Up [::b][Enter[][::-]Use Profile [::b][n[][::-]Create [::b][c[][::-]Copy [::b][e[][::-]Edit [::b][v[][::-]Verify [::b][Del[][::-]Delete")
@@ -605,8 +614,8 @@ func (c *Controller) fillDetails(key string) {
 	}
 }
 
-func (c *Controller) Duck(url string, region *string, acc string, sec string) error {
-	mCf := model.NewConfig(url, region, acc, sec)
+func (c *Controller) Duck(url string, region *string, acc string, sec string, ssl bool) error {
+	mCf := model.NewConfig(url, region, acc, sec, ssl)
 	c.model = model.NewModel(mCf)
 	c.view.List.SetChangedFunc(func(i int, s string, s2 string, r rune) {
 		_, cur := c.view.List.GetItemText(i)

@@ -2,9 +2,11 @@ package model
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"log"
+	"net/http"
 	"os"
 	"path"
 	"path/filepath"
@@ -35,6 +37,7 @@ type Config struct {
 	Region    *string
 	AccessKey string
 	SecretKey string
+	SSl       bool
 }
 
 type Object struct {
@@ -61,12 +64,13 @@ func GetDownloader(client *s3.Client) *s3m.Downloader {
 	return d
 }
 
-func NewConfig(url string, region *string, accKey string, secKey string) Config {
+func NewConfig(url string, region *string, accKey string, secKey string, ssl bool) Config {
 	return Config{
 		url,
 		region,
 		accKey,
 		secKey,
+		ssl,
 	}
 }
 
@@ -79,7 +83,6 @@ func GetConfig(cf Config, update bool) (aws.Config, error) {
 
 		if cf.Region != nil {
 			endpoint = aws.Endpoint{
-				// TODO: check usage
 				//PartitionID:   "aws",
 				URL:               cf.Url,
 				SigningRegion:     *cf.Region,
@@ -87,7 +90,6 @@ func GetConfig(cf Config, update bool) (aws.Config, error) {
 			}
 		} else {
 			endpoint = aws.Endpoint{
-				// TODO: check usage
 				//PartitionID: "aws",
 				URL:               cf.Url,
 				HostnameImmutable: true,
@@ -101,23 +103,26 @@ func GetConfig(cf Config, update bool) (aws.Config, error) {
 		cf.SecretKey,
 		"",
 	)
-	//opts := []optsFunc{
-	//	config.WithEndpointResolverWithOptions(customResolver),
-	//	config.WithCredentialsProvider(staticProvider),
-	//}
 
 	var opts []optsFunc
 	// TODO: check usage
 	if update && strings.Contains(cf.Url, "amazon") {
 		opts = []optsFunc{
 			config.WithRegion(*cf.Region),
-			config.WithCredentialsProvider(staticProvider),
 		}
 	} else {
 		opts = []optsFunc{
 			config.WithEndpointResolverWithOptions(customResolver),
-			config.WithCredentialsProvider(staticProvider),
 		}
+	}
+
+	opts = append(opts, config.WithCredentialsProvider(staticProvider))
+	if !cf.SSl {
+		tr := &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+		client := &http.Client{Transport: tr}
+		opts = append(opts, config.WithHTTPClient(client))
 	}
 
 	cfg, err := config.LoadDefaultConfig(context.TODO(), opts...)

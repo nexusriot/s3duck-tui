@@ -28,6 +28,7 @@ type Config struct {
 	Region    *string `json:"region"`
 	AccessKey string  `json:"access_key"`
 	SecretKey string  `json:"secret_key"`
+	IgnoreSsl bool    `json:"ignore_ssl"`
 }
 
 func GetHomeDir() string {
@@ -38,15 +39,6 @@ func GetHomeDir() string {
 	}
 	return homeDir
 }
-
-//func (p *Params) ConfigExists(name string) (bool, *Config, int) {
-//	for i, cf := range p.Config {
-//		if cf.Name == name {
-//			return true, cf, i
-//		}
-//	}
-//	return false, nil, -1
-//}
 
 func (p *Params) WriteConfig() {
 
@@ -59,15 +51,10 @@ func (p *Params) WriteConfig() {
 }
 
 func (p *Params) NewConfiguration(config *Config) error {
-	//exists, _, _ := p.ConfigExists(config.Name)
 	if config.Name == "" {
 		return errors.New(fmt.Sprintf("empty name not allowed"))
 	}
-	//
-	//if exists {
-	//	return errors.New(fmt.Sprintf("profile with name %s exists", config.Name))
-	//}
-	//
+
 	p.Config = append(p.Config, config)
 	p.WriteConfig()
 	return nil

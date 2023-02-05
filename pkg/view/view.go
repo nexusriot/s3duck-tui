@@ -100,6 +100,8 @@ func (v *View) NewCreateForm(header string) *tview.Form {
 	form.AddInputField("Region", "", 52, nil, nil)
 	form.AddInputField("Access key", "", 52, nil, nil)
 	form.AddPasswordField("Secret key", "", 52, '*', nil)
+	form.AddCheckbox("Disable ssl check", false, func(checked bool) {
+	})
 	form.SetBorder(true)
 
 	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
