@@ -2,8 +2,11 @@ package model
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"log"
+	"net/http"
 	"os"
 	"path"
 	"path/filepath"
@@ -29,6 +32,14 @@ const (
 	Bucket
 )
 
+type Config struct {
+	Url       string
+	Region    *string
+	AccessKey string
+	SecretKey string
+	SSl       bool
+}
+
 type Object struct {
 	Key          *string
 	Ot           FType
@@ -43,6 +54,7 @@ type Model struct {
 	Config     *aws.Config
 	Client     *s3.Client
 	Downloader *s3m.Downloader
+	Cf         *Config
 }
 
 func GetDownloader(client *s3.Client) *s3m.Downloader {
@@ -52,20 +64,74 @@ func GetDownloader(client *s3.Client) *s3m.Downloader {
 	return d
 }
 
-func NewModel() *Model {
-	//conf := aws.NewConfig().
-	//	WithRegion("eu-central-1").
-	//	//WithEndpoint("http://127.0.0.1:4566").
-	//	WithS3ForcePathStyle(true)
+func NewConfig(url string, region *string, accKey string, secKey string, ssl bool) Config {
+	return Config{
+		url,
+		region,
+		accKey,
+		secKey,
+		ssl,
+	}
+}
 
-	opts := []optsFunc{
-		//config.WithRegion("eu-central-1"),
+// GetConfig  ...
+func GetConfig(cf Config, update bool) (aws.Config, error) {
+	customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
+		var endpoint aws.Endpoint
+
+		// TODO: optionally disable ssl
+
+		if cf.Region != nil {
+			endpoint = aws.Endpoint{
+				//PartitionID:   "aws",
+				URL:               cf.Url,
+				SigningRegion:     *cf.Region,
+				HostnameImmutable: true,
+			}
+		} else {
+			endpoint = aws.Endpoint{
+				//PartitionID: "aws",
+				URL:               cf.Url,
+				HostnameImmutable: true,
+			}
+		}
+		return endpoint, nil
+	})
+
+	staticProvider := credentials.NewStaticCredentialsProvider(
+		cf.AccessKey,
+		cf.SecretKey,
+		"",
+	)
+
+	var opts []optsFunc
+	// TODO: check usage
+	if update && strings.Contains(cf.Url, "amazon") {
+		opts = []optsFunc{
+			config.WithRegion(*cf.Region),
+		}
+	} else {
+		opts = []optsFunc{
+			config.WithEndpointResolverWithOptions(customResolver),
+		}
+	}
+
+	opts = append(opts, config.WithCredentialsProvider(staticProvider))
+	if !cf.SSl {
+		tr := &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}
+		client := &http.Client{Transport: tr}
+		opts = append(opts, config.WithHTTPClient(client))
 	}
 
 	cfg, err := config.LoadDefaultConfig(context.TODO(), opts...)
-	if err != nil {
-		panic(err)
-	}
+	return cfg, err
+}
+
+func NewModel(cf Config) *Model {
+
+	cfg, _ := GetConfig(cf, false)
 
 	client := s3.NewFromConfig(cfg)
 
@@ -73,26 +139,17 @@ func NewModel() *Model {
 		Config:     &cfg,
 		Client:     client,
 		Downloader: GetDownloader(client),
+		Cf:         &cf,
 	}
 	return &m
 }
 
 func (m *Model) RefreshClient(bucket *string) {
+
 	// TODO: handle err
 	region, _ := m.GetBucketLocation(bucket)
-	//endpoint := m.Client.ClientInfo.Endpoint
-	opts := []optsFunc{
-		config.WithRegion(*region),
-	}
-	cfg, err := config.LoadDefaultConfig(context.TODO(), opts...)
-	if err != nil {
-		panic(err)
-	}
-	//conf := aws.NewConfig().
-	//	WithRegion(*region).
-	//WithEndpoint(endpoint).
-	// TODO: ???
-	//WithS3ForcePathStyle(true)
+	m.Cf.Region = region
+	cfg, _ := GetConfig(*m.Cf, true)
 
 	m.Client = s3.NewFromConfig(cfg)
 	m.Downloader = GetDownloader(m.Client)
