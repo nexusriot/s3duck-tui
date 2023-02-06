@@ -25,6 +25,7 @@ type Controller struct {
 	objs          map[string]*model.Object
 	currentPath   string
 	currentBucket *model.Object
+	bucketPos     int
 	position      map[string]int
 	params        *cfg.Params
 }
@@ -39,6 +40,7 @@ func NewController(debug bool) *Controller {
 		view:        v,
 		model:       nil,
 		currentPath: "",
+		bucketPos:   0,
 		position:    make(map[string]int),
 		params:      params,
 	}
@@ -242,6 +244,9 @@ func (c *Controller) updateList() ([]string, error) {
 					if val.Ot == model.Folder {
 						c.position[c.currentPath] = c.view.List.GetCurrentItem()
 					}
+					if val.Ot == model.Bucket {
+						c.bucketPos = c.view.List.GetCurrentItem()
+					}
 					c.Down(cur)
 				}
 			}
@@ -290,6 +295,10 @@ func (c *Controller) Up() {
 	fields := strings.FieldsFunc(strings.TrimSpace(c.currentPath), u.SplitFunc)
 	if len(fields) == 0 {
 		c.updateList()
+		// TODO: do we really need this check?
+		if c.currentBucket == nil {
+			c.view.List.SetCurrentItem(c.bucketPos)
+		}
 		return
 	}
 	newDir := strings.Join(fields[:len(fields)-1], "/")
@@ -624,6 +633,7 @@ func (c *Controller) Duck(url string, region *string, acc string, sec string, ss
 	})
 	c.currentBucket = nil
 	c.currentPath = ""
+	c.bucketPos = 0
 	c.updateList()
 	c.setInput()
 	return nil

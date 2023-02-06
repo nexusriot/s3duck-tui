@@ -36,8 +36,8 @@ func NewView() *View {
 		})
 	tv.SetBorder(true)
 	main := tview.NewFlex()
-	main.AddItem(list, 0, 3, true)
-	main.AddItem(tv, 0, 1, false)
+	main.AddItem(list, 0, 5, true)
+	main.AddItem(tv, 0, 2, false)
 
 	pages := tview.NewPages().
 		AddPage("main", main, true, true)
