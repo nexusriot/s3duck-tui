@@ -208,7 +208,7 @@ func (c *Controller) updateList() ([]string, error) {
 		title = fmt.Sprintf("(%s)/%s", *c.currentBucket.Key, c.currentPath)
 		suff = "[::b][d[][::-]Download [::b] "
 	}
-	fText := fmt.Sprintf("[::b][↓,↑][::-]Down/Up [::b][Enter/Backspace][::-]Lower/Upper %s[Del[][::-]Delete [P[][::-]Profiles [::b][Ctrl+q][::-]Quit", suff)
+	fText := fmt.Sprintf("[::b][↓,↑][::-]Down/Up [::b][Enter/Backspace][::-]Lower/Upper %s[Del[][::-]Delete [c[][::-]Create [p[][::-]Profiles [::b][Ctrl+q][::-]Quit", suff)
 	c.view.SetFrameText(fText)
 	c.view.List.SetTitle(title)
 	err := c.makeObjectMap()
@@ -314,7 +314,7 @@ func (c *Controller) Stop() {
 }
 
 func (c *Controller) CreateConfigEntry() {
-	cForm := c.view.NewCreateForm("Create config entry")
+	cForm := c.view.NewCreateProfileForm("Create config entry")
 	cForm.AddButton("Save", func() {
 		var region *string
 
@@ -362,7 +362,7 @@ func (c *Controller) EditConfigEntry() {
 	i := c.view.List.GetCurrentItem()
 
 	entry := c.params.Config[i]
-	cForm := c.view.NewCreateForm("Edit config entry")
+	cForm := c.view.NewCreateProfileForm("Edit config entry")
 
 	cForm.GetFormItem(0).(*tview.InputField).SetText(entry.Name)
 	cForm.GetFormItem(1).(*tview.InputField).SetText(entry.BaseUrl)
@@ -430,6 +430,46 @@ func (c *Controller) CopyProfile() {
 			}
 		})
 	c.view.Pages.AddAndSwitchToPage("confirm", confirm, true)
+}
+
+func (c *Controller) create(isBucket bool) {
+	cForm := c.view.NewCreateForm("Create bucket")
+	cForm.AddButton("Save", func() {
+		var err error
+		name := cForm.GetFormItem(0).(*tview.InputField).GetText()
+
+		if isBucket {
+			err = c.model.CreateBucket(&name)
+		} else {
+			key := path.Join(c.currentPath, name)
+			err = c.model.CreateFolder(&key, c.currentBucket)
+		}
+		if err != nil {
+			c.view.Pages.RemovePage("modal")
+			c.error("Error creating object", err, false)
+			return
+		}
+
+		c.view.Pages.RemovePage("modal")
+		keys, err := c.updateList()
+
+		pos := getPosition(name, keys)
+		c.view.List.SetCurrentItem(pos)
+	})
+
+	cForm.AddButton("Quit", func() {
+		c.view.Pages.RemovePage("modal")
+	})
+
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(cForm, 60, 9), true, true)
+}
+
+func (c *Controller) Create() {
+	if c.currentBucket == nil {
+		c.create(true)
+		return
+	}
+	c.create(false)
 }
 
 func (c *Controller) CheckProfile() {
@@ -518,19 +558,22 @@ func (c *Controller) setInput() {
 		case tcell.KeyCtrlQ:
 			c.Stop()
 			return nil
+		}
+		return event
+	})
+	c.view.List.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
 		case tcell.KeyDelete:
 			c.Delete()
 			return nil
 		case tcell.KeyBackspace2:
 			c.Up()
 			return nil
-		}
-		return event
-	})
-	c.view.List.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		switch event.Key() {
 		case tcell.KeyRune:
 			switch event.Rune() {
+			case 'c':
+				c.Create()
+				return nil
 			case 'd':
 				c.Download()
 				return nil

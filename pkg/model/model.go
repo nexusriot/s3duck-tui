@@ -344,3 +344,19 @@ func (m *Model) DeleteBucket(name *string) error {
 	}
 	return err
 }
+
+func (m *Model) CreateBucket(name *string) error {
+	_, err := m.Client.CreateBucket(context.TODO(), &s3.CreateBucketInput{
+		Bucket: aws.String(*name),
+		ACL:    s3t.BucketCannedACLPrivate,
+	})
+	return err
+}
+
+func (m *Model) CreateFolder(name *string, bucket *Object) error {
+	_, err := m.Client.PutObject(context.TODO(), &s3.PutObjectInput{
+		Bucket: aws.String(*bucket.Key),
+		Key:    aws.String(*name),
+	})
+	return err
+}
