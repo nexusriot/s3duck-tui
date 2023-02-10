@@ -433,7 +433,13 @@ func (c *Controller) CopyProfile() {
 }
 
 func (c *Controller) create(isBucket bool) {
-	cForm := c.view.NewCreateForm("Create bucket")
+	var oTp string
+	if isBucket {
+		oTp = "bucket"
+	} else {
+		oTp = "folder"
+	}
+	cForm := c.view.NewCreateForm(fmt.Sprintf("Create %s", oTp))
 	cForm.AddButton("Save", func() {
 		var err error
 		name := cForm.GetFormItem(0).(*tview.InputField).GetText()
@@ -441,7 +447,7 @@ func (c *Controller) create(isBucket bool) {
 		if isBucket {
 			err = c.model.CreateBucket(&name)
 		} else {
-			key := path.Join(c.currentPath, name)
+			key := path.Join(c.currentPath, name) + "/"
 			err = c.model.CreateFolder(&key, c.currentBucket)
 		}
 		if err != nil {
@@ -461,7 +467,7 @@ func (c *Controller) create(isBucket bool) {
 		c.view.Pages.RemovePage("modal")
 	})
 
-	c.view.Pages.AddPage("modal", c.view.ModalEdit(cForm, 60, 9), true, true)
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(cForm, 60, 8), true, true)
 }
 
 func (c *Controller) Create() {
