@@ -3,6 +3,7 @@ package controller
 import (
 	"fmt"
 	"github.com/rivo/tview"
+	"os"
 	"path"
 	"path/filepath"
 	"sort"
@@ -586,7 +587,11 @@ func (c *Controller) setInput() {
 			case 'p':
 				c.Profiles()
 				return nil
+			case 'l':
+				c.ShowLocalFSModal(c.params.HomeDir) // or "."
+				return nil
 			}
+
 		}
 		return event
 	})
@@ -710,4 +715,74 @@ func (c *Controller) success(header string) {
 		c.view.Pages.RemovePage("modal")
 	})
 	c.view.Pages.AddPage("modal", c.view.ModalEdit(succMsg, 8, 3), true, true)
+}
+
+func (c *Controller) ShowLocalFSModal(startPath string) {
+	currentPath := startPath
+
+	// Step 1: Declare the list explicitly
+	var localList *tview.List
+	localList = tview.NewList().
+		ShowSecondaryText(false)
+
+	// Step 2: Define rendering logic
+	var renderList func(string)
+	renderList = func(curPath string) {
+		currentPath = curPath
+		localList.Clear()
+		localList.SetTitle(fmt.Sprintf("Local FS: %s", curPath))
+
+		entries, err := os.ReadDir(curPath)
+		if err != nil {
+			c.error("Failed to read directory", err, false)
+			return
+		}
+
+		sort.Slice(entries, func(i, j int) bool {
+			if entries[i].IsDir() != entries[j].IsDir() {
+				return entries[i].IsDir()
+			}
+			return entries[i].Name() < entries[j].Name()
+		})
+
+		for _, entry := range entries {
+			name := entry.Name()
+			fullPath := filepath.Join(curPath, name)
+			display := name
+			if entry.IsDir() {
+				display += "/"
+			}
+			localList.AddItem(display, "", 0, func(p string, isDir bool) func() {
+				return func() {
+					if isDir {
+						renderList(p)
+					} else {
+						c.success(fmt.Sprintf("Selected file: %s", p))
+						c.view.Pages.RemovePage("modal")
+					}
+				}
+			}(fullPath, entry.IsDir()))
+		}
+	}
+
+	// Step 3: Input handling
+	localList.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEsc:
+			c.view.Pages.RemovePage("modal")
+			return nil
+		case tcell.KeyBackspace2:
+			parent := filepath.Dir(currentPath)
+			renderList(parent)
+			return nil
+		}
+		return event
+	})
+
+	// ✅ Step 4: Wrap AFTERWARDS
+	modal := c.view.ModalEdit(localList, 60, 25)
+
+	// Step 5: Show
+	c.view.Pages.AddPage("modal", modal, true, true)
+	renderList(startPath)
 }
