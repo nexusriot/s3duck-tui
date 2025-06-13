@@ -211,7 +211,15 @@ func (c *Controller) Download() error {
 }
 
 func (c *Controller) updateList() ([]string, error) {
+	err := c.makeObjectMap()
+	if err != nil {
+		c.view.Pages.RemovePage("modal")
+		c.error(fmt.Sprintf("Failed to fetch folder"), err, false)
+		return nil, err
+	}
+
 	c.view.List.Clear()
+
 	var title string
 	var suff string
 	if c.currentBucket == nil {
@@ -221,15 +229,9 @@ func (c *Controller) updateList() ([]string, error) {
 		title = fmt.Sprintf("(%s)/%s", *c.currentBucket.Key, c.currentPath)
 		suff = "[::b][ctrl+d[][::-]Download [::b] "
 	}
-	fText := fmt.Sprintf("[::b][↓,↑][::-]Down/Up [::b][Enter/Backspace][::-]Lower/Upper %s[Del[][::-]Delete [ctrl+b[][::-]Create [p[][::-]Profiles [::b][Ctrl+q][::-]Quit", suff)
+	fText := fmt.Sprintf("[::b][↓,↑][::-]Down/Up [::b][Enter/Backspace][::-]Lower/Upper %s[Del[][::-]Delete [ctrl+b[][::-]Create [ctrl+p[][::-]Profiles [::b][Ctrl+q][::-]Quit", suff)
 	c.view.SetFrameText(fText)
 	c.view.List.SetTitle(title)
-	err := c.makeObjectMap()
-	if err != nil {
-		c.view.Pages.RemovePage("modal")
-		c.error("Failed to fetch folder", err, false)
-		return nil, err
-	}
 	keys := make([]string, 0, len(c.objs))
 	objs := make([]*model.Object, 0, len(c.objs))
 
@@ -365,7 +367,7 @@ func (c *Controller) CreateConfigEntry() {
 		c.view.Pages.RemovePage("modal")
 	})
 
-	c.view.Pages.AddPage("modal", c.view.ModalEdit(cForm, 60, 17), true, true)
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(cForm, 75, 17), true, true)
 }
 
 func (c *Controller) EditConfigEntry() {
@@ -414,7 +416,7 @@ func (c *Controller) EditConfigEntry() {
 		c.view.Pages.RemovePage("modal")
 	})
 
-	c.view.Pages.AddPage("modal", c.view.ModalEdit(cForm, 60, 17), true, true)
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(cForm, 75, 17), true, true)
 }
 
 func (c *Controller) CopyProfile() {
@@ -590,12 +592,11 @@ func (c *Controller) setInput() {
 		case tcell.KeyCtrlD:
 			c.Download()
 			return nil
+		case tcell.KeyCtrlP:
+			c.Profiles()
+			return nil
 		case tcell.KeyRune:
 			switch event.Rune() {
-
-			case 'p':
-				c.Profiles()
-				return nil
 			case 'l':
 				c.ShowLocalFSModal(c.params.HomeDir) // or "."
 				return nil
@@ -650,7 +651,7 @@ func (c *Controller) fillConfigData() {
 			}
 		})
 	}
-	c.view.SetFrameText("[::b][↓,↑][::-]Down/Up [::b][Enter[][::-]Use Profile [::b][n[][::-]Create [::b][c[][::-]Copy [::b][e[][::-]Edit [::b][v[][::-]Verify [::b][Del[][::-]Delete")
+	c.view.SetFrameText("[::b][↓,↑][::-]Down/Up [::b][Enter[][::-]Use Profile [::b][ctrl+b[][::-]Create [::b][ctrl+j[][::-]Copy [::b][ctrl+h[][::-]Edit [::b][ctrl+o[][::-]Verify [::b][Del[][::-]Delete")
 }
 
 func (c *Controller) fillDetails(key string) {

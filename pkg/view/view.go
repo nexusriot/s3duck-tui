@@ -105,7 +105,6 @@ func (v *View) NewCreateProfileForm(header string) *tview.Form {
 	form.AddCheckbox("Disable ssl check", false, func(checked bool) {
 	})
 	form.SetBorder(true)
-
 	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyEsc:

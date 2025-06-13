@@ -346,11 +346,25 @@ func (m *Model) DeleteBucket(name *string) error {
 }
 
 func (m *Model) CreateBucket(name *string) error {
-	_, err := m.Client.CreateBucket(context.TODO(), &s3.CreateBucketInput{
+	region := aws.ToString(m.Cf.Region)
+
+	input := &s3.CreateBucketInput{
 		Bucket: aws.String(*name),
 		ACL:    s3t.BucketCannedACLPrivate,
-	})
-	return err
+	}
+
+	// us-east-1 does NOT accept a LocationConstraint
+	if region != "" && region != "us-east-1" {
+		input.CreateBucketConfiguration = &s3t.CreateBucketConfiguration{
+			LocationConstraint: s3t.BucketLocationConstraint(region),
+		}
+	}
+
+	_, err := m.Client.CreateBucket(context.TODO(), input)
+	if err != nil {
+		return fmt.Errorf("failed to create bucket: %w", err)
+	}
+	return nil
 }
 
 func (m *Model) CreateFolder(name *string, bucket *Object) error {
