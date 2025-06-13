@@ -119,7 +119,7 @@ func (c *Controller) Delete() error {
 						if err != nil {
 							c.error(fmt.Sprintf("Failed to delete %s", cur), err, false)
 						}
-						c.updateList()
+						go c.updateList()
 					}()
 				}
 			})
@@ -214,27 +214,25 @@ func (c *Controller) updateList() ([]string, error) {
 	err := c.makeObjectMap()
 	if err != nil {
 		c.view.Pages.RemovePage("modal")
-		c.error(fmt.Sprintf("Failed to fetch folder"), err, false)
+		c.error("Failed to fetch folder", err, false)
 		return nil, err
 	}
 
-	c.view.List.Clear()
-
+	var keys []string
 	var title string
 	var suff string
+
 	if c.currentBucket == nil {
 		title = "(buckets)"
 		suff = ""
 	} else {
 		title = fmt.Sprintf("(%s)/%s", *c.currentBucket.Key, c.currentPath)
-		suff = "[::b][ctrl+d[][::-]Download [::b] "
+		suff = "[::b][ctrl+d[][::-]Download [::b][::b][ctrl+u[][::-]Upload [::b]"
 	}
-	fText := fmt.Sprintf("[::b][↓,↑][::-]Down/Up [::b][Enter/Backspace][::-]Lower/Upper %s[Del[][::-]Delete [ctrl+b[][::-]Create [ctrl+p[][::-]Profiles [::b][Ctrl+q][::-]Quit", suff)
-	c.view.SetFrameText(fText)
-	c.view.List.SetTitle(title)
-	keys := make([]string, 0, len(c.objs))
-	objs := make([]*model.Object, 0, len(c.objs))
 
+	fText := fmt.Sprintf("[::b][↓,↑][::-]Down/Up [::b][Enter/Backspace][::-]Lower/Upper %s[Del[][::-]Delete [ctrl+b[][::-]Create [ctrl+p[][::-]Profiles [::b][Ctrl+q][::-]Quit", suff)
+
+	objs := make([]*model.Object, 0, len(c.objs))
 	for _, k := range c.objs {
 		objs = append(objs, k)
 	}
@@ -245,35 +243,49 @@ func (c *Controller) updateList() ([]string, error) {
 		return *objs[i].Key < *objs[j].Key
 	})
 
+	// Extract keys
 	for _, v := range objs {
-		keys = append(keys, *v.Key)
-
-	}
-	for _, key := range keys {
-		c.view.List.AddItem(key, key, 0, func() {
-			i := c.view.List.GetCurrentItem()
-			_, cur := c.view.List.GetItemText(i)
-			cur = strings.TrimSpace(cur)
-			if val, ok := c.objs[cur]; ok {
-				if val.Ot == model.Folder || val.Ot == model.Bucket {
-					if val.Ot == model.Folder {
-						c.position[c.currentPath] = c.view.List.GetCurrentItem()
-					}
-					if val.Ot == model.Bucket {
-						c.bucketPos = c.view.List.GetCurrentItem()
-					}
-					c.Down(cur)
-				}
-			}
-		})
-	}
-	if c.currentBucket != nil {
-		if val, ok := c.position[c.currentPath]; ok {
-			c.view.List.SetCurrentItem(val)
-			delete(c.position, c.currentPath)
+		if v.Key != nil {
+			keys = append(keys, *v.Key)
 		}
 	}
-	return keys, err
+
+	// Queue UI update
+	c.view.App.QueueUpdateDraw(func() {
+		c.view.List.Clear()
+		c.view.List.SetTitle(title)
+		c.view.SetFrameText(fText)
+
+		for _, k := range keys {
+			key := k // capture local copy
+			c.view.List.AddItem(key, key, 0, func() {
+				i := c.view.List.GetCurrentItem()
+				_, cur := c.view.List.GetItemText(i)
+				cur = strings.TrimSpace(cur)
+				if val, ok := c.objs[cur]; ok {
+					if val.Ot == model.Folder || val.Ot == model.Bucket {
+						if val.Ot == model.Folder {
+							c.position[c.currentPath] = c.view.List.GetCurrentItem()
+						}
+						if val.Ot == model.Bucket {
+							c.bucketPos = c.view.List.GetCurrentItem()
+						}
+						c.Down(cur)
+					}
+				}
+			})
+		}
+
+		// Restore position if available
+		if c.currentBucket != nil {
+			if val, ok := c.position[c.currentPath]; ok {
+				c.view.List.SetCurrentItem(val)
+				delete(c.position, c.currentPath)
+			}
+		}
+	})
+
+	return keys, nil
 }
 
 func (c *Controller) findBucketByName(name string) *model.Object {
@@ -299,7 +311,7 @@ func (c *Controller) Down(name string) {
 		c.currentPath = newDir
 	}
 	c.view.Details.Clear()
-	c.updateList()
+	go c.updateList()
 }
 
 func (c *Controller) Up() {
@@ -309,7 +321,7 @@ func (c *Controller) Up() {
 	}
 	fields := strings.FieldsFunc(strings.TrimSpace(c.currentPath), u.SplitFunc)
 	if len(fields) == 0 {
-		c.updateList()
+		go c.updateList()
 		// TODO: do we really need this check?
 		if c.currentBucket == nil {
 			c.view.List.SetCurrentItem(c.bucketPos)
@@ -321,7 +333,7 @@ func (c *Controller) Up() {
 		newDir = newDir + "/"
 	}
 	c.currentPath = newDir
-	c.updateList()
+	go c.updateList()
 }
 
 func (c *Controller) Stop() {
@@ -363,7 +375,7 @@ func (c *Controller) CreateConfigEntry() {
 		c.view.List.SetCurrentItem(len(c.params.Config) - 1)
 	})
 
-	cForm.AddButton("Quit", func() {
+	cForm.AddButton("Cancel", func() {
 		c.view.Pages.RemovePage("modal")
 	})
 
@@ -412,7 +424,7 @@ func (c *Controller) EditConfigEntry() {
 		c.fillConfigData()
 		c.view.List.SetCurrentItem(i)
 	})
-	cForm.AddButton("Quit", func() {
+	cForm.AddButton("Cancel", func() {
 		c.view.Pages.RemovePage("modal")
 	})
 
@@ -472,13 +484,23 @@ func (c *Controller) create(isBucket bool) {
 		}
 
 		c.view.Pages.RemovePage("modal")
-		keys, err := c.updateList()
 
-		pos := getPosition(name, keys)
-		c.view.List.SetCurrentItem(pos)
+		// Run updateList in a goroutine
+		go func() {
+			keys, err := c.updateList()
+			if err != nil {
+				return
+			}
+			pos := getPosition(name, keys)
+
+			// Set current item on UI thread
+			c.view.App.QueueUpdateDraw(func() {
+				c.view.List.SetCurrentItem(pos)
+			})
+		}()
 	})
 
-	cForm.AddButton("Quit", func() {
+	cForm.AddButton("Cancel", func() {
 		c.view.Pages.RemovePage("modal")
 	})
 
@@ -595,13 +617,9 @@ func (c *Controller) setInput() {
 		case tcell.KeyCtrlP:
 			c.Profiles()
 			return nil
-		case tcell.KeyRune:
-			switch event.Rune() {
-			case 'l':
-				c.ShowLocalFSModal(c.params.HomeDir) // or "."
-				return nil
-			}
-
+		case tcell.KeyCtrlU:
+			c.ShowLocalFSModal(c.params.HomeDir)
+			return nil
 		}
 		return event
 	})
@@ -698,7 +716,7 @@ func (c *Controller) Duck(url string, region *string, acc string, sec string, ss
 	c.currentBucket = nil
 	c.currentPath = ""
 	c.bucketPos = 0
-	c.updateList()
+	go c.updateList()
 	c.setInput()
 	return nil
 }
@@ -709,14 +727,13 @@ func (c *Controller) Run() error {
 }
 
 func (c *Controller) error(header string, err error, fatal bool) {
-	errMsg := c.view.NewErrorMessageQ(header, err.Error())
-	errMsg.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-		c.view.Pages.RemovePage("modal")
-		//if fatal {
-		//	c.view.App.Stop()
-		//}
+	c.view.App.QueueUpdateDraw(func() {
+		errMsg := c.view.NewErrorMessageQ(header, err.Error())
+		errMsg.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+			c.view.Pages.RemovePage("modal")
+		})
+		c.view.Pages.AddPage("modal", c.view.ModalEdit(errMsg, 8, 3), true, true)
 	})
-	c.view.Pages.AddPage("modal", c.view.ModalEdit(errMsg, 8, 3), true, true)
 }
 
 func (c *Controller) success(header string) {
@@ -736,7 +753,7 @@ func (c *Controller) ShowLocalFSModal(startPath string) {
 
 	app := c.view.App
 
-	okBtn := tview.NewButton("OK").SetSelectedFunc(func() {
+	okBtn := tview.NewButton("Upload").SetSelectedFunc(func() {
 		i := localList.GetCurrentItem()
 		name, _ := localList.GetItemText(i)
 		fullPath := filepath.Join(currentPath, strings.TrimSuffix(name, "/"))
@@ -874,7 +891,7 @@ func (c *Controller) Upload(localPath string) error {
 			progress.SetText("Upload complete.\n\nPress Done to return.")
 			progress.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
 				c.view.Pages.RemovePage("progress").SwitchToPage("main")
-				c.updateList()
+				go c.updateList()
 			})
 		})
 	}()
