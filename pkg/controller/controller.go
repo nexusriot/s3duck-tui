@@ -165,6 +165,14 @@ func (c *Controller) Download() error {
 							downloadedSize := int64(0)
 							title := "Downloading"
 
+							c.view.App.QueueUpdateDraw(func() {
+								progress.SetText(fmt.Sprintf(
+									"Downloading\n0/%d object(s)\n0B/%s (0.0%%)",
+									len(objects),
+									humanize.IBytes(uint64(totalSize)),
+								))
+							})
+
 							for i, object := range objects {
 								n, err := c.model.Download(object, c.currentPath, cwd, c.currentBucket.Key)
 								if err != nil {
