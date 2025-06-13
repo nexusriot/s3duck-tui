@@ -219,9 +219,9 @@ func (c *Controller) updateList() ([]string, error) {
 		suff = ""
 	} else {
 		title = fmt.Sprintf("(%s)/%s", *c.currentBucket.Key, c.currentPath)
-		suff = "[::b][d[][::-]Download [::b] "
+		suff = "[::b][ctrl+d[][::-]Download [::b] "
 	}
-	fText := fmt.Sprintf("[::b][↓,↑][::-]Down/Up [::b][Enter/Backspace][::-]Lower/Upper %s[Del[][::-]Delete [c[][::-]Create [p[][::-]Profiles [::b][Ctrl+q][::-]Quit", suff)
+	fText := fmt.Sprintf("[::b][↓,↑][::-]Down/Up [::b][Enter/Backspace][::-]Lower/Upper %s[Del[][::-]Delete [ctrl+b[][::-]Create [p[][::-]Profiles [::b][Ctrl+q][::-]Quit", suff)
 	c.view.SetFrameText(fText)
 	c.view.List.SetTitle(title)
 	err := c.makeObjectMap()
@@ -550,7 +550,7 @@ func (c *Controller) setConfigInput() {
 
 	c.view.List.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
-		case tcell.KeyCtrlN:
+		case tcell.KeyCtrlB:
 			c.CreateConfigEntry()
 			return nil
 		case tcell.KeyCtrlH:
@@ -584,14 +584,15 @@ func (c *Controller) setInput() {
 		case tcell.KeyBackspace2:
 			c.Up()
 			return nil
+		case tcell.KeyCtrlB:
+			c.Create()
+			return nil
+		case tcell.KeyCtrlD:
+			c.Download()
+			return nil
 		case tcell.KeyRune:
 			switch event.Rune() {
-			case 'c':
-				c.Create()
-				return nil
-			case 'd':
-				c.Download()
-				return nil
+
 			case 'p':
 				c.Profiles()
 				return nil
@@ -710,9 +711,9 @@ func (c *Controller) error(header string, err error, fatal bool) {
 	errMsg := c.view.NewErrorMessageQ(header, err.Error())
 	errMsg.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
 		c.view.Pages.RemovePage("modal")
-		if fatal {
-			c.view.App.Stop()
-		}
+		//if fatal {
+		//	c.view.App.Stop()
+		//}
 	})
 	c.view.Pages.AddPage("modal", c.view.ModalEdit(errMsg, 8, 3), true, true)
 }
@@ -726,14 +727,26 @@ func (c *Controller) success(header string) {
 }
 
 func (c *Controller) ShowLocalFSModal(startPath string) {
+	if c.currentBucket == nil {
+		return
+	}
 	currentPath := startPath
 	layout, localList := c.view.NewCreateLocalFileListForm()
 
 	app := c.view.App
 
 	okBtn := tview.NewButton("OK").SetSelectedFunc(func() {
-		// Handle OK
+		i := localList.GetCurrentItem()
+		name, _ := localList.GetItemText(i)
+		fullPath := filepath.Join(currentPath, strings.TrimSuffix(name, "/"))
+
+		c.view.Pages.RemovePage("modal")
+		err := c.Upload(fullPath)
+		if err != nil {
+			c.error("Upload failed", err, false)
+		}
 	})
+
 	cancelBtn := tview.NewButton("Cancel").SetSelectedFunc(func() {
 		c.view.Pages.RemovePage("modal")
 	})
@@ -828,4 +841,42 @@ func (c *Controller) ShowLocalFSModal(startPath string) {
 	modal := c.view.ModalEdit(layout, 60, 25)
 	c.view.Pages.AddPage("modal", modal, true, true)
 	renderList(startPath) // Initial directory render
+}
+
+func (c *Controller) Upload(localPath string) error {
+	progress := c.view.NewProgressMessage()
+	c.view.Pages.AddPage("progress", progress, true, true)
+
+	go func() {
+		err := c.model.Upload(localPath, c.currentPath, c.currentBucket, func(n, total int64, i, count int, local, remote string) {
+			percentage := float64(n) / float64(total) * 100
+
+			c.view.App.QueueUpdateDraw(func() {
+				progress.SetText(fmt.Sprintf(
+					"Uploading\n%d/%d file(s)\n%s/%s (%.1f%%)\nLast: %s\n-> %s",
+					i, count,
+					humanize.IBytes(uint64(n)),
+					humanize.IBytes(uint64(total)),
+					percentage,
+					local,
+					remote,
+				))
+			})
+		})
+
+		c.view.App.QueueUpdateDraw(func() {
+			if err != nil {
+				c.view.Pages.RemovePage("progress").SwitchToPage("main")
+				c.error("Upload failed", err, false)
+				return
+			}
+			progress.SetText("Upload complete.\n\nPress Done to return.")
+			progress.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+				c.view.Pages.RemovePage("progress").SwitchToPage("main")
+				c.updateList()
+			})
+		})
+	}()
+
+	return nil
 }

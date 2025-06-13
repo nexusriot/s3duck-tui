@@ -7,7 +7,7 @@ import (
 	"github.com/rivo/tview"
 )
 
-const versionText = "S3Duck 🦆 TUI v.0.0.4 - (PoC)"
+const versionText = "S3Duck 🦆 TUI v.0.0.6 - preview"
 
 // View ...
 type View struct {
@@ -84,7 +84,7 @@ func (v *View) SetHeaderVersionText(versionText string) {
 
 func (v *View) NewProgressMessage() *tview.Modal {
 	return tview.NewModal().
-		SetText("Starting download...\n").
+		SetText("Starting...\n").
 		AddButtons([]string{"Done"}).
 		SetDoneFunc(nil) // disable Done until finished
 }

@@ -360,3 +360,66 @@ func (m *Model) CreateFolder(name *string, bucket *Object) error {
 	})
 	return err
 }
+
+func (m *Model) Upload(localPath, s3Prefix string, bucket *Object, progressCb func(current, total int64, i, count int, local, remote string)) error {
+	info, err := os.Stat(localPath)
+	if err != nil {
+		return err
+	}
+
+	isDir := info.IsDir()
+	var files []string
+	var totalSize int64
+
+	if isDir {
+		err := filepath.Walk(localPath, func(path string, fi os.FileInfo, err error) error {
+			if err != nil || fi.IsDir() {
+				return nil
+			}
+			files = append(files, path)
+			totalSize += fi.Size()
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	} else {
+		files = []string{localPath}
+		totalSize = info.Size()
+	}
+
+	uploader := s3m.NewUploader(m.Client)
+
+	for i, fpath := range files {
+		var relPath string
+		if isDir {
+			relPath, _ = filepath.Rel(localPath, fpath)
+			relPath = filepath.ToSlash(relPath)
+		} else {
+			relPath = filepath.Base(fpath)
+		}
+
+		s3Key := path.Join(s3Prefix, filepath.Base(localPath), relPath)
+
+		fp, err := os.Open(fpath)
+		if err != nil {
+			return fmt.Errorf("failed to open file %s: %w", fpath, err)
+		}
+
+		_, err = uploader.Upload(context.TODO(), &s3.PutObjectInput{
+			Bucket: aws.String(*bucket.Key),
+			Key:    aws.String(s3Key),
+			Body:   fp,
+		})
+		fp.Close()
+		if err != nil {
+			return fmt.Errorf("upload failed for %s: %w", fpath, err)
+		}
+
+		if stat, err := os.Stat(fpath); err == nil && progressCb != nil {
+			progressCb(stat.Size(), totalSize, i+1, len(files), fpath, s3Key)
+		}
+	}
+
+	return nil
+}
