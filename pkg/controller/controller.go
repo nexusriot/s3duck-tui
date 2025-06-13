@@ -123,7 +123,7 @@ func (c *Controller) Delete() error {
 					}()
 				}
 			})
-		c.view.Pages.AddAndSwitchToPage("confirm", confirm, true)
+		c.view.Pages.AddPage("confirm", confirm, true, true)
 	}
 	return nil
 }
@@ -159,7 +159,7 @@ func (c *Controller) Download() error {
 					c.view.Pages.RemovePage("confirm").SwitchToPage("main")
 
 					if buttonLabel == "OK" {
-						c.view.Pages.AddAndSwitchToPage("progress", progress, true)
+						c.view.Pages.AddPage("progress", progress, true, true)
 
 						go func() {
 							downloadedSize := int64(0)
@@ -203,7 +203,8 @@ func (c *Controller) Download() error {
 						}()
 					}
 				})
-			c.view.Pages.AddAndSwitchToPage("confirm", confirm, true)
+			//c.view.Pages.AddAndSwitchToPage("confirm", confirm, true)
+			c.view.Pages.AddPage("confirm", confirm, true, true)
 		}
 	}
 	return nil
@@ -531,7 +532,7 @@ func (c *Controller) DeleteConfigEntry() {
 
 			}
 		})
-	c.view.Pages.AddAndSwitchToPage("confirm", confirm, true)
+	c.view.Pages.AddPage("confirm", confirm, true, true)
 }
 
 func (c *Controller) setConfigInput() {
@@ -726,18 +727,39 @@ func (c *Controller) success(header string) {
 
 func (c *Controller) ShowLocalFSModal(startPath string) {
 	currentPath := startPath
+	layout, localList := c.view.NewCreateLocalFileListForm()
 
-	// Step 1: Declare the list explicitly
-	var localList *tview.List
-	localList = tview.NewList().
-		ShowSecondaryText(false)
+	app := c.view.App
 
-	// Step 2: Define rendering logic
+	okBtn := tview.NewButton("OK").SetSelectedFunc(func() {
+		// Handle OK
+	})
+	cancelBtn := tview.NewButton("Cancel").SetSelectedFunc(func() {
+		c.view.Pages.RemovePage("modal")
+	})
+
+	buttonRow := tview.NewFlex().
+		SetDirection(tview.FlexColumn).
+		AddItem(okBtn, 0, 1, false).
+		AddItem(tview.NewBox(), 2, 0, false). // <- spacer: fixed width 2
+		AddItem(cancelBtn, 0, 1, false)
+
+	flex, _ := layout.(*tview.Flex)
+	flex.AddItem(buttonRow, 1, 0, false)
+
+	// Maintain focusable order
+	focusables := []tview.Primitive{localList, okBtn, cancelBtn}
+	focusIndex := 0
+	setNextFocus := func() {
+		focusIndex = (focusIndex + 1) % len(focusables)
+		app.SetFocus(focusables[focusIndex])
+	}
+
 	var renderList func(string)
 	renderList = func(curPath string) {
 		currentPath = curPath
 		localList.Clear()
-		localList.SetTitle(fmt.Sprintf("Local FS: %s", curPath))
+		localList.SetTitle(fmt.Sprintf("Local FS: %s", curPath)).SetBorder(true)
 
 		entries, err := os.ReadDir(curPath)
 		if err != nil {
@@ -772,9 +794,11 @@ func (c *Controller) ShowLocalFSModal(startPath string) {
 		}
 	}
 
-	// Step 3: Input handling
 	localList.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
+		case tcell.KeyTab:
+			setNextFocus()
+			return nil
 		case tcell.KeyEsc:
 			c.view.Pages.RemovePage("modal")
 			return nil
@@ -786,10 +810,22 @@ func (c *Controller) ShowLocalFSModal(startPath string) {
 		return event
 	})
 
-	// ✅ Step 4: Wrap AFTERWARDS
-	modal := c.view.ModalEdit(localList, 60, 25)
+	okBtn.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyTab {
+			setNextFocus()
+			return nil
+		}
+		return event
+	})
+	cancelBtn.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyTab {
+			setNextFocus()
+			return nil
+		}
+		return event
+	})
 
-	// Step 5: Show
+	modal := c.view.ModalEdit(layout, 60, 25)
 	c.view.Pages.AddPage("modal", modal, true, true)
-	renderList(startPath)
+	renderList(startPath) // Initial directory render
 }

@@ -116,6 +116,17 @@ func (v *View) NewCreateProfileForm(header string) *tview.Form {
 	return form
 }
 
+func (v *View) NewCreateLocalFileListForm() (tview.Primitive, *tview.List) {
+	var localList *tview.List
+	localList = tview.NewList().
+		ShowSecondaryText(false)
+
+	flex := tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(localList, 0, 2, true)
+	return flex, localList
+}
+
 func (v *View) NewSuccessMessageQ(header string) *tview.Modal {
 	successQ := tview.NewModal()
 	successQ.SetText(header).SetBackgroundColor(tcell.ColorLime).AddButtons([]string{"ok"})
