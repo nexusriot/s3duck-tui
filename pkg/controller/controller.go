@@ -2,7 +2,6 @@ package controller
 
 import (
 	"fmt"
-	"github.com/rivo/tview"
 	"os"
 	"path"
 	"path/filepath"
@@ -11,6 +10,7 @@ import (
 
 	"github.com/dustin/go-humanize"
 	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
 
 	cfg "github.com/nexusriot/s3duck-tui/internal/config"
 	"github.com/nexusriot/s3duck-tui/pkg/model"
@@ -167,27 +167,38 @@ func (c *Controller) Download() error {
 
 							for i, object := range objects {
 								n, err := c.model.Download(object, c.currentPath, cwd, c.currentBucket.Key)
-
 								if err != nil {
-									c.view.Pages.RemovePage("progress").SwitchToPage("main")
+									c.view.App.QueueUpdateDraw(func() {
+										c.view.Pages.RemovePage("progress").SwitchToPage("main")
+									})
 									c.error(fmt.Sprintf("Failed to download %s", *object.Key), err, false)
+									return
 								}
 								downloadedSize += n
+								percentage := float64(downloadedSize) / float64(totalSize) * 100
+
 								if i+1 == nos {
 									title = "Downloaded"
 								}
+
 								c.view.App.QueueUpdateDraw(func() {
-									progress.SetText(fmt.Sprintf("%s\n%d/%d objects\n%s/%s",
+									progress.SetText(fmt.Sprintf(
+										"%s\n%d/%d object(s)\n%s/%s (%.1f%%)",
 										title,
-										i+1,
-										nos,
+										i+1, nos,
 										humanize.IBytes(uint64(downloadedSize)),
 										humanize.IBytes(uint64(totalSize)),
+										percentage,
 									))
 								})
 							}
-							progress.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-								c.view.Pages.RemovePage("progress").SwitchToPage("main")
+
+							// Enable Done button after all downloads
+							c.view.App.QueueUpdateDraw(func() {
+								progress.SetText("Download complete.\n\nPress Done to return.")
+								progress.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+									c.view.Pages.RemovePage("progress").SwitchToPage("main")
+								})
 							})
 						}()
 					}
@@ -538,22 +549,18 @@ func (c *Controller) setConfigInput() {
 
 	c.view.List.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
-		case tcell.KeyRune:
-			switch event.Rune() {
-			// TODO: ctrl + key
-			case 'n':
-				c.CreateConfigEntry()
-				return nil
-			case 'e':
-				c.EditConfigEntry()
-				return nil
-			case 'c':
-				c.CopyProfile()
-				return nil
-			case 'v':
-				c.CheckProfile()
-				return nil
-			}
+		case tcell.KeyCtrlN:
+			c.CreateConfigEntry()
+			return nil
+		case tcell.KeyCtrlH:
+			c.EditConfigEntry()
+			return nil
+		case tcell.KeyCtrlJ:
+			c.CopyProfile()
+			return nil
+		case tcell.KeyCtrlO:
+			c.CheckProfile()
+			return nil
 		}
 		return event
 	})

@@ -84,7 +84,9 @@ func (v *View) SetHeaderVersionText(versionText string) {
 
 func (v *View) NewProgressMessage() *tview.Modal {
 	return tview.NewModal().
-		SetText("Downloading\n\n").AddButtons([]string{"Done"})
+		SetText("Starting download...\n").
+		AddButtons([]string{"Done"}).
+		SetDoneFunc(nil) // disable Done until finished
 }
 
 func (v *View) NewConfirm() *tview.Modal {
