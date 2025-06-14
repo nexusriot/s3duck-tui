@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"github.com/aws/aws-sdk-go-v2/credentials"
+
 	"log"
 	"net/http"
 	"os"
@@ -15,6 +15,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	s3m "github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3t "github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -295,26 +296,31 @@ func (m *Model) List(path string, bucket *Object) ([]*Object, error) {
 }
 
 func (m *Model) ListBuckets() ([]*Object, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	objs := make([]*Object, 0)
-	result, err := m.Client.ListBuckets(context.TODO(), &s3.ListBucketsInput{})
+
+	result, err := m.Client.ListBuckets(ctx, &s3.ListBucketsInput{})
 	if err != nil {
 		return nil, err
 	}
+
 	for _, b := range result.Buckets {
 		sv := aws.String(*b.Name)
 		td := aws.Time(*b.CreationDate)
 		ko := &Object{
-			sv,
-			Bucket,
-			nil,
-			nil,
-			nil,
-			td,
-			nil,
+			Key:          sv,
+			Ot:           Bucket,
+			Etag:         nil,
+			Size:         nil,
+			StorageClass: nil,
+			LastModified: td,
+			// Add other fields if necessary
 		}
 		objs = append(objs, ko)
 	}
-	return objs, err
+	return objs, nil
 }
 
 func (m *Model) Delete(key *string, bucket *Object) error {
@@ -413,7 +419,13 @@ func (m *Model) Upload(localPath, s3Prefix string, bucket *Object, progressCb fu
 			relPath = filepath.Base(fpath)
 		}
 
-		s3Key := path.Join(s3Prefix, filepath.Base(localPath), relPath)
+		var s3Key string
+		if isDir {
+			relPath = filepath.ToSlash(relPath)
+			s3Key = path.Join(s3Prefix, filepath.Base(localPath), relPath)
+		} else {
+			s3Key = path.Join(s3Prefix, relPath)
+		}
 
 		fp, err := os.Open(fpath)
 		if err != nil {

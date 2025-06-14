@@ -56,7 +56,7 @@ func (c *Controller) makeObjectMap() error {
 	if c.currentBucket == nil {
 		list, err = c.model.ListBuckets()
 		if err != nil {
-			c.error("Failed to list buckets", err, true)
+			go c.error("Failed to list buckets", err, true)
 		}
 	} else {
 		list, err = c.model.List(c.currentPath, c.currentBucket)
@@ -117,7 +117,7 @@ func (c *Controller) Delete() error {
 							err = c.model.Delete(&op, c.currentBucket)
 						}
 						if err != nil {
-							c.error(fmt.Sprintf("Failed to delete %s", cur), err, false)
+							go c.error(fmt.Sprintf("Failed to delete %s", cur), err, false)
 						}
 						go c.updateList()
 					}()
@@ -179,7 +179,7 @@ func (c *Controller) Download() error {
 									c.view.App.QueueUpdateDraw(func() {
 										c.view.Pages.RemovePage("progress").SwitchToPage("main")
 									})
-									c.error(fmt.Sprintf("Failed to download %s", *object.Key), err, false)
+									go c.error(fmt.Sprintf("Failed to download %s", *object.Key), err, false)
 									return
 								}
 								downloadedSize += n
@@ -222,7 +222,7 @@ func (c *Controller) updateList() ([]string, error) {
 	err := c.makeObjectMap()
 	if err != nil {
 		c.view.Pages.RemovePage("modal")
-		c.error("Failed to fetch folder", err, false)
+		go c.error("Failed to fetch folder", err, false)
 		return nil, err
 	}
 
@@ -377,7 +377,7 @@ func (c *Controller) CreateConfigEntry() {
 
 		c.view.Pages.RemovePage("modal")
 		if err != nil {
-			c.error("Error creating config entry", err, false)
+			go c.error("Error creating config entry", err, false)
 		}
 		c.fillConfigData()
 		c.view.List.SetCurrentItem(len(c.params.Config) - 1)
@@ -487,7 +487,7 @@ func (c *Controller) create(isBucket bool) {
 		}
 		if err != nil {
 			c.view.Pages.RemovePage("modal")
-			c.error("Error creating object", err, false)
+			go c.error("Error creating object", err, false)
 			return
 		}
 
@@ -537,9 +537,9 @@ func (c *Controller) CheckProfile() {
 	_, err := c.model.ListBuckets()
 
 	if err != nil {
-		c.error(fmt.Sprintf("error checking profile %s", cf.Name), err, false)
+		go c.error(fmt.Sprintf("error checking profile %s", cf.Name), err, false)
 	} else {
-		c.success(fmt.Sprintf("successfully checked profile %s", cf.Name))
+		go c.success(fmt.Sprintf("successfully checked profile %s", cf.Name))
 	}
 
 }
@@ -673,7 +673,7 @@ func (c *Controller) fillConfigData() {
 			conf := c.params.Config[i]
 			err := c.Duck(conf.BaseUrl, conf.Region, conf.AccessKey, conf.SecretKey, !conf.IgnoreSsl)
 			if err != nil {
-				c.error("Failed to use profile", err, false)
+				go c.error("Failed to use profile", err, false)
 			}
 		})
 	}
@@ -735,11 +735,13 @@ func (c *Controller) Run() error {
 }
 
 func (c *Controller) error(header string, err error, fatal bool) {
+	errMsg := c.view.NewErrorMessageQ(header, err.Error())
+	errMsg.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+		c.view.Pages.RemovePage("modal")
+	})
+
+	// Call QueueUpdateDraw ONLY for the update
 	c.view.App.QueueUpdateDraw(func() {
-		errMsg := c.view.NewErrorMessageQ(header, err.Error())
-		errMsg.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-			c.view.Pages.RemovePage("modal")
-		})
 		c.view.Pages.AddPage("modal", c.view.ModalEdit(errMsg, 8, 3), true, true)
 	})
 }
@@ -749,7 +751,11 @@ func (c *Controller) success(header string) {
 	succMsg.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
 		c.view.Pages.RemovePage("modal")
 	})
-	c.view.Pages.AddPage("modal", c.view.ModalEdit(succMsg, 8, 3), true, true)
+
+	// Same here: just view update
+	c.view.App.QueueUpdateDraw(func() {
+		c.view.Pages.AddPage("modal", c.view.ModalEdit(succMsg, 8, 3), true, true)
+	})
 }
 
 func (c *Controller) ShowLocalFSModal(startPath string) {
@@ -769,7 +775,7 @@ func (c *Controller) ShowLocalFSModal(startPath string) {
 		c.view.Pages.RemovePage("modal")
 		err := c.Upload(fullPath)
 		if err != nil {
-			c.error("Upload failed", err, false)
+			go c.error("Upload failed", err, false)
 		}
 	})
 
@@ -802,7 +808,7 @@ func (c *Controller) ShowLocalFSModal(startPath string) {
 
 		entries, err := os.ReadDir(curPath)
 		if err != nil {
-			c.error("Failed to read directory", err, false)
+			go c.error("Failed to read directory", err, false)
 			return
 		}
 
@@ -824,9 +830,6 @@ func (c *Controller) ShowLocalFSModal(startPath string) {
 				return func() {
 					if isDir {
 						renderList(p)
-					} else {
-						c.success(fmt.Sprintf("Selected file: %s", p))
-						c.view.Pages.RemovePage("modal")
 					}
 				}
 			}(fullPath, entry.IsDir()))
@@ -893,7 +896,7 @@ func (c *Controller) Upload(localPath string) error {
 		c.view.App.QueueUpdateDraw(func() {
 			if err != nil {
 				c.view.Pages.RemovePage("progress").SwitchToPage("main")
-				c.error("Upload failed", err, false)
+				go c.error("Upload failed", err, false)
 				return
 			}
 			progress.SetText("Upload complete.\n\nPress Done to return.")
