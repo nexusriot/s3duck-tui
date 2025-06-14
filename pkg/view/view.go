@@ -7,7 +7,7 @@ import (
 	"github.com/rivo/tview"
 )
 
-const versionText = "S3Duck 🦆 TUI v.0.0.7 - preview"
+const versionText = "S3Duck 🦆 TUI v.0.0.8 - preview"
 
 // View ...
 type View struct {
@@ -36,8 +36,8 @@ func NewView() *View {
 		})
 	tv.SetBorder(true)
 	main := tview.NewFlex()
-	main.AddItem(list, 0, 5, true)
-	main.AddItem(tv, 0, 2, false)
+	main.AddItem(list, 0, 4, true)
+	main.AddItem(tv, 0, 3, false)
 
 	pages := tview.NewPages().
 		AddPage("main", main, true, true)
@@ -80,13 +80,6 @@ func (v *View) SetFrameText(helpText string) {
 
 func (v *View) SetHeaderVersionText(versionText string) {
 	v.Frame.AddText(fmt.Sprintf(versionText), true, tview.AlignCenter, tcell.ColorGreen)
-}
-
-func (v *View) NewProgressMessage() *tview.Modal {
-	return tview.NewModal().
-		SetText("Starting...\n").
-		AddButtons([]string{"Done"}).
-		SetDoneFunc(nil) // disable Done until finished
 }
 
 func (v *View) NewConfirm() *tview.Modal {

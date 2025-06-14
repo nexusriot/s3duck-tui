@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path"
@@ -129,92 +130,111 @@ func (c *Controller) Delete() error {
 }
 
 func (c *Controller) Download() error {
-
 	cur := c.getSelectedObjectName()
-	if val, ok := c.objs[cur]; ok {
-		if val.Ot == model.Folder || val.Ot == model.File {
-
-			cwd := path.Join(c.params.HomeDir, "Downloads")
-			cwd = cwd + fmt.Sprintf("%c", filepath.Separator)
-			key := c.currentPath + cur
-			if val.Ot == model.Folder {
-				key = key + "/"
-			}
-			totalSize := int64(0)
-			objects := c.model.ListObjects(key, c.currentBucket)
-
-			for _, o := range objects {
-				totalSize += o.Size
-			}
-			nos := len(objects)
-			progress := c.view.NewProgressMessage()
-
-			confirm := c.view.NewConfirm()
-			confirm.SetText(fmt.Sprintf("Do you want to download to %s\n%d object(s)\ntotal size %s",
-				cwd,
-				nos,
-				humanize.IBytes(uint64(totalSize)),
-			)).
-				SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-					c.view.Pages.RemovePage("confirm").SwitchToPage("main")
-
-					if buttonLabel == "OK" {
-						c.view.Pages.AddPage("progress", progress, true, true)
-
-						go func() {
-							downloadedSize := int64(0)
-							title := "Downloading"
-
-							c.view.App.QueueUpdateDraw(func() {
-								progress.SetText(fmt.Sprintf(
-									"Downloading\n0/%d object(s)\n0B/%s (0.0%%)",
-									len(objects),
-									humanize.IBytes(uint64(totalSize)),
-								))
-							})
-
-							for i, object := range objects {
-								n, err := c.model.Download(object, c.currentPath, cwd, c.currentBucket.Key)
-								if err != nil {
-									c.view.App.QueueUpdateDraw(func() {
-										c.view.Pages.RemovePage("progress").SwitchToPage("main")
-									})
-									go c.error(fmt.Sprintf("Failed to download %s", *object.Key), err, false)
-									return
-								}
-								downloadedSize += n
-								percentage := float64(downloadedSize) / float64(totalSize) * 100
-
-								if i+1 == nos {
-									title = "Downloaded"
-								}
-
-								c.view.App.QueueUpdateDraw(func() {
-									progress.SetText(fmt.Sprintf(
-										"%s\n%d/%d object(s)\n%s/%s (%.1f%%)",
-										title,
-										i+1, nos,
-										humanize.IBytes(uint64(downloadedSize)),
-										humanize.IBytes(uint64(totalSize)),
-										percentage,
-									))
-								})
-							}
-
-							// Enable Done button after all downloads
-							c.view.App.QueueUpdateDraw(func() {
-								progress.SetText("Download complete.\n\nPress Done to return.")
-								progress.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-									c.view.Pages.RemovePage("progress").SwitchToPage("main")
-								})
-							})
-						}()
-					}
-				})
-			//c.view.Pages.AddAndSwitchToPage("confirm", confirm, true)
-			c.view.Pages.AddPage("confirm", confirm, true, true)
-		}
+	val, ok := c.objs[cur]
+	if !ok || (val.Ot != model.File && val.Ot != model.Folder) {
+		return nil
 	}
+
+	cwd := path.Join(c.params.HomeDir, "Downloads") + string(filepath.Separator)
+	key := c.currentPath + cur
+	if val.Ot == model.Folder {
+		key += "/"
+	}
+
+	objects := c.model.ListObjects(key, c.currentBucket)
+	if len(objects) == 0 {
+		return nil
+	}
+
+	totalSize := int64(0)
+	for _, o := range objects {
+		totalSize += o.Size
+	}
+
+	confirm := c.view.NewConfirm()
+	confirm.SetText(fmt.Sprintf("Do you want to download to %s\n%d object(s)\ntotal size %s",
+		cwd,
+		len(objects),
+		humanize.IBytes(uint64(totalSize)),
+	)).SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+		c.view.Pages.RemovePage("confirm").SwitchToPage("main")
+
+		if buttonLabel != "OK" {
+			return
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		progress := tview.NewModal().
+			SetText("Starting download...\n").
+			AddButtons([]string{"Cancel"}).
+			SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+				cancel()
+				c.view.Pages.RemovePage("progress").SwitchToPage("main")
+			})
+		c.view.Pages.AddPage("progress", progress, true, true)
+
+		go func() {
+			downloadedSize := int64(0)
+
+			// Show initial progress for 0%
+			c.view.App.QueueUpdateDraw(func() {
+				progress.SetText(fmt.Sprintf(
+					"Downloading\n0/%d object(s)\n0B/%s (0.0%%)",
+					len(objects),
+					humanize.IBytes(uint64(totalSize)),
+				))
+			})
+
+			for i, object := range objects {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				n, err := c.model.Download(ctx, object, c.currentPath, cwd, c.currentBucket.Key)
+				if err != nil {
+					c.view.App.QueueUpdateDraw(func() {
+						c.view.Pages.RemovePage("progress").SwitchToPage("main")
+					})
+					go c.error(fmt.Sprintf("Failed to download %s", *object.Key), err, false)
+					return
+				}
+
+				downloadedSize += n
+				percentage := float64(downloadedSize) / float64(totalSize) * 100
+
+				c.view.App.QueueUpdateDraw(func() {
+					progress.SetText(fmt.Sprintf(
+						"Downloading\n%d/%d object(s)\n%s/%s (%.1f%%)",
+						i+1, len(objects),
+						humanize.IBytes(uint64(downloadedSize)),
+						humanize.IBytes(uint64(totalSize)),
+						percentage,
+					))
+				})
+			}
+
+			// After download finishes successfully
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				c.view.App.QueueUpdateDraw(func() {
+					progress.ClearButtons()
+					progress.AddButtons([]string{"Done"})
+					progress.SetText("Download complete.\n\nPress Done to return.")
+					progress.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+						c.view.Pages.RemovePage("progress").SwitchToPage("main")
+					})
+					c.view.App.SetFocus(progress)
+				})
+			}
+		}()
+	})
+
+	c.view.Pages.AddPage("confirm", confirm, true, true)
 	return nil
 }
 
@@ -238,7 +258,7 @@ func (c *Controller) updateList() ([]string, error) {
 		suff = "[::b][ctrl+d[][::-]Download [::b][::b][ctrl+u[][::-]Upload [::b]"
 	}
 
-	fText := fmt.Sprintf("[::b][↓,↑][::-]Down/Up [::b][Enter/Backspace][::-]Lower/Upper %s[Del[][::-]Delete [ctrl+b[][::-]Create [ctrl+p[][::-]Profiles [::b][Ctrl+q][::-]Quit", suff)
+	fText := fmt.Sprintf("[::b][↓,↑][::-]Down/Up [::b][Enter/Backspace][::-]Lower/Upper %s[::b][Del[][::-]Delete [::b][ctrl+b][::-]Create [::b][ctrl+p][::-]Profiles [::b][Ctrl+q][::-]Quit", suff)
 
 	objs := make([]*model.Object, 0, len(c.objs))
 	for _, k := range c.objs {
@@ -677,7 +697,7 @@ func (c *Controller) fillConfigData() {
 			}
 		})
 	}
-	c.view.SetFrameText("[::b][↓,↑][::-]Down/Up [::b][Enter[][::-]Use Profile [::b][ctrl+b[][::-]Create [::b][ctrl+j[][::-]Copy [::b][ctrl+h[][::-]Edit [::b][ctrl+o[][::-]Verify [::b][Del[][::-]Delete")
+	c.view.SetFrameText("[::b][↓,↑][::-]Down/Up [::b][Enter[][::-]Use Profile [::b][ctrl+b[][::-]Create [::b][ctrl+j[][::-]Copy [::b][ctrl+h[][::-]Edit [::b][ctrl+o[][::-]Verify [::b][Del[][::-]Delete [::b][Ctrl+q][::-]Quit")
 }
 
 func (c *Controller) fillDetails(key string) {
@@ -873,11 +893,18 @@ func (c *Controller) ShowLocalFSModal(startPath string) {
 }
 
 func (c *Controller) Upload(localPath string) error {
-	progress := c.view.NewProgressMessage()
+	ctx, cancel := context.WithCancel(context.Background())
+	progress := tview.NewModal().
+		SetText("Starting upload...\n").
+		AddButtons([]string{"Cancel"}).
+		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+			cancel()
+			c.view.Pages.RemovePage("progress").SwitchToPage("main")
+		})
 
 	files, totalSize, err := c.model.PrepareUpload(localPath, c.currentPath, c.currentBucket)
 	if err != nil || len(files) == 0 {
-		go c.error("No files to upload", fmt.Errorf("nothing selected"), false)
+		c.error("No files to upload", fmt.Errorf("nothing selected"), false)
 		return nil
 	}
 
@@ -893,7 +920,13 @@ func (c *Controller) Upload(localPath string) error {
 	))
 
 	go func() {
-		err := c.model.Upload(localPath, c.currentPath, c.currentBucket, func(n, total int64, i, count int, local, remote string) {
+		err := c.model.Upload(ctx, localPath, c.currentPath, c.currentBucket, func(n, total int64, i, count int, local, remote string) {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
 			percentage := float64(n) / float64(total) * 100
 			c.view.App.QueueUpdateDraw(func() {
 				progress.SetText(fmt.Sprintf(
@@ -908,18 +941,30 @@ func (c *Controller) Upload(localPath string) error {
 			})
 		})
 
-		c.view.App.QueueUpdateDraw(func() {
-			if err != nil {
-				c.view.Pages.RemovePage("progress").SwitchToPage("main")
-				go c.error("Upload failed", err, false)
-				return
-			}
-			progress.SetText("Upload complete.\n\nPress Done to return.")
-			progress.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-				c.view.Pages.RemovePage("progress").SwitchToPage("main")
-				go c.updateList()
+		select {
+		case <-ctx.Done():
+			go c.updateList()
+			return
+		default:
+			c.view.App.QueueUpdateDraw(func() {
+				if err != nil {
+					c.view.Pages.RemovePage("progress").SwitchToPage("main")
+					c.error("Upload failed", err, false)
+					return
+				}
+
+				// Clear previous Cancel button and add Done
+				progress.ClearButtons()
+				progress.SetText("Upload complete.\n\nPress Done to return.")
+				progress.AddButtons([]string{"Done"})
+				progress.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+					c.view.Pages.RemovePage("progress").SwitchToPage("main")
+					go c.updateList()
+				})
+
+				c.view.App.SetFocus(progress)
 			})
-		})
+		}
 	}()
 
 	return nil

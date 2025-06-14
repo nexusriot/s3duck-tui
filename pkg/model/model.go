@@ -181,8 +181,8 @@ func (m *Model) ListObjects(key string, bucket *Object) []s3t.Object {
 	return objects
 }
 
-func (m *Model) Download(object s3t.Object, currentPath string, destPath string, bucket *string) (n int64, err error) {
-	if err = os.MkdirAll(filepath.Dir(destPath), 0700); err != nil {
+func (m *Model) Download(ctx context.Context, object s3t.Object, currentPath, destPath string, bucket *string) (n int64, err error) {
+	if err = os.MkdirAll(destPath, 0700); err != nil {
 		return 0, err
 	}
 
@@ -198,28 +198,35 @@ func (m *Model) Download(object s3t.Object, currentPath string, destPath string,
 
 	_, err = os.Stat(dp)
 	if err == nil {
-		return 0, fmt.Errorf("exists")
+		return 0, fmt.Errorf("file exists: %s", dp)
 	}
 
 	fp, err := os.Create(dp)
 	if err != nil {
 		return 0, err
 	}
-
 	defer func() {
-		if err := fp.Close(); err != nil {
-			panic(err)
+		if cerr := fp.Close(); cerr != nil && err == nil {
+			err = cerr
 		}
 	}()
 
-	return m.Downloader.Download(
-		context.TODO(),
+	n, err = m.Downloader.Download(
+		ctx,
 		fp,
 		&s3.GetObjectInput{
 			Bucket: aws.String(*bucket),
 			Key:    object.Key,
 		},
 	)
+
+	if ctx.Err() != nil {
+		// Cleanup partial file
+		os.Remove(dp)
+		return 0, ctx.Err()
+	}
+
+	return n, err
 }
 
 func (m *Model) GetBucketLocation(name *string) (*string, error) {
@@ -387,7 +394,7 @@ func (m *Model) CreateFolder(name *string, bucket *Object) error {
 	return err
 }
 
-func (m *Model) Upload(localPath, s3Prefix string, bucket *Object, progressCb func(current, total int64, i, count int, local, remote string)) error {
+func (m *Model) Upload(ctx context.Context, localPath, s3Prefix string, bucket *Object, progressCb func(current, total int64, i, count int, local, remote string)) error {
 	info, err := os.Stat(localPath)
 	if err != nil {
 		return err
@@ -417,6 +424,12 @@ func (m *Model) Upload(localPath, s3Prefix string, bucket *Object, progressCb fu
 	uploader := s3m.NewUploader(m.Client)
 
 	for i, fpath := range files {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
 		var relPath string
 		if isDir {
 			relPath, _ = filepath.Rel(localPath, fpath)
@@ -427,7 +440,6 @@ func (m *Model) Upload(localPath, s3Prefix string, bucket *Object, progressCb fu
 
 		var s3Key string
 		if isDir {
-			relPath = filepath.ToSlash(relPath)
 			s3Key = path.Join(s3Prefix, filepath.Base(localPath), relPath)
 		} else {
 			s3Key = path.Join(s3Prefix, relPath)
@@ -438,7 +450,7 @@ func (m *Model) Upload(localPath, s3Prefix string, bucket *Object, progressCb fu
 			return fmt.Errorf("failed to open file %s: %w", fpath, err)
 		}
 
-		_, err = uploader.Upload(context.TODO(), &s3.PutObjectInput{
+		_, err = uploader.Upload(ctx, &s3.PutObjectInput{
 			Bucket: aws.String(*bucket.Key),
 			Key:    aws.String(s3Key),
 			Body:   fp,
