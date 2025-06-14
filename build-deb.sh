@@ -1,6 +1,6 @@
 #!/bin/env bash
 
-version=0.0.4
+version=0.0.8
 
 echo "building deb for s3duck-tui $version"
 

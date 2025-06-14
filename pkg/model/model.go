@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"github.com/aws/aws-sdk-go-v2/credentials"
+
 	"log"
 	"net/http"
 	"os"
@@ -15,6 +15,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	s3m "github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3t "github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -31,6 +32,12 @@ const (
 	Folder
 	Bucket
 )
+
+type UploadTarget struct {
+	LocalPath  string
+	RemotePath string
+	Size       int64
+}
 
 type Config struct {
 	Url       string
@@ -174,8 +181,8 @@ func (m *Model) ListObjects(key string, bucket *Object) []s3t.Object {
 	return objects
 }
 
-func (m *Model) Download(object s3t.Object, currentPath string, destPath string, bucket *string) (n int64, err error) {
-	if err = os.MkdirAll(filepath.Dir(destPath), 0700); err != nil {
+func (m *Model) Download(ctx context.Context, object s3t.Object, currentPath, destPath string, bucket *string) (n int64, err error) {
+	if err = os.MkdirAll(destPath, 0700); err != nil {
 		return 0, err
 	}
 
@@ -191,28 +198,35 @@ func (m *Model) Download(object s3t.Object, currentPath string, destPath string,
 
 	_, err = os.Stat(dp)
 	if err == nil {
-		return 0, fmt.Errorf("exists")
+		return 0, fmt.Errorf("file exists: %s", dp)
 	}
 
 	fp, err := os.Create(dp)
 	if err != nil {
 		return 0, err
 	}
-
 	defer func() {
-		if err := fp.Close(); err != nil {
-			panic(err)
+		if cerr := fp.Close(); cerr != nil && err == nil {
+			err = cerr
 		}
 	}()
 
-	return m.Downloader.Download(
-		context.TODO(),
+	n, err = m.Downloader.Download(
+		ctx,
 		fp,
 		&s3.GetObjectInput{
 			Bucket: aws.String(*bucket),
 			Key:    object.Key,
 		},
 	)
+
+	if ctx.Err() != nil {
+		// Cleanup partial file
+		os.Remove(dp)
+		return 0, ctx.Err()
+	}
+
+	return n, err
 }
 
 func (m *Model) GetBucketLocation(name *string) (*string, error) {
@@ -295,26 +309,31 @@ func (m *Model) List(path string, bucket *Object) ([]*Object, error) {
 }
 
 func (m *Model) ListBuckets() ([]*Object, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
 	objs := make([]*Object, 0)
-	result, err := m.Client.ListBuckets(context.TODO(), &s3.ListBucketsInput{})
+
+	result, err := m.Client.ListBuckets(ctx, &s3.ListBucketsInput{})
 	if err != nil {
 		return nil, err
 	}
+
 	for _, b := range result.Buckets {
 		sv := aws.String(*b.Name)
 		td := aws.Time(*b.CreationDate)
 		ko := &Object{
-			sv,
-			Bucket,
-			nil,
-			nil,
-			nil,
-			td,
-			nil,
+			Key:          sv,
+			Ot:           Bucket,
+			Etag:         nil,
+			Size:         nil,
+			StorageClass: nil,
+			LastModified: td,
+			// Add other fields if necessary
 		}
 		objs = append(objs, ko)
 	}
-	return objs, err
+	return objs, nil
 }
 
 func (m *Model) Delete(key *string, bucket *Object) error {
@@ -346,11 +365,25 @@ func (m *Model) DeleteBucket(name *string) error {
 }
 
 func (m *Model) CreateBucket(name *string) error {
-	_, err := m.Client.CreateBucket(context.TODO(), &s3.CreateBucketInput{
+	region := aws.ToString(m.Cf.Region)
+
+	input := &s3.CreateBucketInput{
 		Bucket: aws.String(*name),
 		ACL:    s3t.BucketCannedACLPrivate,
-	})
-	return err
+	}
+
+	// us-east-1 does NOT accept a LocationConstraint
+	if region != "" && region != "us-east-1" {
+		input.CreateBucketConfiguration = &s3t.CreateBucketConfiguration{
+			LocationConstraint: s3t.BucketLocationConstraint(region),
+		}
+	}
+
+	_, err := m.Client.CreateBucket(context.TODO(), input)
+	if err != nil {
+		return fmt.Errorf("failed to create bucket: %w", err)
+	}
+	return nil
 }
 
 func (m *Model) CreateFolder(name *string, bucket *Object) error {
@@ -359,4 +392,114 @@ func (m *Model) CreateFolder(name *string, bucket *Object) error {
 		Key:    aws.String(*name),
 	})
 	return err
+}
+
+func (m *Model) Upload(ctx context.Context, localPath, s3Prefix string, bucket *Object, progressCb func(current, total int64, i, count int, local, remote string)) error {
+	info, err := os.Stat(localPath)
+	if err != nil {
+		return err
+	}
+
+	isDir := info.IsDir()
+	var files []string
+	var totalSize int64
+
+	if isDir {
+		err := filepath.Walk(localPath, func(path string, fi os.FileInfo, err error) error {
+			if err != nil || fi.IsDir() {
+				return nil
+			}
+			files = append(files, path)
+			totalSize += fi.Size()
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	} else {
+		files = []string{localPath}
+		totalSize = info.Size()
+	}
+
+	uploader := s3m.NewUploader(m.Client)
+
+	for i, fpath := range files {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		var relPath string
+		if isDir {
+			relPath, _ = filepath.Rel(localPath, fpath)
+			relPath = filepath.ToSlash(relPath)
+		} else {
+			relPath = filepath.Base(fpath)
+		}
+
+		var s3Key string
+		if isDir {
+			s3Key = path.Join(s3Prefix, filepath.Base(localPath), relPath)
+		} else {
+			s3Key = path.Join(s3Prefix, relPath)
+		}
+
+		fp, err := os.Open(fpath)
+		if err != nil {
+			return fmt.Errorf("failed to open file %s: %w", fpath, err)
+		}
+
+		_, err = uploader.Upload(ctx, &s3.PutObjectInput{
+			Bucket: aws.String(*bucket.Key),
+			Key:    aws.String(s3Key),
+			Body:   fp,
+		})
+		fp.Close()
+		if err != nil {
+			return fmt.Errorf("upload failed for %s: %w", fpath, err)
+		}
+
+		if stat, err := os.Stat(fpath); err == nil && progressCb != nil {
+			progressCb(stat.Size(), totalSize, i+1, len(files), fpath, s3Key)
+		}
+	}
+
+	return nil
+}
+
+// PrepareUpload returns list of files to upload with remote keys and total size.
+func (m *Model) PrepareUpload(localPath string, currentPath string, bucket *Object) ([]UploadTarget, int64, error) {
+	var targets []UploadTarget
+	var totalSize int64
+
+	err := filepath.Walk(localPath, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err // skip unreadable file
+		}
+		if info.IsDir() {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(localPath, p)
+		if err != nil {
+			return err
+		}
+
+		// S3 expects forward slashes
+		remotePath := filepath.ToSlash(filepath.Join(currentPath, relPath))
+
+		targets = append(targets, UploadTarget{
+			LocalPath:  p,
+			RemotePath: remotePath,
+			Size:       info.Size(),
+		})
+		totalSize += info.Size()
+		return nil
+	})
+
+	if err != nil {
+		return nil, 0, err
+	}
+	return targets, totalSize, nil
 }

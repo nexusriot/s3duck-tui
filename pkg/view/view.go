@@ -7,7 +7,7 @@ import (
 	"github.com/rivo/tview"
 )
 
-const versionText = "S3Duck 🦆 TUI v.0.0.4 - (PoC)"
+const versionText = "S3Duck 🦆 TUI v.0.0.8 - preview"
 
 // View ...
 type View struct {
@@ -36,8 +36,8 @@ func NewView() *View {
 		})
 	tv.SetBorder(true)
 	main := tview.NewFlex()
-	main.AddItem(list, 0, 5, true)
-	main.AddItem(tv, 0, 2, false)
+	main.AddItem(list, 0, 4, true)
+	main.AddItem(tv, 0, 3, false)
 
 	pages := tview.NewPages().
 		AddPage("main", main, true, true)
@@ -82,11 +82,6 @@ func (v *View) SetHeaderVersionText(versionText string) {
 	v.Frame.AddText(fmt.Sprintf(versionText), true, tview.AlignCenter, tcell.ColorGreen)
 }
 
-func (v *View) NewProgressMessage() *tview.Modal {
-	return tview.NewModal().
-		SetText("Downloading\n\n").AddButtons([]string{"Done"})
-}
-
 func (v *View) NewConfirm() *tview.Modal {
 	return tview.NewModal().AddButtons([]string{"OK", "Cancel"})
 }
@@ -103,7 +98,6 @@ func (v *View) NewCreateProfileForm(header string) *tview.Form {
 	form.AddCheckbox("Disable ssl check", false, func(checked bool) {
 	})
 	form.SetBorder(true)
-
 	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyEsc:
@@ -112,6 +106,17 @@ func (v *View) NewCreateProfileForm(header string) *tview.Form {
 		return event
 	})
 	return form
+}
+
+func (v *View) NewCreateLocalFileListForm() (tview.Primitive, *tview.List) {
+	var localList *tview.List
+	localList = tview.NewList().
+		ShowSecondaryText(false)
+
+	flex := tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(localList, 0, 2, true)
+	return flex, localList
 }
 
 func (v *View) NewSuccessMessageQ(header string) *tview.Modal {

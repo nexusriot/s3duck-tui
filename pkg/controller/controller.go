@@ -1,8 +1,9 @@
 package controller
 
 import (
+	"context"
 	"fmt"
-	"github.com/rivo/tview"
+	"os"
 	"path"
 	"path/filepath"
 	"sort"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/dustin/go-humanize"
 	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
 
 	cfg "github.com/nexusriot/s3duck-tui/internal/config"
 	"github.com/nexusriot/s3duck-tui/pkg/model"
@@ -55,7 +57,7 @@ func (c *Controller) makeObjectMap() error {
 	if c.currentBucket == nil {
 		list, err = c.model.ListBuckets()
 		if err != nil {
-			c.error("Failed to list buckets", err, true)
+			go c.error("Failed to list buckets", err, true)
 		}
 	} else {
 		list, err = c.model.List(c.currentPath, c.currentBucket)
@@ -116,110 +118,149 @@ func (c *Controller) Delete() error {
 							err = c.model.Delete(&op, c.currentBucket)
 						}
 						if err != nil {
-							c.error(fmt.Sprintf("Failed to delete %s", cur), err, false)
+							go c.error(fmt.Sprintf("Failed to delete %s", cur), err, false)
 						}
-						c.updateList()
+						go c.updateList()
 					}()
 				}
 			})
-		c.view.Pages.AddAndSwitchToPage("confirm", confirm, true)
+		c.view.Pages.AddPage("confirm", confirm, true, true)
 	}
 	return nil
 }
 
 func (c *Controller) Download() error {
-
 	cur := c.getSelectedObjectName()
-	if val, ok := c.objs[cur]; ok {
-		if val.Ot == model.Folder || val.Ot == model.File {
-
-			cwd := path.Join(c.params.HomeDir, "Downloads")
-			cwd = cwd + fmt.Sprintf("%c", filepath.Separator)
-			key := c.currentPath + cur
-			if val.Ot == model.Folder {
-				key = key + "/"
-			}
-			totalSize := int64(0)
-			objects := c.model.ListObjects(key, c.currentBucket)
-
-			for _, o := range objects {
-				totalSize += o.Size
-			}
-			nos := len(objects)
-			progress := c.view.NewProgressMessage()
-
-			confirm := c.view.NewConfirm()
-			confirm.SetText(fmt.Sprintf("Do you want to download to %s\n%d object(s)\ntotal size %s",
-				cwd,
-				nos,
-				humanize.IBytes(uint64(totalSize)),
-			)).
-				SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-					c.view.Pages.RemovePage("confirm").SwitchToPage("main")
-
-					if buttonLabel == "OK" {
-						c.view.Pages.AddAndSwitchToPage("progress", progress, true)
-
-						go func() {
-							downloadedSize := int64(0)
-							title := "Downloading"
-
-							for i, object := range objects {
-								n, err := c.model.Download(object, c.currentPath, cwd, c.currentBucket.Key)
-
-								if err != nil {
-									c.view.Pages.RemovePage("progress").SwitchToPage("main")
-									c.error(fmt.Sprintf("Failed to download %s", *object.Key), err, false)
-								}
-								downloadedSize += n
-								if i+1 == nos {
-									title = "Downloaded"
-								}
-								c.view.App.QueueUpdateDraw(func() {
-									progress.SetText(fmt.Sprintf("%s\n%d/%d objects\n%s/%s",
-										title,
-										i+1,
-										nos,
-										humanize.IBytes(uint64(downloadedSize)),
-										humanize.IBytes(uint64(totalSize)),
-									))
-								})
-							}
-							progress.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-								c.view.Pages.RemovePage("progress").SwitchToPage("main")
-							})
-						}()
-					}
-				})
-			c.view.Pages.AddAndSwitchToPage("confirm", confirm, true)
-		}
+	val, ok := c.objs[cur]
+	if !ok || (val.Ot != model.File && val.Ot != model.Folder) {
+		return nil
 	}
+
+	cwd := path.Join(c.params.HomeDir, "Downloads") + string(filepath.Separator)
+	key := c.currentPath + cur
+	if val.Ot == model.Folder {
+		key += "/"
+	}
+
+	objects := c.model.ListObjects(key, c.currentBucket)
+	if len(objects) == 0 {
+		return nil
+	}
+
+	totalSize := int64(0)
+	for _, o := range objects {
+		totalSize += o.Size
+	}
+
+	confirm := c.view.NewConfirm()
+	confirm.SetText(fmt.Sprintf("Do you want to download to %s\n%d object(s)\ntotal size %s",
+		cwd,
+		len(objects),
+		humanize.IBytes(uint64(totalSize)),
+	)).SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+		c.view.Pages.RemovePage("confirm").SwitchToPage("main")
+
+		if buttonLabel != "OK" {
+			return
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		progress := tview.NewModal().
+			SetText("Starting download...\n").
+			AddButtons([]string{"Cancel"}).
+			SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+				cancel()
+				c.view.Pages.RemovePage("progress").SwitchToPage("main")
+			})
+		c.view.Pages.AddPage("progress", progress, true, true)
+
+		go func() {
+			downloadedSize := int64(0)
+
+			// Show initial progress for 0%
+			c.view.App.QueueUpdateDraw(func() {
+				progress.SetText(fmt.Sprintf(
+					"Downloading\n0/%d object(s)\n0B/%s (0.0%%)",
+					len(objects),
+					humanize.IBytes(uint64(totalSize)),
+				))
+			})
+
+			for i, object := range objects {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				n, err := c.model.Download(ctx, object, c.currentPath, cwd, c.currentBucket.Key)
+				if err != nil {
+					c.view.App.QueueUpdateDraw(func() {
+						c.view.Pages.RemovePage("progress").SwitchToPage("main")
+					})
+					go c.error(fmt.Sprintf("Failed to download %s", *object.Key), err, false)
+					return
+				}
+
+				downloadedSize += n
+				percentage := float64(downloadedSize) / float64(totalSize) * 100
+
+				c.view.App.QueueUpdateDraw(func() {
+					progress.SetText(fmt.Sprintf(
+						"Downloading\n%d/%d object(s)\n%s/%s (%.1f%%)",
+						i+1, len(objects),
+						humanize.IBytes(uint64(downloadedSize)),
+						humanize.IBytes(uint64(totalSize)),
+						percentage,
+					))
+				})
+			}
+
+			// After download finishes successfully
+			select {
+			case <-ctx.Done():
+				return
+			default:
+				c.view.App.QueueUpdateDraw(func() {
+					progress.ClearButtons()
+					progress.AddButtons([]string{"Done"})
+					progress.SetText("Download complete.\n\nPress Done to return.")
+					progress.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+						c.view.Pages.RemovePage("progress").SwitchToPage("main")
+					})
+					c.view.App.SetFocus(progress)
+				})
+			}
+		}()
+	})
+
+	c.view.Pages.AddPage("confirm", confirm, true, true)
 	return nil
 }
 
 func (c *Controller) updateList() ([]string, error) {
-	c.view.List.Clear()
+	err := c.makeObjectMap()
+	if err != nil {
+		c.view.Pages.RemovePage("modal")
+		go c.error("Failed to fetch folder", err, false)
+		return nil, err
+	}
+
+	var keys []string
 	var title string
 	var suff string
+
 	if c.currentBucket == nil {
 		title = "(buckets)"
 		suff = ""
 	} else {
 		title = fmt.Sprintf("(%s)/%s", *c.currentBucket.Key, c.currentPath)
-		suff = "[::b][d[][::-]Download [::b] "
+		suff = "[::b][ctrl+d[][::-]Download [::b][::b][ctrl+u[][::-]Upload [::b]"
 	}
-	fText := fmt.Sprintf("[::b][↓,↑][::-]Down/Up [::b][Enter/Backspace][::-]Lower/Upper %s[Del[][::-]Delete [c[][::-]Create [p[][::-]Profiles [::b][Ctrl+q][::-]Quit", suff)
-	c.view.SetFrameText(fText)
-	c.view.List.SetTitle(title)
-	err := c.makeObjectMap()
-	if err != nil {
-		c.view.Pages.RemovePage("modal")
-		c.error("Failed to fetch folder", err, false)
-		return nil, err
-	}
-	keys := make([]string, 0, len(c.objs))
-	objs := make([]*model.Object, 0, len(c.objs))
 
+	fText := fmt.Sprintf("[::b][↓,↑][::-]Down/Up [::b][Enter/Backspace][::-]Lower/Upper %s[::b][Del[][::-]Delete [::b][ctrl+b][::-]Create [::b][ctrl+p][::-]Profiles [::b][Ctrl+q][::-]Quit", suff)
+
+	objs := make([]*model.Object, 0, len(c.objs))
 	for _, k := range c.objs {
 		objs = append(objs, k)
 	}
@@ -230,35 +271,49 @@ func (c *Controller) updateList() ([]string, error) {
 		return *objs[i].Key < *objs[j].Key
 	})
 
+	// Extract keys
 	for _, v := range objs {
-		keys = append(keys, *v.Key)
-
-	}
-	for _, key := range keys {
-		c.view.List.AddItem(key, key, 0, func() {
-			i := c.view.List.GetCurrentItem()
-			_, cur := c.view.List.GetItemText(i)
-			cur = strings.TrimSpace(cur)
-			if val, ok := c.objs[cur]; ok {
-				if val.Ot == model.Folder || val.Ot == model.Bucket {
-					if val.Ot == model.Folder {
-						c.position[c.currentPath] = c.view.List.GetCurrentItem()
-					}
-					if val.Ot == model.Bucket {
-						c.bucketPos = c.view.List.GetCurrentItem()
-					}
-					c.Down(cur)
-				}
-			}
-		})
-	}
-	if c.currentBucket != nil {
-		if val, ok := c.position[c.currentPath]; ok {
-			c.view.List.SetCurrentItem(val)
-			delete(c.position, c.currentPath)
+		if v.Key != nil {
+			keys = append(keys, *v.Key)
 		}
 	}
-	return keys, err
+
+	// Queue UI update
+	c.view.App.QueueUpdateDraw(func() {
+		c.view.List.Clear()
+		c.view.List.SetTitle(title)
+		c.view.SetFrameText(fText)
+
+		for _, k := range keys {
+			key := k // capture local copy
+			c.view.List.AddItem(key, key, 0, func() {
+				i := c.view.List.GetCurrentItem()
+				_, cur := c.view.List.GetItemText(i)
+				cur = strings.TrimSpace(cur)
+				if val, ok := c.objs[cur]; ok {
+					if val.Ot == model.Folder || val.Ot == model.Bucket {
+						if val.Ot == model.Folder {
+							c.position[c.currentPath] = c.view.List.GetCurrentItem()
+						}
+						if val.Ot == model.Bucket {
+							c.bucketPos = c.view.List.GetCurrentItem()
+						}
+						c.Down(cur)
+					}
+				}
+			})
+		}
+
+		// Restore position if available
+		if c.currentBucket != nil {
+			if val, ok := c.position[c.currentPath]; ok {
+				c.view.List.SetCurrentItem(val)
+				delete(c.position, c.currentPath)
+			}
+		}
+	})
+
+	return keys, nil
 }
 
 func (c *Controller) findBucketByName(name string) *model.Object {
@@ -284,7 +339,7 @@ func (c *Controller) Down(name string) {
 		c.currentPath = newDir
 	}
 	c.view.Details.Clear()
-	c.updateList()
+	go c.updateList()
 }
 
 func (c *Controller) Up() {
@@ -294,7 +349,7 @@ func (c *Controller) Up() {
 	}
 	fields := strings.FieldsFunc(strings.TrimSpace(c.currentPath), u.SplitFunc)
 	if len(fields) == 0 {
-		c.updateList()
+		go c.updateList()
 		// TODO: do we really need this check?
 		if c.currentBucket == nil {
 			c.view.List.SetCurrentItem(c.bucketPos)
@@ -306,7 +361,7 @@ func (c *Controller) Up() {
 		newDir = newDir + "/"
 	}
 	c.currentPath = newDir
-	c.updateList()
+	go c.updateList()
 }
 
 func (c *Controller) Stop() {
@@ -342,17 +397,17 @@ func (c *Controller) CreateConfigEntry() {
 
 		c.view.Pages.RemovePage("modal")
 		if err != nil {
-			c.error("Error creating config entry", err, false)
+			go c.error("Error creating config entry", err, false)
 		}
 		c.fillConfigData()
 		c.view.List.SetCurrentItem(len(c.params.Config) - 1)
 	})
 
-	cForm.AddButton("Quit", func() {
+	cForm.AddButton("Cancel", func() {
 		c.view.Pages.RemovePage("modal")
 	})
 
-	c.view.Pages.AddPage("modal", c.view.ModalEdit(cForm, 60, 17), true, true)
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(cForm, 75, 17), true, true)
 }
 
 func (c *Controller) EditConfigEntry() {
@@ -397,11 +452,11 @@ func (c *Controller) EditConfigEntry() {
 		c.fillConfigData()
 		c.view.List.SetCurrentItem(i)
 	})
-	cForm.AddButton("Quit", func() {
+	cForm.AddButton("Cancel", func() {
 		c.view.Pages.RemovePage("modal")
 	})
 
-	c.view.Pages.AddPage("modal", c.view.ModalEdit(cForm, 60, 17), true, true)
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(cForm, 75, 17), true, true)
 }
 
 func (c *Controller) CopyProfile() {
@@ -452,18 +507,28 @@ func (c *Controller) create(isBucket bool) {
 		}
 		if err != nil {
 			c.view.Pages.RemovePage("modal")
-			c.error("Error creating object", err, false)
+			go c.error("Error creating object", err, false)
 			return
 		}
 
 		c.view.Pages.RemovePage("modal")
-		keys, err := c.updateList()
 
-		pos := getPosition(name, keys)
-		c.view.List.SetCurrentItem(pos)
+		// Run updateList in a goroutine
+		go func() {
+			keys, err := c.updateList()
+			if err != nil {
+				return
+			}
+			pos := getPosition(name, keys)
+
+			// Set current item on UI thread
+			c.view.App.QueueUpdateDraw(func() {
+				c.view.List.SetCurrentItem(pos)
+			})
+		}()
 	})
 
-	cForm.AddButton("Quit", func() {
+	cForm.AddButton("Cancel", func() {
 		c.view.Pages.RemovePage("modal")
 	})
 
@@ -492,9 +557,9 @@ func (c *Controller) CheckProfile() {
 	_, err := c.model.ListBuckets()
 
 	if err != nil {
-		c.error(fmt.Sprintf("error checking profile %s", cf.Name), err, false)
+		go c.error(fmt.Sprintf("error checking profile %s", cf.Name), err, false)
 	} else {
-		c.success(fmt.Sprintf("successfully checked profile %s", cf.Name))
+		go c.success(fmt.Sprintf("successfully checked profile %s", cf.Name))
 	}
 
 }
@@ -519,7 +584,7 @@ func (c *Controller) DeleteConfigEntry() {
 
 			}
 		})
-	c.view.Pages.AddAndSwitchToPage("confirm", confirm, true)
+	c.view.Pages.AddPage("confirm", confirm, true, true)
 }
 
 func (c *Controller) setConfigInput() {
@@ -537,22 +602,18 @@ func (c *Controller) setConfigInput() {
 
 	c.view.List.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
-		case tcell.KeyRune:
-			switch event.Rune() {
-			// TODO: ctrl + key
-			case 'n':
-				c.CreateConfigEntry()
-				return nil
-			case 'e':
-				c.EditConfigEntry()
-				return nil
-			case 'c':
-				c.CopyProfile()
-				return nil
-			case 'v':
-				c.CheckProfile()
-				return nil
-			}
+		case tcell.KeyCtrlB:
+			c.CreateConfigEntry()
+			return nil
+		case tcell.KeyCtrlH:
+			c.EditConfigEntry()
+			return nil
+		case tcell.KeyCtrlJ:
+			c.CopyProfile()
+			return nil
+		case tcell.KeyCtrlO:
+			c.CheckProfile()
+			return nil
 		}
 		return event
 	})
@@ -575,18 +636,18 @@ func (c *Controller) setInput() {
 		case tcell.KeyBackspace2:
 			c.Up()
 			return nil
-		case tcell.KeyRune:
-			switch event.Rune() {
-			case 'c':
-				c.Create()
-				return nil
-			case 'd':
-				c.Download()
-				return nil
-			case 'p':
-				c.Profiles()
-				return nil
-			}
+		case tcell.KeyCtrlB:
+			c.Create()
+			return nil
+		case tcell.KeyCtrlD:
+			c.Download()
+			return nil
+		case tcell.KeyCtrlP:
+			c.Profiles()
+			return nil
+		case tcell.KeyCtrlU:
+			c.ShowLocalFSModal(c.params.HomeDir)
+			return nil
 		}
 		return event
 	})
@@ -632,11 +693,11 @@ func (c *Controller) fillConfigData() {
 			conf := c.params.Config[i]
 			err := c.Duck(conf.BaseUrl, conf.Region, conf.AccessKey, conf.SecretKey, !conf.IgnoreSsl)
 			if err != nil {
-				c.error("Failed to use profile", err, false)
+				go c.error("Failed to use profile", err, false)
 			}
 		})
 	}
-	c.view.SetFrameText("[::b][↓,↑][::-]Down/Up [::b][Enter[][::-]Use Profile [::b][n[][::-]Create [::b][c[][::-]Copy [::b][e[][::-]Edit [::b][v[][::-]Verify [::b][Del[][::-]Delete")
+	c.view.SetFrameText("[::b][↓,↑][::-]Down/Up [::b][Enter[][::-]Use Profile [::b][ctrl+b[][::-]Create [::b][ctrl+j[][::-]Copy [::b][ctrl+h[][::-]Edit [::b][ctrl+o[][::-]Verify [::b][Del[][::-]Delete [::b][Ctrl+q][::-]Quit")
 }
 
 func (c *Controller) fillDetails(key string) {
@@ -683,7 +744,7 @@ func (c *Controller) Duck(url string, region *string, acc string, sec string, ss
 	c.currentBucket = nil
 	c.currentPath = ""
 	c.bucketPos = 0
-	c.updateList()
+	go c.updateList()
 	c.setInput()
 	return nil
 }
@@ -697,11 +758,12 @@ func (c *Controller) error(header string, err error, fatal bool) {
 	errMsg := c.view.NewErrorMessageQ(header, err.Error())
 	errMsg.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
 		c.view.Pages.RemovePage("modal")
-		if fatal {
-			c.view.App.Stop()
-		}
 	})
-	c.view.Pages.AddPage("modal", c.view.ModalEdit(errMsg, 8, 3), true, true)
+
+	// Call QueueUpdateDraw ONLY for the update
+	c.view.App.QueueUpdateDraw(func() {
+		c.view.Pages.AddPage("modal", c.view.ModalEdit(errMsg, 8, 3), true, true)
+	})
 }
 
 func (c *Controller) success(header string) {
@@ -709,5 +771,201 @@ func (c *Controller) success(header string) {
 	succMsg.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
 		c.view.Pages.RemovePage("modal")
 	})
-	c.view.Pages.AddPage("modal", c.view.ModalEdit(succMsg, 8, 3), true, true)
+
+	// Same here: just view update
+	c.view.App.QueueUpdateDraw(func() {
+		c.view.Pages.AddPage("modal", c.view.ModalEdit(succMsg, 8, 3), true, true)
+	})
+}
+
+func (c *Controller) ShowLocalFSModal(startPath string) {
+	if c.currentBucket == nil {
+		return
+	}
+	currentPath := startPath
+	layout, localList := c.view.NewCreateLocalFileListForm()
+
+	app := c.view.App
+
+	okBtn := tview.NewButton("Upload").SetSelectedFunc(func() {
+		i := localList.GetCurrentItem()
+		name, _ := localList.GetItemText(i)
+		fullPath := filepath.Join(currentPath, strings.TrimSuffix(name, "/"))
+
+		c.view.Pages.RemovePage("modal")
+		err := c.Upload(fullPath)
+		if err != nil {
+			go c.error("Upload failed", err, false)
+		}
+	})
+
+	cancelBtn := tview.NewButton("Cancel").SetSelectedFunc(func() {
+		c.view.Pages.RemovePage("modal")
+	})
+
+	buttonRow := tview.NewFlex().
+		SetDirection(tview.FlexColumn).
+		AddItem(okBtn, 0, 1, false).
+		AddItem(tview.NewBox(), 2, 0, false). // <- spacer: fixed width 2
+		AddItem(cancelBtn, 0, 1, false)
+
+	flex, _ := layout.(*tview.Flex)
+	flex.AddItem(buttonRow, 1, 0, false)
+
+	// Maintain focusable order
+	focusables := []tview.Primitive{localList, okBtn, cancelBtn}
+	focusIndex := 0
+	setNextFocus := func() {
+		focusIndex = (focusIndex + 1) % len(focusables)
+		app.SetFocus(focusables[focusIndex])
+	}
+
+	var renderList func(string)
+	renderList = func(curPath string) {
+		currentPath = curPath
+		localList.Clear()
+		localList.SetTitle(fmt.Sprintf("Local FS: %s", curPath)).SetBorder(true)
+
+		entries, err := os.ReadDir(curPath)
+		if err != nil {
+			go c.error("Failed to read directory", err, false)
+			return
+		}
+
+		sort.Slice(entries, func(i, j int) bool {
+			if entries[i].IsDir() != entries[j].IsDir() {
+				return entries[i].IsDir()
+			}
+			return entries[i].Name() < entries[j].Name()
+		})
+
+		for _, entry := range entries {
+			name := entry.Name()
+			fullPath := filepath.Join(curPath, name)
+			display := name
+			if entry.IsDir() {
+				display += "/"
+			}
+			localList.AddItem(display, "", 0, func(p string, isDir bool) func() {
+				return func() {
+					if isDir {
+						renderList(p)
+					}
+				}
+			}(fullPath, entry.IsDir()))
+		}
+	}
+
+	localList.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyTab:
+			setNextFocus()
+			return nil
+		case tcell.KeyEsc:
+			c.view.Pages.RemovePage("modal")
+			return nil
+		case tcell.KeyBackspace2:
+			parent := filepath.Dir(currentPath)
+			renderList(parent)
+			return nil
+		}
+		return event
+	})
+
+	okBtn.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyTab {
+			setNextFocus()
+			return nil
+		}
+		return event
+	})
+	cancelBtn.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyTab {
+			setNextFocus()
+			return nil
+		}
+		return event
+	})
+
+	modal := c.view.ModalEdit(layout, 60, 25)
+	c.view.Pages.AddPage("modal", modal, true, true)
+	renderList(startPath) // Initial directory render
+}
+
+func (c *Controller) Upload(localPath string) error {
+	ctx, cancel := context.WithCancel(context.Background())
+	progress := tview.NewModal().
+		SetText("Starting upload...\n").
+		AddButtons([]string{"Cancel"}).
+		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+			cancel()
+			c.view.Pages.RemovePage("progress").SwitchToPage("main")
+		})
+
+	files, totalSize, err := c.model.PrepareUpload(localPath, c.currentPath, c.currentBucket)
+	if err != nil || len(files) == 0 {
+		c.error("No files to upload", fmt.Errorf("nothing selected"), false)
+		return nil
+	}
+
+	first := files[0]
+
+	c.view.Pages.AddPage("progress", progress, true, true)
+	progress.SetText(fmt.Sprintf(
+		"Uploading\n0/%d file(s)\n0B/%s (0.0%%)\nLast: %s\n-> %s",
+		len(files),
+		humanize.IBytes(uint64(totalSize)),
+		first.LocalPath,
+		first.RemotePath,
+	))
+
+	go func() {
+		err := c.model.Upload(ctx, localPath, c.currentPath, c.currentBucket, func(n, total int64, i, count int, local, remote string) {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+
+			percentage := float64(n) / float64(total) * 100
+			c.view.App.QueueUpdateDraw(func() {
+				progress.SetText(fmt.Sprintf(
+					"Uploading\n%d/%d file(s)\n%s/%s (%.1f%%)\nLast: %s\n-> %s",
+					i, count,
+					humanize.IBytes(uint64(n)),
+					humanize.IBytes(uint64(total)),
+					percentage,
+					local,
+					remote,
+				))
+			})
+		})
+
+		select {
+		case <-ctx.Done():
+			go c.updateList()
+			return
+		default:
+			c.view.App.QueueUpdateDraw(func() {
+				if err != nil {
+					c.view.Pages.RemovePage("progress").SwitchToPage("main")
+					c.error("Upload failed", err, false)
+					return
+				}
+
+				// Clear previous Cancel button and add Done
+				progress.ClearButtons()
+				progress.SetText("Upload complete.\n\nPress Done to return.")
+				progress.AddButtons([]string{"Done"})
+				progress.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+					c.view.Pages.RemovePage("progress").SwitchToPage("main")
+					go c.updateList()
+				})
+
+				c.view.App.SetFocus(progress)
+			})
+		}
+	}()
+
+	return nil
 }
