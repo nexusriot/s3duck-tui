@@ -33,6 +33,12 @@ const (
 	Bucket
 )
 
+type UploadTarget struct {
+	LocalPath  string
+	RemotePath string
+	Size       int64
+}
+
 type Config struct {
 	Url       string
 	Region    *string
@@ -448,4 +454,40 @@ func (m *Model) Upload(localPath, s3Prefix string, bucket *Object, progressCb fu
 	}
 
 	return nil
+}
+
+// PrepareUpload returns list of files to upload with remote keys and total size.
+func (m *Model) PrepareUpload(localPath string, currentPath string, bucket *Object) ([]UploadTarget, int64, error) {
+	var targets []UploadTarget
+	var totalSize int64
+
+	err := filepath.Walk(localPath, func(p string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err // skip unreadable file
+		}
+		if info.IsDir() {
+			return nil
+		}
+
+		relPath, err := filepath.Rel(localPath, p)
+		if err != nil {
+			return err
+		}
+
+		// S3 expects forward slashes
+		remotePath := filepath.ToSlash(filepath.Join(currentPath, relPath))
+
+		targets = append(targets, UploadTarget{
+			LocalPath:  p,
+			RemotePath: remotePath,
+			Size:       info.Size(),
+		})
+		totalSize += info.Size()
+		return nil
+	})
+
+	if err != nil {
+		return nil, 0, err
+	}
+	return targets, totalSize, nil
 }

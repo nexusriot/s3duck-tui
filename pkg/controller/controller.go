@@ -874,12 +874,27 @@ func (c *Controller) ShowLocalFSModal(startPath string) {
 
 func (c *Controller) Upload(localPath string) error {
 	progress := c.view.NewProgressMessage()
+
+	files, totalSize, err := c.model.PrepareUpload(localPath, c.currentPath, c.currentBucket)
+	if err != nil || len(files) == 0 {
+		go c.error("No files to upload", fmt.Errorf("nothing selected"), false)
+		return nil
+	}
+
+	first := files[0]
+
 	c.view.Pages.AddPage("progress", progress, true, true)
+	progress.SetText(fmt.Sprintf(
+		"Uploading\n0/%d file(s)\n0B/%s (0.0%%)\nLast: %s\n-> %s",
+		len(files),
+		humanize.IBytes(uint64(totalSize)),
+		first.LocalPath,
+		first.RemotePath,
+	))
 
 	go func() {
 		err := c.model.Upload(localPath, c.currentPath, c.currentBucket, func(n, total int64, i, count int, local, remote string) {
 			percentage := float64(n) / float64(total) * 100
-
 			c.view.App.QueueUpdateDraw(func() {
 				progress.SetText(fmt.Sprintf(
 					"Uploading\n%d/%d file(s)\n%s/%s (%.1f%%)\nLast: %s\n-> %s",
