@@ -364,7 +364,7 @@ func (m *Model) DeleteBucket(name *string) error {
 	return err
 }
 
-func (m *Model) CreateBucket(name *string) error {
+func (m *Model) CreateBucket(name *string, public bool) error {
 	region := aws.ToString(m.Cf.Region)
 
 	input := &s3.CreateBucketInput{
@@ -382,6 +382,12 @@ func (m *Model) CreateBucket(name *string) error {
 	_, err := m.Client.CreateBucket(context.TODO(), input)
 	if err != nil {
 		return fmt.Errorf("failed to create bucket: %w", err)
+	}
+	if public {
+		err = m.MakeBucketPublic(*name)
+		if err != nil {
+			return fmt.Errorf("bucket created, but failed to make it public: %v", err)
+		}
 	}
 	return nil
 }
@@ -502,4 +508,23 @@ func (m *Model) PrepareUpload(localPath string, currentPath string, bucket *Obje
 		return nil, 0, err
 	}
 	return targets, totalSize, nil
+}
+
+func (m *Model) MakeBucketPublic(bucketName string) error {
+	policy := fmt.Sprintf(`{
+		"Version":"2012-10-17",
+		"Statement":[{
+			"Sid":"PublicReadGetObject",
+			"Effect":"Allow",
+			"Principal": "*",
+			"Action":["s3:GetObject"],
+			"Resource":["arn:aws:s3:::%s/*"]
+		}]
+	}`, bucketName)
+
+	_, err := m.Client.PutBucketPolicy(context.TODO(), &s3.PutBucketPolicyInput{
+		Bucket: aws.String(bucketName),
+		Policy: aws.String(policy),
+	})
+	return err
 }

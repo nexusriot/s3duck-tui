@@ -258,7 +258,7 @@ func (c *Controller) updateList() ([]string, error) {
 		suff = "[::b][ctrl+d[][::-]Download [::b][::b][ctrl+u[][::-]Upload [::b]"
 	}
 
-	fText := fmt.Sprintf("[::b][↓,↑][::-]Down/Up [::b][Enter/Backspace][::-]Lower/Upper %s[::b][Del[][::-]Delete [::b][ctrl+b][::-]Create [::b][ctrl+p][::-]Profiles [::b][Ctrl+q][::-]Quit", suff)
+	fText := fmt.Sprintf("[::b][↓,↑][::-]Down/Up [::b][Enter/Backspace][::-]Lower/Upper %s[::b][Del[][::-]Delete [::b][ctrl+b][::-]Create [::b][ctrl+p][::-]Profiles [::b][ctrl+l][::-]Properties [::b][Ctrl+q][::-]Quit", suff)
 
 	objs := make([]*model.Object, 0, len(c.objs))
 	for _, k := range c.objs {
@@ -489,18 +489,22 @@ func (c *Controller) CopyProfile() {
 
 func (c *Controller) create(isBucket bool) {
 	var oTp string
+	var disableBool bool
 	if isBucket {
 		oTp = "bucket"
+		disableBool = true
 	} else {
 		oTp = "folder"
+		disableBool = false
 	}
-	cForm := c.view.NewCreateForm(fmt.Sprintf("Create %s", oTp))
+	cForm := c.view.NewCreateForm(fmt.Sprintf("Create %s", oTp), disableBool)
 	cForm.AddButton("Save", func() {
 		var err error
 		name := cForm.GetFormItem(0).(*tview.InputField).GetText()
+		public := cForm.GetFormItem(1).(*tview.Checkbox).IsChecked()
 
 		if isBucket {
-			err = c.model.CreateBucket(&name)
+			err = c.model.CreateBucket(&name, public)
 		} else {
 			key := path.Join(c.currentPath, name) + "/"
 			err = c.model.CreateFolder(&key, c.currentBucket)
@@ -532,11 +536,12 @@ func (c *Controller) create(isBucket bool) {
 		c.view.Pages.RemovePage("modal")
 	})
 
-	c.view.Pages.AddPage("modal", c.view.ModalEdit(cForm, 60, 8), true, true)
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(cForm, 65, 9), true, true)
 }
 
 func (c *Controller) Create() {
 	if c.currentBucket == nil {
+		// TODO: respect isPublic
 		c.create(true)
 		return
 	}
@@ -644,6 +649,10 @@ func (c *Controller) setInput() {
 			return nil
 		case tcell.KeyCtrlP:
 			c.Profiles()
+			return nil
+		case tcell.KeyCtrlL:
+			cur := c.getSelectedObjectName()
+			c.ShowFileProperties(cur)
 			return nil
 		case tcell.KeyCtrlU:
 			c.ShowLocalFSModal(c.params.HomeDir)
@@ -968,4 +977,48 @@ func (c *Controller) Upload(localPath string) error {
 	}()
 
 	return nil
+}
+
+func (c *Controller) ShowFileProperties(key string) {
+	obj, ok := c.objs[key]
+	if !ok || obj.Ot != model.File {
+		return
+	}
+
+	bucketName := *c.currentBucket.Key
+	fullPath := *obj.FullPath
+
+	// Determine if it's AWS-style or custom endpoint
+	var url string
+	if strings.Contains(c.model.Cf.Url, "amazonaws.com") && c.model.Cf.Region != nil {
+		url = fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", bucketName, *c.model.Cf.Region, fullPath)
+	} else {
+		scheme := "https"
+		if !c.model.Cf.SSl {
+			scheme = "http"
+		}
+		url = fmt.Sprintf("%s://%s/%s/%s", scheme, c.model.Cf.Url, bucketName, fullPath)
+	}
+
+	text := fmt.Sprintf(
+		"[green]Name: [white]%s\n[green]Size: [white]%s\n[green]Modified: [white]%v\n[green]Etag: [white]%s\n[green]Link: [blue]%s",
+		*obj.Key,
+		humanize.IBytes(uint64(*obj.Size)),
+		obj.LastModified,
+		*obj.Etag,
+		url,
+	)
+
+	modal := tview.NewModal().
+		SetText(text).
+		AddButtons([]string{"Copy Link", "Close"}).
+		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+			c.view.Pages.RemovePage("modal")
+			if buttonLabel == "Copy Link" {
+				u.CopyToClipboard(url)
+				go c.success("Link copied to clipboard")
+			}
+		})
+
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(modal, 75, 12), true, true)
 }
