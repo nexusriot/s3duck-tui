@@ -528,3 +528,65 @@ func (m *Model) MakeBucketPublic(bucketName string) error {
 	})
 	return err
 }
+
+func (m *Model) CreateBucketWithPolicy(name *string, makePublic bool) error {
+	region := aws.ToString(m.Cf.Region)
+	ctx := context.TODO()
+
+	// 1. Create the bucket
+	input := &s3.CreateBucketInput{
+		Bucket: aws.String(*name),
+		ACL:    s3t.BucketCannedACLPrivate,
+	}
+	if region != "" && region != "us-east-1" {
+		input.CreateBucketConfiguration = &s3t.CreateBucketConfiguration{
+			LocationConstraint: s3t.BucketLocationConstraint(region),
+		}
+	}
+
+	_, err := m.Client.CreateBucket(ctx, input)
+	if err != nil {
+		return fmt.Errorf("failed to create bucket: %w", err)
+	}
+
+	// ✅ Wait a moment for consistency
+	time.Sleep(1 * time.Second)
+
+	if makePublic {
+		// 2. Disable all public access blocks
+		_, err = m.Client.PutPublicAccessBlock(ctx, &s3.PutPublicAccessBlockInput{
+			Bucket: name,
+			PublicAccessBlockConfiguration: &s3t.PublicAccessBlockConfiguration{
+				BlockPublicAcls:       false,
+				IgnorePublicAcls:      false,
+				BlockPublicPolicy:     false,
+				RestrictPublicBuckets: false,
+			},
+		})
+		if err != nil {
+			return fmt.Errorf("failed to disable public access block: %w", err)
+		}
+
+		// 3. Set public-read policy
+		policy := fmt.Sprintf(`{
+			"Version":"2012-10-17",
+			"Statement":[{
+				"Sid":"PublicReadGetObject",
+				"Effect":"Allow",
+				"Principal": "*",
+				"Action":["s3:GetObject"],
+				"Resource":["arn:aws:s3:::%s/*"]
+			}]
+		}`, *name)
+
+		_, err = m.Client.PutBucketPolicy(ctx, &s3.PutBucketPolicyInput{
+			Bucket: name,
+			Policy: aws.String(policy),
+		})
+		if err != nil {
+			return fmt.Errorf("failed to apply public policy: %w", err)
+		}
+	}
+
+	return nil
+}

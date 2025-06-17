@@ -504,7 +504,7 @@ func (c *Controller) create(isBucket bool) {
 		public := cForm.GetFormItem(1).(*tview.Checkbox).IsChecked()
 
 		if isBucket {
-			err = c.model.CreateBucket(&name, public)
+			err = c.model.CreateBucketWithPolicy(&name, public)
 		} else {
 			key := path.Join(c.currentPath, name) + "/"
 			err = c.model.CreateFolder(&key, c.currentBucket)
