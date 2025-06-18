@@ -57,7 +57,7 @@ func (c *Controller) makeObjectMap() error {
 	if c.currentBucket == nil {
 		list, err = c.model.ListBuckets()
 		if err != nil {
-			go c.error("Failed to list buckets", err, true)
+			return err
 		}
 	} else {
 		list, err = c.model.List(c.currentPath, c.currentBucket)
@@ -117,10 +117,14 @@ func (c *Controller) Delete() error {
 							}
 							err = c.model.Delete(&op, c.currentBucket)
 						}
-						if err != nil {
-							go c.error(fmt.Sprintf("Failed to delete %s", cur), err, false)
-						}
-						go c.updateList()
+						go func() {
+							if err != nil {
+								c.error(fmt.Sprintf("Failed to delete %s", cur), err, false)
+							} else {
+								c.updateList()
+							}
+						}()
+
 					}()
 				}
 			})
@@ -241,7 +245,6 @@ func (c *Controller) Download() error {
 func (c *Controller) updateList() ([]string, error) {
 	err := c.makeObjectMap()
 	if err != nil {
-		c.view.Pages.RemovePage("modal")
 		go c.error("Failed to fetch folder", err, false)
 		return nil, err
 	}
@@ -504,7 +507,7 @@ func (c *Controller) create(isBucket bool) {
 		public := cForm.GetFormItem(1).(*tview.Checkbox).IsChecked()
 
 		if isBucket {
-			err = c.model.CreateBucketWithPolicy(&name, public)
+			err = c.model.CreateBucket(&name, public)
 		} else {
 			key := path.Join(c.currentPath, name) + "/"
 			err = c.model.CreateFolder(&key, c.currentBucket)
@@ -541,7 +544,6 @@ func (c *Controller) create(isBucket bool) {
 
 func (c *Controller) Create() {
 	if c.currentBucket == nil {
-		// TODO: respect isPublic
 		c.create(true)
 		return
 	}
@@ -700,10 +702,7 @@ func (c *Controller) fillConfigData() {
 		c.view.List.AddItem(cf.Name, cf.Name, 0, func() {
 			i := c.view.List.GetCurrentItem()
 			conf := c.params.Config[i]
-			err := c.Duck(conf.BaseUrl, conf.Region, conf.AccessKey, conf.SecretKey, !conf.IgnoreSsl)
-			if err != nil {
-				go c.error("Failed to use profile", err, false)
-			}
+			c.Duck(conf.BaseUrl, conf.Region, conf.AccessKey, conf.SecretKey, !conf.IgnoreSsl)
 		})
 	}
 	c.view.SetFrameText("[::b][↓,↑][::-]Down/Up [::b][Enter[][::-]Use Profile [::b][ctrl+b[][::-]Create [::b][ctrl+j[][::-]Copy [::b][ctrl+h[][::-]Edit [::b][ctrl+o[][::-]Verify [::b][Del[][::-]Delete [::b][Ctrl+q][::-]Quit")
@@ -742,7 +741,7 @@ func (c *Controller) fillDetails(key string) {
 	}
 }
 
-func (c *Controller) Duck(url string, region *string, acc string, sec string, ssl bool) error {
+func (c *Controller) Duck(url string, region *string, acc string, sec string, ssl bool) {
 	mCf := model.NewConfig(url, region, acc, sec, ssl)
 	c.model = model.NewModel(mCf)
 	c.view.List.SetChangedFunc(func(i int, s string, s2 string, r rune) {
@@ -753,9 +752,11 @@ func (c *Controller) Duck(url string, region *string, acc string, sec string, ss
 	c.currentBucket = nil
 	c.currentPath = ""
 	c.bucketPos = 0
-	go c.updateList()
-	c.setInput()
-	return nil
+	go func() {
+		if _, err := c.updateList(); err == nil {
+			c.setInput()
+		}
+	}()
 }
 
 func (c *Controller) Run() error {
@@ -993,11 +994,7 @@ func (c *Controller) ShowFileProperties(key string) {
 	if strings.Contains(c.model.Cf.Url, "amazonaws.com") && c.model.Cf.Region != nil {
 		url = fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", bucketName, *c.model.Cf.Region, fullPath)
 	} else {
-		scheme := "https"
-		if !c.model.Cf.SSl {
-			scheme = "http"
-		}
-		url = fmt.Sprintf("%s://%s/%s/%s", scheme, c.model.Cf.Url, bucketName, fullPath)
+		url = fmt.Sprintf("%s/%s/%s", c.model.Cf.Url, bucketName, fullPath)
 	}
 
 	text := fmt.Sprintf(
