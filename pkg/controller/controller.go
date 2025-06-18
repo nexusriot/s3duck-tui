@@ -57,7 +57,7 @@ func (c *Controller) makeObjectMap() error {
 	if c.currentBucket == nil {
 		list, err = c.model.ListBuckets()
 		if err != nil {
-			go c.error("Failed to list buckets", err, true)
+			return err
 		}
 	} else {
 		list, err = c.model.List(c.currentPath, c.currentBucket)
@@ -117,10 +117,14 @@ func (c *Controller) Delete() error {
 							}
 							err = c.model.Delete(&op, c.currentBucket)
 						}
-						if err != nil {
-							go c.error(fmt.Sprintf("Failed to delete %s", cur), err, false)
-						}
-						go c.updateList()
+						go func() {
+							if err != nil {
+								c.error(fmt.Sprintf("Failed to delete %s", cur), err, false)
+							} else {
+								c.updateList()
+							}
+						}()
+
 					}()
 				}
 			})
@@ -241,7 +245,6 @@ func (c *Controller) Download() error {
 func (c *Controller) updateList() ([]string, error) {
 	err := c.makeObjectMap()
 	if err != nil {
-		c.view.Pages.RemovePage("modal")
 		go c.error("Failed to fetch folder", err, false)
 		return nil, err
 	}
@@ -258,7 +261,7 @@ func (c *Controller) updateList() ([]string, error) {
 		suff = "[::b][ctrl+d[][::-]Download [::b][::b][ctrl+u[][::-]Upload [::b]"
 	}
 
-	fText := fmt.Sprintf("[::b][↓,↑][::-]Down/Up [::b][Enter/Backspace][::-]Lower/Upper %s[::b][Del[][::-]Delete [::b][ctrl+b][::-]Create [::b][ctrl+p][::-]Profiles [::b][Ctrl+q][::-]Quit", suff)
+	fText := fmt.Sprintf("[::b][↓,↑][::-]Down/Up [::b][Enter/Backspace][::-]Lower/Upper %s[::b][Del[][::-]Delete [::b][ctrl+b][::-]Create [::b][ctrl+p][::-]Profiles [::b][ctrl+l][::-]Properties [::b][Ctrl+q][::-]Quit", suff)
 
 	objs := make([]*model.Object, 0, len(c.objs))
 	for _, k := range c.objs {
@@ -489,18 +492,26 @@ func (c *Controller) CopyProfile() {
 
 func (c *Controller) create(isBucket bool) {
 	var oTp string
+	var disableBool bool
 	if isBucket {
 		oTp = "bucket"
+		disableBool = true
 	} else {
 		oTp = "folder"
+		disableBool = false
 	}
-	cForm := c.view.NewCreateForm(fmt.Sprintf("Create %s", oTp))
+	cForm := c.view.NewCreateForm(fmt.Sprintf("Create %s", oTp), disableBool)
 	cForm.AddButton("Save", func() {
 		var err error
 		name := cForm.GetFormItem(0).(*tview.InputField).GetText()
 
+		if name == "" {
+			return
+		}
+
 		if isBucket {
-			err = c.model.CreateBucket(&name)
+			public := cForm.GetFormItem(1).(*tview.Checkbox).IsChecked()
+			err = c.model.CreateBucket(&name, public)
 		} else {
 			key := path.Join(c.currentPath, name) + "/"
 			err = c.model.CreateFolder(&key, c.currentBucket)
@@ -532,7 +543,7 @@ func (c *Controller) create(isBucket bool) {
 		c.view.Pages.RemovePage("modal")
 	})
 
-	c.view.Pages.AddPage("modal", c.view.ModalEdit(cForm, 60, 8), true, true)
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(cForm, 65, 9), true, true)
 }
 
 func (c *Controller) Create() {
@@ -645,6 +656,10 @@ func (c *Controller) setInput() {
 		case tcell.KeyCtrlP:
 			c.Profiles()
 			return nil
+		case tcell.KeyCtrlL:
+			cur := c.getSelectedObjectName()
+			c.ShowFileProperties(cur)
+			return nil
 		case tcell.KeyCtrlU:
 			c.ShowLocalFSModal(c.params.HomeDir)
 			return nil
@@ -691,10 +706,7 @@ func (c *Controller) fillConfigData() {
 		c.view.List.AddItem(cf.Name, cf.Name, 0, func() {
 			i := c.view.List.GetCurrentItem()
 			conf := c.params.Config[i]
-			err := c.Duck(conf.BaseUrl, conf.Region, conf.AccessKey, conf.SecretKey, !conf.IgnoreSsl)
-			if err != nil {
-				go c.error("Failed to use profile", err, false)
-			}
+			c.Duck(conf.BaseUrl, conf.Region, conf.AccessKey, conf.SecretKey, !conf.IgnoreSsl)
 		})
 	}
 	c.view.SetFrameText("[::b][↓,↑][::-]Down/Up [::b][Enter[][::-]Use Profile [::b][ctrl+b[][::-]Create [::b][ctrl+j[][::-]Copy [::b][ctrl+h[][::-]Edit [::b][ctrl+o[][::-]Verify [::b][Del[][::-]Delete [::b][Ctrl+q][::-]Quit")
@@ -733,7 +745,7 @@ func (c *Controller) fillDetails(key string) {
 	}
 }
 
-func (c *Controller) Duck(url string, region *string, acc string, sec string, ssl bool) error {
+func (c *Controller) Duck(url string, region *string, acc string, sec string, ssl bool) {
 	mCf := model.NewConfig(url, region, acc, sec, ssl)
 	c.model = model.NewModel(mCf)
 	c.view.List.SetChangedFunc(func(i int, s string, s2 string, r rune) {
@@ -744,9 +756,11 @@ func (c *Controller) Duck(url string, region *string, acc string, sec string, ss
 	c.currentBucket = nil
 	c.currentPath = ""
 	c.bucketPos = 0
-	go c.updateList()
-	c.setInput()
-	return nil
+	go func() {
+		if _, err := c.updateList(); err == nil {
+			c.setInput()
+		}
+	}()
 }
 
 func (c *Controller) Run() error {
@@ -968,4 +982,44 @@ func (c *Controller) Upload(localPath string) error {
 	}()
 
 	return nil
+}
+
+func (c *Controller) ShowFileProperties(key string) {
+	obj, ok := c.objs[key]
+	if !ok || obj.Ot != model.File {
+		return
+	}
+
+	bucketName := *c.currentBucket.Key
+	fullPath := *obj.FullPath
+
+	// Determine if it's AWS-style or custom endpoint
+	var url string
+	if strings.Contains(c.model.Cf.Url, "amazonaws.com") && c.model.Cf.Region != nil {
+		url = fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", bucketName, *c.model.Cf.Region, fullPath)
+	} else {
+		url = fmt.Sprintf("%s/%s/%s", c.model.Cf.Url, bucketName, fullPath)
+	}
+
+	text := fmt.Sprintf(
+		"[green]Name: [white]%s\n[green]Size: [white]%s\n[green]Modified: [white]%v\n[green]Etag: [white]%s\n[green]Link: [blue]%s",
+		*obj.Key,
+		humanize.IBytes(uint64(*obj.Size)),
+		obj.LastModified,
+		*obj.Etag,
+		url,
+	)
+
+	modal := tview.NewModal().
+		SetText(text).
+		AddButtons([]string{"Copy Link", "Close"}).
+		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+			c.view.Pages.RemovePage("modal")
+			if buttonLabel == "Copy Link" {
+				u.CopyToClipboard(url)
+				go c.success("Link copied to clipboard")
+			}
+		})
+
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(modal, 75, 12), true, true)
 }

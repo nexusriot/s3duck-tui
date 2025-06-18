@@ -7,7 +7,7 @@ import (
 	"github.com/rivo/tview"
 )
 
-const versionText = "S3Duck 🦆 TUI v.0.0.8 - preview"
+const versionText = "S3Duck 🦆 TUI v.0.0.9 - preview"
 
 // View ...
 type View struct {
@@ -125,13 +125,15 @@ func (v *View) NewSuccessMessageQ(header string) *tview.Modal {
 	return successQ
 }
 
-func (v *View) NewCreateForm(header string) *tview.Form {
+func (v *View) NewCreateForm(header string, disablePublic bool) *tview.Form {
 	form := tview.NewForm()
 
 	form.SetTitle(header)
 	form.AddInputField("Name", "", 52, nil, nil)
+	if disablePublic {
+		form.AddCheckbox("Public?", false, func(checked bool) {})
+	}
 	form.SetBorder(true)
-
 	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyEsc:
