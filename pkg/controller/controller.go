@@ -504,9 +504,13 @@ func (c *Controller) create(isBucket bool) {
 	cForm.AddButton("Save", func() {
 		var err error
 		name := cForm.GetFormItem(0).(*tview.InputField).GetText()
-		public := cForm.GetFormItem(1).(*tview.Checkbox).IsChecked()
+
+		if name == "" {
+			return
+		}
 
 		if isBucket {
+			public := cForm.GetFormItem(1).(*tview.Checkbox).IsChecked()
 			err = c.model.CreateBucket(&name, public)
 		} else {
 			key := path.Join(c.currentPath, name) + "/"
