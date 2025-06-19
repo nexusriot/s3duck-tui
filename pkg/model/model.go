@@ -78,6 +78,20 @@ func (pr *progressReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+type progressWriterAt struct {
+	w          io.WriterAt
+	written    int64
+	total      int64
+	updateFunc func(written int64, total int64)
+}
+
+func (pwa *progressWriterAt) WriteAt(p []byte, off int64) (int, error) {
+	n, err := pwa.w.WriteAt(p, off)
+	pwa.written += int64(n)
+	pwa.updateFunc(pwa.written, pwa.total)
+	return n, err
+}
+
 func GetDownloader(client *s3.Client) *s3m.Downloader {
 	d := s3m.NewDownloader(client, func(d *s3m.Downloader) {
 		d.BufferProvider = s3m.NewPooledBufferedWriterReadFromProvider(5 * 1024 * 1024)
@@ -195,27 +209,33 @@ func (m *Model) ListObjects(key string, bucket *Object) []s3t.Object {
 	return objects
 }
 
-func (m *Model) Download(ctx context.Context, object s3t.Object, currentPath, destPath string, bucket *string) (n int64, err error) {
-	if err = os.MkdirAll(destPath, 0700); err != nil {
+func (m *Model) Download(
+	ctx context.Context,
+	object s3t.Object,
+	currentPath, destPath string,
+	bucket *string,
+	totalSize int64,
+	progressCb func(written int64, total int64, key string),
+) (int64, error) {
+	if err := os.MkdirAll(destPath, 0700); err != nil {
 		return 0, err
 	}
 
-	p, _ := filepath.Rel(currentPath, *object.Key)
-	dp := path.Join(destPath, p)
+	relativePath, _ := filepath.Rel(currentPath, *object.Key)
+	downloadPath := path.Join(destPath, relativePath)
 
 	if strings.HasSuffix(*object.Key, "/") {
-		err = os.MkdirAll(dp, 0760)
-		return 0, nil
+		return 0, os.MkdirAll(downloadPath, 0760)
 	}
-	dir := filepath.Dir(dp)
-	err = os.MkdirAll(dir, 0760)
-
-	_, err = os.Stat(dp)
-	if err == nil {
-		return 0, fmt.Errorf("file exists: %s", dp)
+	dir := filepath.Dir(downloadPath)
+	if err := os.MkdirAll(dir, 0760); err != nil {
+		return 0, err
+	}
+	if _, err := os.Stat(downloadPath); err == nil {
+		return 0, fmt.Errorf("file exists: %s", downloadPath)
 	}
 
-	fp, err := os.Create(dp)
+	fp, err := os.Create(downloadPath)
 	if err != nil {
 		return 0, err
 	}
@@ -225,18 +245,23 @@ func (m *Model) Download(ctx context.Context, object s3t.Object, currentPath, de
 		}
 	}()
 
-	n, err = m.Downloader.Download(
-		ctx,
-		fp,
-		&s3.GetObjectInput{
-			Bucket: aws.String(*bucket),
-			Key:    object.Key,
+	writerAt := &progressWriterAt{
+		w:     fp,
+		total: object.Size,
+		updateFunc: func(written int64, total int64) {
+			if progressCb != nil {
+				progressCb(written, total, *object.Key)
+			}
 		},
-	)
+	}
+
+	n, err := m.Downloader.Download(ctx, writerAt, &s3.GetObjectInput{
+		Bucket: bucket,
+		Key:    object.Key,
+	})
 
 	if ctx.Err() != nil {
-		// Cleanup partial file
-		os.Remove(dp)
+		os.Remove(downloadPath)
 		return 0, ctx.Err()
 	}
 
