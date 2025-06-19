@@ -221,8 +221,19 @@ func (m *Model) Download(
 		return 0, err
 	}
 
-	relativePath, _ := filepath.Rel(currentPath, *object.Key)
-	downloadPath := path.Join(destPath, relativePath)
+	key := filepath.ToSlash(*object.Key)
+	prefix := filepath.ToSlash(currentPath)
+
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+
+	relativeKey := key
+	if strings.HasPrefix(key, prefix) {
+		relativeKey = strings.TrimPrefix(key, prefix)
+	}
+
+	downloadPath := filepath.Join(destPath, relativeKey)
 
 	if strings.HasSuffix(*object.Key, "/") {
 		return 0, os.MkdirAll(downloadPath, 0760)
@@ -495,7 +506,7 @@ func (m *Model) Upload(
 			relPath, _ = filepath.Rel(localPath, fpath)
 			relPath = filepath.ToSlash(relPath)
 		}
-		s3Key := path.Join(s3Prefix, filepath.Base(localPath), relPath)
+		s3Key := path.Join(s3Prefix, relPath) // ✅ clean and correct
 
 		pr := &progressReader{
 			r:     fp,

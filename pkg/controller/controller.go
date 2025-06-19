@@ -122,6 +122,7 @@ func (c *Controller) Delete() error {
 								c.error(fmt.Sprintf("Failed to delete %s", cur), err, false)
 							} else {
 								c.updateList()
+								c.clearDetailsIfNoSelection()
 							}
 						}()
 
@@ -134,6 +135,11 @@ func (c *Controller) Delete() error {
 }
 
 func (c *Controller) Download() error {
+
+	if c.view.List.GetItemCount() == 0 {
+		return nil
+	}
+
 	cur := c.getSelectedObjectName()
 	val, ok := c.objs[cur]
 	if !ok || (val.Ot != model.File && val.Ot != model.Folder) {
@@ -1012,4 +1018,22 @@ func (c *Controller) ShowFileProperties(key string) {
 		})
 
 	c.view.Pages.AddPage("modal", c.view.ModalEdit(modal, 75, 12), true, true)
+}
+
+func (c *Controller) clearDetailsIfNoSelection() {
+	c.view.App.QueueUpdateDraw(func() {
+		if c.view.List.GetItemCount() == 0 {
+			c.view.Details.Clear()
+			return
+		}
+		i := c.view.List.GetCurrentItem()
+		if i < 0 {
+			c.view.Details.Clear()
+			return
+		}
+		_, cur := c.view.List.GetItemText(i)
+		if strings.TrimSpace(cur) == "" {
+			c.view.Details.Clear()
+		}
+	})
 }
