@@ -382,8 +382,6 @@ func (c *Controller) CreateConfigEntry() {
 		if reg != "" {
 			region = &reg
 		}
-
-		fmt.Println(name)
 		conf := cfg.Config{
 			Name:      name,
 			BaseUrl:   url,
