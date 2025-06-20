@@ -971,14 +971,16 @@ func (c *Controller) Upload(localPath string) error {
 				return
 			}
 
-			progress.ClearButtons()
-			progress.SetText("Upload complete.\n\nPress Done to return.")
-			progress.AddButtons([]string{"Done"})
-			progress.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-				c.view.Pages.RemovePage("progress").SwitchToPage("main")
-				go c.updateList()
+			c.view.App.QueueUpdateDraw(func() {
+				progress.ClearButtons()
+				progress.SetText("Upload complete.\n\nPress Done to return.")
+				progress.AddButtons([]string{"Done"})
+				progress.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+					c.view.Pages.RemovePage("progress").SwitchToPage("main")
+					go c.updateList()
+				})
+				c.view.App.SetFocus(progress)
 			})
-			c.view.App.SetFocus(progress)
 		}
 	}()
 
