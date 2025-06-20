@@ -502,13 +502,14 @@ func (m *Model) Upload(
 			return fmt.Errorf("failed to open file %s: %w", fpath, err)
 		}
 
-		baseFolder := filepath.Base(localPath)
-		relPath := fpath
+		var s3Key string
 		if isDir {
-			relPath, _ = filepath.Rel(localPath, fpath)
+			relPath, _ := filepath.Rel(localPath, fpath)
+			relPath = filepath.ToSlash(relPath)
+			s3Key = path.Join(s3Prefix, relPath)
+		} else {
+			s3Key = path.Join(s3Prefix, filepath.Base(fpath))
 		}
-		relPath = filepath.ToSlash(relPath)
-		s3Key := path.Join(s3Prefix, baseFolder, relPath)
 
 		pr := &progressReader{
 			r:     fp,
