@@ -965,22 +965,20 @@ func (c *Controller) Upload(localPath string) error {
 			go c.updateList()
 			return
 		default:
-			c.view.App.QueueUpdateDraw(func() {
-				if err != nil {
-					c.view.Pages.RemovePage("progress").SwitchToPage("main")
-					c.error("Upload failed", err, false)
-					return
-				}
+			if err != nil {
+				c.view.Pages.RemovePage("progress").SwitchToPage("main")
+				c.error("Upload failed", err, false)
+				return
+			}
 
-				progress.ClearButtons()
-				progress.SetText("Upload complete.\n\nPress Done to return.")
-				progress.AddButtons([]string{"Done"})
-				progress.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-					c.view.Pages.RemovePage("progress").SwitchToPage("main")
-					go c.updateList()
-				})
-				c.view.App.SetFocus(progress)
+			progress.ClearButtons()
+			progress.SetText("Upload complete.\n\nPress Done to return.")
+			progress.AddButtons([]string{"Done"})
+			progress.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+				c.view.Pages.RemovePage("progress").SwitchToPage("main")
+				go c.updateList()
 			})
+			c.view.App.SetFocus(progress)
 		}
 	}()
 
