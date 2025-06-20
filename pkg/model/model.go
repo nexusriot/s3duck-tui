@@ -504,9 +504,9 @@ func (m *Model) Upload(
 
 		var s3Key string
 		if isDir {
-			relPath, _ := filepath.Rel(localPath, fpath)
-			relPath = filepath.ToSlash(relPath)
-			s3Key = path.Join(s3Prefix, relPath)
+			parent := filepath.Dir(localPath)
+			relPath, _ := filepath.Rel(parent, fpath)
+			s3Key = filepath.ToSlash(path.Join(s3Prefix, relPath))
 		} else {
 			s3Key = path.Join(s3Prefix, filepath.Base(fpath))
 		}
