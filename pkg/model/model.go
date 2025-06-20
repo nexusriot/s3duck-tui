@@ -483,6 +483,7 @@ func (m *Model) Upload(
 	}
 
 	uploader := s3m.NewUploader(m.Client)
+	var uploadedTotal int64
 
 	for i, fpath := range files {
 		select {
@@ -502,16 +503,19 @@ func (m *Model) Upload(
 		}
 
 		baseFolder := filepath.Base(localPath)
-		relPath, _ := filepath.Rel(localPath, fpath)
+		relPath := fpath
+		if isDir {
+			relPath, _ = filepath.Rel(localPath, fpath)
+		}
 		relPath = filepath.ToSlash(relPath)
 		s3Key := path.Join(s3Prefix, baseFolder, relPath)
 
 		pr := &progressReader{
 			r:     fp,
 			total: stat.Size(),
-			update: func(written, total int64) {
+			update: func(written, _ int64) {
 				if progressCb != nil {
-					progressCb(written, totalSize, i+1, len(files), fpath, s3Key)
+					progressCb(uploadedTotal+written, totalSize, i+1, len(files), fpath, s3Key)
 				}
 			},
 		}
@@ -527,6 +531,8 @@ func (m *Model) Upload(
 		if err != nil {
 			return fmt.Errorf("upload failed for %s: %w", fpath, err)
 		}
+
+		uploadedTotal += stat.Size()
 	}
 
 	return nil
