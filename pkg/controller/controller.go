@@ -998,7 +998,7 @@ func (c *Controller) ShowFileProperties(key string) {
 	}
 
 	text := fmt.Sprintf(
-		"[green]Name: [white]%s\n[green]Size: [white]%s\n[green]Modified: [white]%v\n[green]Etag: [white]%s\n[green]Link: [blue]%s",
+		"[black]Name: [white]%s\n[black]Size: [white]%s\n[black]Modified: [white]%v\n[black]Etag: [white]%s\n[black]Link: [black]%s",
 		*obj.Key,
 		humanize.IBytes(uint64(*obj.Size)),
 		obj.LastModified,
