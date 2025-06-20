@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/dustin/go-humanize"
 	"github.com/gdamore/tcell/v2"
@@ -902,6 +903,9 @@ func (c *Controller) ShowLocalFSModal(startPath string) {
 
 func (c *Controller) Upload(localPath string) error {
 	ctx, cancel := context.WithCancel(context.Background())
+	ctx, timeoutCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer timeoutCancel()
+
 	progress := tview.NewModal().
 		SetText("Starting upload...\n").
 		AddButtons([]string{"Cancel"}).
@@ -936,7 +940,8 @@ func (c *Controller) Upload(localPath string) error {
 			}
 
 			percentage := float64(n) / float64(total) * 100
-			c.view.App.QueueUpdateDraw(func() {
+
+			go c.view.App.QueueUpdateDraw(func() {
 				progress.SetText(fmt.Sprintf(
 					"Uploading\n%d/%d file(s)\n%s/%s (%.1f%%)\nLast: %s\n-> %s",
 					i, count,
@@ -961,7 +966,6 @@ func (c *Controller) Upload(localPath string) error {
 					return
 				}
 
-				// Clear previous Cancel button and add Done
 				progress.ClearButtons()
 				progress.SetText("Upload complete.\n\nPress Done to return.")
 				progress.AddButtons([]string{"Done"})
@@ -969,7 +973,6 @@ func (c *Controller) Upload(localPath string) error {
 					c.view.Pages.RemovePage("progress").SwitchToPage("main")
 					go c.updateList()
 				})
-
 				c.view.App.SetFocus(progress)
 			})
 		}
