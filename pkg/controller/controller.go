@@ -122,6 +122,7 @@ func (c *Controller) Delete() error {
 								c.error(fmt.Sprintf("Failed to delete %s", cur), err, false)
 							} else {
 								c.updateList()
+								c.clearDetailsIfNoSelection()
 							}
 						}()
 
@@ -134,13 +135,18 @@ func (c *Controller) Delete() error {
 }
 
 func (c *Controller) Download() error {
+
+	if c.view.List.GetItemCount() == 0 {
+		return nil
+	}
+
 	cur := c.getSelectedObjectName()
 	val, ok := c.objs[cur]
 	if !ok || (val.Ot != model.File && val.Ot != model.Folder) {
 		return nil
 	}
 
-	cwd := path.Join(c.params.HomeDir, "Downloads") + string(filepath.Separator)
+	cwd := path.Join(c.params.HomeDir, "Downloads") + "/"
 	key := c.currentPath + cur
 	if val.Ot == model.Folder {
 		key += "/"
@@ -150,7 +156,6 @@ func (c *Controller) Download() error {
 	if len(objects) == 0 {
 		return nil
 	}
-
 	totalSize := int64(0)
 	for _, o := range objects {
 		totalSize += o.Size
@@ -181,15 +186,6 @@ func (c *Controller) Download() error {
 		go func() {
 			downloadedSize := int64(0)
 
-			// Show initial progress for 0%
-			c.view.App.QueueUpdateDraw(func() {
-				progress.SetText(fmt.Sprintf(
-					"Downloading\n0/%d object(s)\n0B/%s (0.0%%)",
-					len(objects),
-					humanize.IBytes(uint64(totalSize)),
-				))
-			})
-
 			for i, object := range objects {
 				select {
 				case <-ctx.Done():
@@ -197,7 +193,20 @@ func (c *Controller) Download() error {
 				default:
 				}
 
-				n, err := c.model.Download(ctx, object, c.currentPath, cwd, c.currentBucket.Key)
+				n, err := c.model.Download(ctx, object, c.currentPath, cwd, c.currentBucket.Key, totalSize, func(written, total int64, key string) {
+					percentage := float64(downloadedSize+written) / float64(totalSize) * 100
+					c.view.App.QueueUpdateDraw(func() {
+						progress.SetText(fmt.Sprintf(
+							"Downloading\n%d/%d object(s)\n%s/%s (%.1f%%)\nCurrent: %s",
+							i+1, len(objects),
+							humanize.IBytes(uint64(downloadedSize+written)),
+							humanize.IBytes(uint64(totalSize)),
+							percentage,
+							key,
+						))
+					})
+				})
+
 				if err != nil {
 					c.view.App.QueueUpdateDraw(func() {
 						c.view.Pages.RemovePage("progress").SwitchToPage("main")
@@ -205,22 +214,9 @@ func (c *Controller) Download() error {
 					go c.error(fmt.Sprintf("Failed to download %s", *object.Key), err, false)
 					return
 				}
-
 				downloadedSize += n
-				percentage := float64(downloadedSize) / float64(totalSize) * 100
-
-				c.view.App.QueueUpdateDraw(func() {
-					progress.SetText(fmt.Sprintf(
-						"Downloading\n%d/%d object(s)\n%s/%s (%.1f%%)",
-						i+1, len(objects),
-						humanize.IBytes(uint64(downloadedSize)),
-						humanize.IBytes(uint64(totalSize)),
-						percentage,
-					))
-				})
 			}
 
-			// After download finishes successfully
 			select {
 			case <-ctx.Done():
 				return
@@ -386,8 +382,6 @@ func (c *Controller) CreateConfigEntry() {
 		if reg != "" {
 			region = &reg
 		}
-
-		fmt.Println(name)
 		conf := cfg.Config{
 			Name:      name,
 			BaseUrl:   url,
@@ -1002,7 +996,7 @@ func (c *Controller) ShowFileProperties(key string) {
 	}
 
 	text := fmt.Sprintf(
-		"[green]Name: [white]%s\n[green]Size: [white]%s\n[green]Modified: [white]%v\n[green]Etag: [white]%s\n[green]Link: [blue]%s",
+		"[black]Name: [white]%s\n[black]Size: [white]%s\n[black]Modified: [white]%v\n[black]Etag: [white]%s\n[black]Link: [black]%s",
 		*obj.Key,
 		humanize.IBytes(uint64(*obj.Size)),
 		obj.LastModified,
@@ -1022,4 +1016,22 @@ func (c *Controller) ShowFileProperties(key string) {
 		})
 
 	c.view.Pages.AddPage("modal", c.view.ModalEdit(modal, 75, 12), true, true)
+}
+
+func (c *Controller) clearDetailsIfNoSelection() {
+	c.view.App.QueueUpdateDraw(func() {
+		if c.view.List.GetItemCount() == 0 {
+			c.view.Details.Clear()
+			return
+		}
+		i := c.view.List.GetCurrentItem()
+		if i < 0 {
+			c.view.Details.Clear()
+			return
+		}
+		_, cur := c.view.List.GetItemText(i)
+		if strings.TrimSpace(cur) == "" {
+			c.view.Details.Clear()
+		}
+	})
 }

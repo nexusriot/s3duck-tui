@@ -4,7 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -62,6 +62,34 @@ type Model struct {
 	Client     *s3.Client
 	Downloader *s3m.Downloader
 	Cf         *Config
+}
+
+type progressReader struct {
+	r       io.Reader
+	written int64
+	total   int64
+	update  func(written int64, total int64)
+}
+
+func (pr *progressReader) Read(p []byte) (int, error) {
+	n, err := pr.r.Read(p)
+	pr.written += int64(n)
+	pr.update(pr.written, pr.total)
+	return n, err
+}
+
+type progressWriterAt struct {
+	w          io.WriterAt
+	written    int64
+	total      int64
+	updateFunc func(written int64, total int64)
+}
+
+func (pwa *progressWriterAt) WriteAt(p []byte, off int64) (int, error) {
+	n, err := pwa.w.WriteAt(p, off)
+	pwa.written += int64(n)
+	pwa.updateFunc(pwa.written, pwa.total)
+	return n, err
 }
 
 func GetDownloader(client *s3.Client) *s3m.Downloader {
@@ -181,27 +209,44 @@ func (m *Model) ListObjects(key string, bucket *Object) []s3t.Object {
 	return objects
 }
 
-func (m *Model) Download(ctx context.Context, object s3t.Object, currentPath, destPath string, bucket *string) (n int64, err error) {
-	if err = os.MkdirAll(destPath, 0700); err != nil {
+func (m *Model) Download(
+	ctx context.Context,
+	object s3t.Object,
+	currentPath, destPath string,
+	bucket *string,
+	totalSize int64,
+	progressCb func(written int64, total int64, key string),
+) (int64, error) {
+	if err := os.MkdirAll(destPath, 0700); err != nil {
 		return 0, err
 	}
 
-	p, _ := filepath.Rel(currentPath, *object.Key)
-	dp := path.Join(destPath, p)
+	key := filepath.ToSlash(*object.Key)
+	prefix := filepath.ToSlash(currentPath)
+
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+
+	relativeKey := key
+	if strings.HasPrefix(key, prefix) {
+		relativeKey = strings.TrimPrefix(key, prefix)
+	}
+
+	downloadPath := filepath.Join(destPath, relativeKey)
 
 	if strings.HasSuffix(*object.Key, "/") {
-		err = os.MkdirAll(dp, 0760)
-		return 0, nil
+		return 0, os.MkdirAll(downloadPath, 0760)
 	}
-	dir := filepath.Dir(dp)
-	err = os.MkdirAll(dir, 0760)
-
-	_, err = os.Stat(dp)
-	if err == nil {
-		return 0, fmt.Errorf("file exists: %s", dp)
+	dir := filepath.Dir(downloadPath)
+	if err := os.MkdirAll(dir, 0760); err != nil {
+		return 0, err
+	}
+	if _, err := os.Stat(downloadPath); err == nil {
+		return 0, fmt.Errorf("file exists: %s", downloadPath)
 	}
 
-	fp, err := os.Create(dp)
+	fp, err := os.Create(downloadPath)
 	if err != nil {
 		return 0, err
 	}
@@ -211,18 +256,23 @@ func (m *Model) Download(ctx context.Context, object s3t.Object, currentPath, de
 		}
 	}()
 
-	n, err = m.Downloader.Download(
-		ctx,
-		fp,
-		&s3.GetObjectInput{
-			Bucket: aws.String(*bucket),
-			Key:    object.Key,
+	writerAt := &progressWriterAt{
+		w:     fp,
+		total: object.Size,
+		updateFunc: func(written int64, total int64) {
+			if progressCb != nil {
+				progressCb(written, total, *object.Key)
+			}
 		},
-	)
+	}
+
+	n, err := m.Downloader.Download(ctx, writerAt, &s3.GetObjectInput{
+		Bucket: bucket,
+		Key:    object.Key,
+	})
 
 	if ctx.Err() != nil {
-		// Cleanup partial file
-		os.Remove(dp)
+		os.Remove(downloadPath)
 		return 0, ctx.Err()
 	}
 
@@ -400,7 +450,12 @@ func (m *Model) CreateFolder(name *string, bucket *Object) error {
 	return err
 }
 
-func (m *Model) Upload(ctx context.Context, localPath, s3Prefix string, bucket *Object, progressCb func(current, total int64, i, count int, local, remote string)) error {
+func (m *Model) Upload(
+	ctx context.Context,
+	localPath, s3Prefix string,
+	bucket *Object,
+	progressCb func(current, total int64, i, count int, local, remote string),
+) error {
 	info, err := os.Stat(localPath)
 	if err != nil {
 		return err
@@ -428,6 +483,7 @@ func (m *Model) Upload(ctx context.Context, localPath, s3Prefix string, bucket *
 	}
 
 	uploader := s3m.NewUploader(m.Client)
+	var uploadedTotal int64
 
 	for i, fpath := range files {
 		select {
@@ -436,19 +492,9 @@ func (m *Model) Upload(ctx context.Context, localPath, s3Prefix string, bucket *
 		default:
 		}
 
-		var relPath string
-		if isDir {
-			relPath, _ = filepath.Rel(localPath, fpath)
-			relPath = filepath.ToSlash(relPath)
-		} else {
-			relPath = filepath.Base(fpath)
-		}
-
-		var s3Key string
-		if isDir {
-			s3Key = path.Join(s3Prefix, filepath.Base(localPath), relPath)
-		} else {
-			s3Key = path.Join(s3Prefix, relPath)
+		stat, err := os.Stat(fpath)
+		if err != nil {
+			return fmt.Errorf("stat failed for %s: %w", fpath, err)
 		}
 
 		fp, err := os.Open(fpath)
@@ -456,19 +502,38 @@ func (m *Model) Upload(ctx context.Context, localPath, s3Prefix string, bucket *
 			return fmt.Errorf("failed to open file %s: %w", fpath, err)
 		}
 
+		var s3Key string
+		if isDir {
+			relPath, _ := filepath.Rel(localPath, fpath)
+			relPath = filepath.ToSlash(relPath)
+			s3Key = path.Join(s3Prefix, relPath)
+		} else {
+			s3Key = path.Join(s3Prefix, filepath.Base(fpath))
+		}
+
+		pr := &progressReader{
+			r:     fp,
+			total: stat.Size(),
+			update: func(written, _ int64) {
+				if progressCb != nil {
+					progressCb(uploadedTotal+written, totalSize, i+1, len(files), fpath, s3Key)
+				}
+			},
+		}
+
 		_, err = uploader.Upload(ctx, &s3.PutObjectInput{
 			Bucket: aws.String(*bucket.Key),
 			Key:    aws.String(s3Key),
-			Body:   fp,
+			Body:   pr,
 		})
+
 		fp.Close()
+
 		if err != nil {
 			return fmt.Errorf("upload failed for %s: %w", fpath, err)
 		}
 
-		if stat, err := os.Stat(fpath); err == nil && progressCb != nil {
-			progressCb(stat.Size(), totalSize, i+1, len(files), fpath, s3Key)
-		}
+		uploadedTotal += stat.Size()
 	}
 
 	return nil
