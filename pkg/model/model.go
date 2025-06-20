@@ -517,31 +517,31 @@ func (m *Model) Upload(
 			s3Key = path.Join(s3Prefix, filepath.Base(fpath))
 		}
 
-		pr := &progressReader{
-			r:     fp,
-			total: stat.Size(),
-			update: func(written, _ int64) {
-				if progressCb != nil {
-					progressCb(uploadedTotal+written, totalSize, i+1, len(files), fpath, s3Key)
-				}
-			},
-		}
+		pipeReader, pipeWriter := io.Pipe()
 
-		tr := &timeoutReader{
-			r: pr,
-			timer: time.AfterFunc(30*time.Second, func() {
-				_ = fp.Close()
-			}),
-		}
+		go func() {
+			defer pipeWriter.Close()
+			_, err := io.Copy(pipeWriter, &progressReader{
+				r:     fp,
+				total: stat.Size(),
+				update: func(written, _ int64) {
+					if progressCb != nil {
+						progressCb(uploadedTotal+written, totalSize, i+1, len(files), fpath, s3Key)
+					}
+				},
+			})
+			if err != nil {
+				pipeWriter.CloseWithError(err)
+			}
+		}()
 
-		uploadCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+		uploadCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 		_, err = uploader.Upload(uploadCtx, &s3.PutObjectInput{
 			Bucket: aws.String(*bucket.Key),
 			Key:    aws.String(s3Key),
-			Body:   tr,
+			Body:   pipeReader,
 		})
 		cancel()
-
 		fp.Close()
 
 		if err != nil {

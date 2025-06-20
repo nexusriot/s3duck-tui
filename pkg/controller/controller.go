@@ -903,8 +903,6 @@ func (c *Controller) ShowLocalFSModal(startPath string) {
 
 func (c *Controller) Upload(localPath string) error {
 	ctx, cancel := context.WithCancel(context.Background())
-	ctx, timeoutCancel := context.WithTimeout(ctx, 30*time.Second)
-	defer timeoutCancel()
 
 	progress := tview.NewModal().
 		SetText("Starting upload...\n").
@@ -931,6 +929,9 @@ func (c *Controller) Upload(localPath string) error {
 		first.RemotePath,
 	))
 
+	var lastDraw time.Time
+	throttle := 100 * time.Millisecond
+
 	go func() {
 		err := c.model.Upload(ctx, localPath, c.currentPath, c.currentBucket, func(n, total int64, i, count int, local, remote string) {
 			select {
@@ -939,9 +940,14 @@ func (c *Controller) Upload(localPath string) error {
 			default:
 			}
 
-			percentage := float64(n) / float64(total) * 100
+			now := time.Now()
+			if now.Sub(lastDraw) < throttle {
+				return
+			}
+			lastDraw = now
 
-			go c.view.App.QueueUpdateDraw(func() {
+			percentage := float64(n) / float64(total) * 100
+			c.view.App.QueueUpdateDraw(func() {
 				progress.SetText(fmt.Sprintf(
 					"Uploading\n%d/%d file(s)\n%s/%s (%.1f%%)\nLast: %s\n-> %s",
 					i, count,
