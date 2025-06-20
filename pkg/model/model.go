@@ -3,6 +3,7 @@ package model
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -19,6 +20,7 @@ import (
 	s3m "github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3t "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 
 	u "github.com/nexusriot/s3duck-tui/pkg/utils"
 )
@@ -92,6 +94,18 @@ func (pwa *progressWriterAt) WriteAt(p []byte, off int64) (int, error) {
 	return n, err
 }
 
+type timeoutReader struct {
+	r     io.Reader
+	timer *time.Timer
+}
+
+func (tr *timeoutReader) Read(p []byte) (int, error) {
+	tr.timer.Reset(30 * time.Second)
+	n, err := tr.r.Read(p)
+	tr.timer.Stop()
+	return n, err
+}
+
 func GetDownloader(client *s3.Client) *s3m.Downloader {
 	d := s3m.NewDownloader(client, func(d *s3m.Downloader) {
 		d.BufferProvider = s3m.NewPooledBufferedWriterReadFromProvider(5 * 1024 * 1024)
@@ -113,19 +127,14 @@ func NewConfig(url string, region *string, accKey string, secKey string, ssl boo
 func GetConfig(cf Config, update bool) (aws.Config, error) {
 	customResolver := aws.EndpointResolverWithOptionsFunc(func(service, region string, options ...interface{}) (aws.Endpoint, error) {
 		var endpoint aws.Endpoint
-
-		// TODO: optionally disable ssl
-
 		if cf.Region != nil {
 			endpoint = aws.Endpoint{
-				//PartitionID:   "aws",
 				URL:               cf.Url,
 				SigningRegion:     *cf.Region,
 				HostnameImmutable: true,
 			}
 		} else {
 			endpoint = aws.Endpoint{
-				//PartitionID: "aws",
 				URL:               cf.Url,
 				HostnameImmutable: true,
 			}
@@ -133,32 +142,22 @@ func GetConfig(cf Config, update bool) (aws.Config, error) {
 		return endpoint, nil
 	})
 
-	staticProvider := credentials.NewStaticCredentialsProvider(
-		cf.AccessKey,
-		cf.SecretKey,
-		"",
-	)
+	staticProvider := credentials.NewStaticCredentialsProvider(cf.AccessKey, cf.SecretKey, "")
 
 	var opts []optsFunc
-	// TODO: check usage
 	if update && strings.Contains(cf.Url, "amazon") {
-		opts = []optsFunc{
-			config.WithRegion(*cf.Region),
-		}
+		opts = []optsFunc{config.WithRegion(*cf.Region)}
 	} else {
-		opts = []optsFunc{
-			config.WithEndpointResolverWithOptions(customResolver),
-		}
+		opts = []optsFunc{config.WithEndpointResolverWithOptions(customResolver)}
 	}
 
-	opts = append(opts, config.WithCredentialsProvider(staticProvider))
-	if !cf.SSl {
-		tr := &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		}
-		client := &http.Client{Transport: tr}
-		opts = append(opts, config.WithHTTPClient(client))
+	timeoutClient := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: !cf.SSl},
+		},
 	}
+	opts = append(opts, config.WithCredentialsProvider(staticProvider), config.WithHTTPClient(timeoutClient))
 
 	cfg, err := config.LoadDefaultConfig(context.TODO(), opts...)
 	return cfg, err
@@ -482,7 +481,14 @@ func (m *Model) Upload(
 		totalSize = info.Size()
 	}
 
-	uploader := s3m.NewUploader(m.Client)
+	uploader := s3m.NewUploader(m.Client, func(u *s3m.Uploader) {
+		u.PartSize = 5 * 1024 * 1024
+		u.LeavePartsOnError = false
+		u.ClientOptions = append(u.ClientOptions, func(o *s3.Options) {
+			o.Retryer = aws.NopRetryer{}
+		})
+	})
+
 	var uploadedTotal int64
 
 	for i, fpath := range files {
@@ -511,25 +517,41 @@ func (m *Model) Upload(
 			s3Key = path.Join(s3Prefix, filepath.Base(fpath))
 		}
 
-		pr := &progressReader{
-			r:     fp,
-			total: stat.Size(),
-			update: func(written, _ int64) {
-				if progressCb != nil {
-					progressCb(uploadedTotal+written, totalSize, i+1, len(files), fpath, s3Key)
-				}
-			},
-		}
+		pipeReader, pipeWriter := io.Pipe()
 
-		_, err = uploader.Upload(ctx, &s3.PutObjectInput{
+		go func() {
+			defer pipeWriter.Close()
+			_, err := io.Copy(pipeWriter, &progressReader{
+				r:     fp,
+				total: stat.Size(),
+				update: func(written, _ int64) {
+					if progressCb != nil {
+						progressCb(uploadedTotal+written, totalSize, i+1, len(files), fpath, s3Key)
+					}
+				},
+			})
+			if err != nil {
+				pipeWriter.CloseWithError(err)
+			}
+		}()
+
+		uploadCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+		_, err = uploader.Upload(uploadCtx, &s3.PutObjectInput{
 			Bucket: aws.String(*bucket.Key),
 			Key:    aws.String(s3Key),
-			Body:   pr,
+			Body:   pipeReader,
 		})
-
+		cancel()
 		fp.Close()
 
 		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return fmt.Errorf("upload timed out for %s", fpath)
+			}
+			var apiErr smithy.APIError
+			if errors.As(err, &apiErr) {
+				return fmt.Errorf("upload failed for %s: %s - %s", fpath, apiErr.ErrorCode(), apiErr.ErrorMessage())
+			}
 			return fmt.Errorf("upload failed for %s: %w", fpath, err)
 		}
 
