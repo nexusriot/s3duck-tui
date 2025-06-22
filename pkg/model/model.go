@@ -617,3 +617,32 @@ func (m *Model) MakeBucketPublic(bucketName string) error {
 	})
 	return err
 }
+
+// ResolveDownloadObjects resolves the objects to be downloaded.
+// If `isFolder` is true, it performs a prefix-based list.
+// If false, returns a single exact match using the key and size.
+func (m *Model) ResolveDownloadObjects(key string, isFolder bool, size *int64, bucket *Object) ([]s3t.Object, int64, error) {
+	if isFolder {
+		if !strings.HasSuffix(key, "/") {
+			key += "/"
+		}
+		objs := m.ListObjects(key, bucket)
+
+		var totalSize int64
+		for _, obj := range objs {
+			totalSize += obj.Size
+		}
+		return objs, totalSize, nil
+	}
+
+	if size == nil {
+		return nil, 0, fmt.Errorf("file size is nil for object %s", key)
+	}
+
+	return []s3t.Object{
+		{
+			Key:  aws.String(key),
+			Size: *size,
+		},
+	}, *size, nil
+}

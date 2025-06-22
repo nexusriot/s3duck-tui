@@ -149,17 +149,10 @@ func (c *Controller) Download() error {
 
 	cwd := path.Join(c.params.HomeDir, "Downloads") + "/"
 	key := c.currentPath + cur
-	if val.Ot == model.Folder {
-		key += "/"
-	}
 
-	objects := c.model.ListObjects(key, c.currentBucket)
-	if len(objects) == 0 {
-		return nil
-	}
-	totalSize := int64(0)
-	for _, o := range objects {
-		totalSize += o.Size
+	objects, totalSize, err := c.model.ResolveDownloadObjects(key, val.Ot == model.Folder, val.Size, c.currentBucket)
+	if err != nil || len(objects) == 0 {
+		return err
 	}
 
 	confirm := c.view.NewConfirm()
