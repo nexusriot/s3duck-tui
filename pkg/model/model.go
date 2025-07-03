@@ -517,36 +517,29 @@ func (m *Model) Upload(
 			s3Key = path.Join(s3Prefix, filepath.Base(fpath))
 		}
 
-		pipeReader, pipeWriter := io.Pipe()
+		reader := &progressReader{
+			r:     fp,
+			total: stat.Size(),
+			update: func(written, _ int64) {
+				if progressCb != nil {
+					progressCb(uploadedTotal+written, totalSize, i+1, len(files), fpath, s3Key)
+				}
+			},
+		}
 
-		go func() {
-			defer pipeWriter.Close()
-			_, err := io.Copy(pipeWriter, &progressReader{
-				r:     fp,
-				total: stat.Size(),
-				update: func(written, _ int64) {
-					if progressCb != nil {
-						progressCb(uploadedTotal+written, totalSize, i+1, len(files), fpath, s3Key)
-					}
-				},
-			})
-			if err != nil {
-				pipeWriter.CloseWithError(err)
-			}
-		}()
+		uploadCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
 
-		uploadCtx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 		_, err = uploader.Upload(uploadCtx, &s3.PutObjectInput{
 			Bucket: aws.String(*bucket.Key),
 			Key:    aws.String(s3Key),
-			Body:   pipeReader,
+			Body:   reader,
 		})
-		cancel()
 		fp.Close()
 
 		if err != nil {
-			if errors.Is(err, context.DeadlineExceeded) {
-				return fmt.Errorf("upload timed out for %s", fpath)
+			if errors.Is(err, context.Canceled) {
+				return fmt.Errorf("upload canceled for %s", fpath)
 			}
 			var apiErr smithy.APIError
 			if errors.As(err, &apiErr) {
