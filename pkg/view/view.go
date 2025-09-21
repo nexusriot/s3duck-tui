@@ -7,7 +7,7 @@ import (
 	"github.com/rivo/tview"
 )
 
-const versionText = "S3Duck 🦆 TUI v.0.0.21 - preview"
+const versionText = "S3Duck 🦆 TUI v.0.0.22"
 
 // View ...
 type View struct {
@@ -26,6 +26,7 @@ func NewView() *View {
 		ShowSecondaryText(false)
 	list.SetBorder(true).
 		SetTitleAlign(tview.AlignLeft)
+	// Note: List supports color tags in primary text; we keep secondary plain.
 
 	tv := tview.NewTextView().
 		SetDynamicColors(true).

@@ -1,8 +1,9 @@
 package utils
 
 import (
-	"github.com/atotto/clipboard"
 	"math/rand"
+
+	"github.com/atotto/clipboard"
 )
 
 func SplitFunc(r rune) bool {
@@ -17,6 +18,7 @@ func RandStr(n int) string {
 	}
 	return string(b)
 }
+
 func CopyToClipboard(text string) {
 	_ = clipboard.WriteAll(text)
 }

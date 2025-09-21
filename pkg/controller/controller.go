@@ -232,6 +232,24 @@ func (c *Controller) Download() error {
 	return nil
 }
 
+// coloredLabelFor returns a colorized primary label while keeping the secondary text plain.
+func coloredLabelFor(o *model.Object) string {
+	if o.Key == nil {
+		return ""
+	}
+	name := *o.Key
+	switch o.Ot {
+	case model.Folder:
+		return "[cyan]" + name + "/[-]"
+	case model.File:
+		return "[white]" + name + "[-]"
+	case model.Bucket:
+		return "[yellow]" + name + "[-]"
+	default:
+		return name
+	}
+}
+
 func (c *Controller) updateList() ([]string, error) {
 	err := c.makeObjectMap()
 	if err != nil {
@@ -264,24 +282,22 @@ func (c *Controller) updateList() ([]string, error) {
 		return *objs[i].Key < *objs[j].Key
 	})
 
-	// Extract keys
-	for _, v := range objs {
-		if v.Key != nil {
-			keys = append(keys, *v.Key)
-		}
-	}
-
 	// Queue UI update
 	c.view.App.QueueUpdateDraw(func() {
 		c.view.List.Clear()
 		c.view.List.SetTitle(title)
 		c.view.SetFrameText(fText)
 
-		for _, k := range keys {
-			key := k // capture local copy
-			c.view.List.AddItem(key, key, 0, func() {
+		for _, o := range objs {
+			if o.Key == nil {
+				continue
+			}
+			raw := *o.Key               // secondary text (plain) – used for lookups
+			label := coloredLabelFor(o) // primary (colored) – shown to user
+
+			c.view.List.AddItem(label, raw, 0, func() {
 				i := c.view.List.GetCurrentItem()
-				_, cur := c.view.List.GetItemText(i)
+				_, cur := c.view.List.GetItemText(i) // secondary text
 				cur = strings.TrimSpace(cur)
 				if val, ok := c.objs[cur]; ok {
 					if val.Ot == model.Folder || val.Ot == model.Bucket {
@@ -295,6 +311,8 @@ func (c *Controller) updateList() ([]string, error) {
 					}
 				}
 			})
+
+			keys = append(keys, raw)
 		}
 
 		// Restore position if available
