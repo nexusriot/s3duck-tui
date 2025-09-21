@@ -240,13 +240,13 @@ func coloredLabelFor(o *model.Object) string {
 	name := *o.Key
 	switch o.Ot {
 	case model.Folder:
-		// cyan folder icon + plain name with trailing slash
-		return "[cyan]▸[-] " + name + "/"
+		// 📁 folder icon (cyan) + plain name with trailing slash
+		return "[cyan]📁[-] " + name + "/"
 	case model.File:
 		// plain file (keeps selection super readable)
 		return "  " + name
 	case model.Bucket:
-		// yellow bucket icon + plain name
+		// yellow bucket dot + plain name
 		return "[yellow]●[-] " + name
 	default:
 		return "  " + name
@@ -291,6 +291,13 @@ func (c *Controller) updateList() ([]string, error) {
 		c.view.List.SetTitle(title)
 		c.view.SetFrameText(fText)
 
+		// Add classic "[..]" at top when inside a bucket (go up one level)
+		if c.currentBucket != nil {
+			c.view.List.AddItem("[..]", "..", 0, func() {
+				c.Up()
+			})
+		}
+
 		for _, o := range objs {
 			if o.Key == nil {
 				continue
@@ -302,6 +309,13 @@ func (c *Controller) updateList() ([]string, error) {
 				i := c.view.List.GetCurrentItem()
 				_, cur := c.view.List.GetItemText(i) // secondary text
 				cur = strings.TrimSpace(cur)
+
+				// Special entry: "[..]" uses secondary text ".."
+				if cur == ".." {
+					c.Up()
+					return
+				}
+
 				if val, ok := c.objs[cur]; ok {
 					if val.Ot == model.Folder || val.Ot == model.Bucket {
 						if val.Ot == model.Folder {
