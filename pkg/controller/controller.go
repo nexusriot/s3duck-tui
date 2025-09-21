@@ -243,8 +243,8 @@ func coloredLabelFor(o *model.Object) string {
 		// 📁 folder icon (cyan) + plain name with trailing slash
 		return "[cyan]📁[-] " + name + "/"
 	case model.File:
-		// plain file (keeps selection super readable)
-		return "  " + name
+		// 📄 file icon + plain name (no inline filename color for selection contrast)
+		return "📄 " + name
 	case model.Bucket:
 		// yellow bucket dot + plain name
 		return "[yellow]●[-] " + name
@@ -843,7 +843,7 @@ func (c *Controller) ShowLocalFSModal(startPath string) {
 	buttonRow := tview.NewFlex().
 		SetDirection(tview.FlexColumn).
 		AddItem(okBtn, 0, 1, false).
-		AddItem(tview.NewBox(), 2, 0, false). // <- spacer: fixed width 2
+		AddItem(tview.NewBox(), 2, 0, false).
 		AddItem(cancelBtn, 0, 1, false)
 
 	flex, _ := layout.(*tview.Flex)
@@ -926,7 +926,7 @@ func (c *Controller) ShowLocalFSModal(startPath string) {
 
 	modal := c.view.ModalEdit(layout, 60, 25)
 	c.view.Pages.AddPage("modal", modal, true, true)
-	renderList(startPath) // Initial directory render
+	renderList(startPath)
 }
 
 func (c *Controller) Upload(localPath string) error {
@@ -1024,7 +1024,6 @@ func (c *Controller) ShowFileProperties(key string) {
 	bucketName := *c.currentBucket.Key
 	fullPath := *obj.FullPath
 
-	// Determine if it's AWS-style or custom endpoint
 	var url string
 	if strings.Contains(c.model.Cf.Url, "amazonaws.com") && c.model.Cf.Region != nil {
 		url = fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", bucketName, *c.model.Cf.Region, fullPath)
