@@ -232,7 +232,7 @@ func (c *Controller) Download() error {
 	return nil
 }
 
-// coloredLabelFor returns a colorized primary label while keeping the secondary text plain.
+// coloredLabelFor returns a colorized icon + plain name for best selection contrast.
 func coloredLabelFor(o *model.Object) string {
 	if o.Key == nil {
 		return ""
@@ -240,13 +240,16 @@ func coloredLabelFor(o *model.Object) string {
 	name := *o.Key
 	switch o.Ot {
 	case model.Folder:
-		return "[cyan]" + name + "/[-]"
+		// cyan folder icon + plain name with trailing slash
+		return "[cyan]▸[-] " + name + "/"
 	case model.File:
-		return "[white]" + name + "[-]"
+		// plain file (keeps selection super readable)
+		return "  " + name
 	case model.Bucket:
-		return "[yellow]" + name + "[-]"
+		// yellow bucket icon + plain name
+		return "[yellow]●[-] " + name
 	default:
-		return name
+		return "  " + name
 	}
 }
 
@@ -293,7 +296,7 @@ func (c *Controller) updateList() ([]string, error) {
 				continue
 			}
 			raw := *o.Key               // secondary text (plain) – used for lookups
-			label := coloredLabelFor(o) // primary (colored) – shown to user
+			label := coloredLabelFor(o) // primary (icon colored, name plain)
 
 			c.view.List.AddItem(label, raw, 0, func() {
 				i := c.view.List.GetCurrentItem()
