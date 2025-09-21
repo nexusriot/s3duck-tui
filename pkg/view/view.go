@@ -7,7 +7,7 @@ import (
 	"github.com/rivo/tview"
 )
 
-const versionText = "S3Duck 🦆 TUI v.0.0.21 - preview"
+const versionText = "S3Duck 🦆 TUI v.0.0.24"
 
 // View ...
 type View struct {
@@ -27,6 +27,10 @@ func NewView() *View {
 	list.SetBorder(true).
 		SetTitleAlign(tview.AlignLeft)
 
+	// Selection style: mid-blue background with white text to avoid clashes on light/dark terms
+	list.SetSelectedBackgroundColor(tcell.ColorBlue)
+	list.SetSelectedTextColor(tcell.ColorWhite)
+
 	tv := tview.NewTextView().
 		SetDynamicColors(true).
 		SetRegions(true).
@@ -35,6 +39,7 @@ func NewView() *View {
 			app.Draw()
 		})
 	tv.SetBorder(true)
+
 	main := tview.NewFlex()
 	main.AddItem(list, 0, 4, true)
 	main.AddItem(tv, 0, 3, false)
@@ -68,7 +73,9 @@ func NewView() *View {
 
 func (v *View) NewErrorMessageQ(header string, details string) *tview.Modal {
 	errorQ := tview.NewModal()
-	errorQ.SetText(header + ": " + details).SetBackgroundColor(tcell.ColorRed).AddButtons([]string{"ok"})
+	errorQ.SetText(header + ": " + details).
+		SetBackgroundColor(tcell.ColorRed).
+		AddButtons([]string{"ok"})
 	return errorQ
 }
 
@@ -78,8 +85,8 @@ func (v *View) SetFrameText(helpText string) {
 	v.Frame.AddText(helpText, false, tview.AlignCenter, tcell.ColorWhite)
 }
 
-func (v *View) SetHeaderVersionText(versionText string) {
-	v.Frame.AddText(fmt.Sprintf(versionText), true, tview.AlignCenter, tcell.ColorGreen)
+func (v *View) SetHeaderVersionText(version string) {
+	v.Frame.AddText(fmt.Sprintf(version), true, tview.AlignCenter, tcell.ColorGreen)
 }
 
 func (v *View) NewConfirm() *tview.Modal {
@@ -95,8 +102,7 @@ func (v *View) NewCreateProfileForm(header string) *tview.Form {
 	form.AddInputField("Region", "", 52, nil, nil)
 	form.AddInputField("Access key", "", 52, nil, nil)
 	form.AddPasswordField("Secret key", "", 52, '*', nil)
-	form.AddCheckbox("Disable ssl check", false, func(checked bool) {
-	})
+	form.AddCheckbox("Disable ssl check", false, func(bool) {})
 	form.SetBorder(true)
 	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
@@ -109,8 +115,7 @@ func (v *View) NewCreateProfileForm(header string) *tview.Form {
 }
 
 func (v *View) NewCreateLocalFileListForm() (tview.Primitive, *tview.List) {
-	var localList *tview.List
-	localList = tview.NewList().
+	localList := tview.NewList().
 		ShowSecondaryText(false)
 
 	flex := tview.NewFlex().
@@ -121,7 +126,9 @@ func (v *View) NewCreateLocalFileListForm() (tview.Primitive, *tview.List) {
 
 func (v *View) NewSuccessMessageQ(header string) *tview.Modal {
 	successQ := tview.NewModal()
-	successQ.SetText(header).SetBackgroundColor(tcell.ColorLime).AddButtons([]string{"ok"})
+	successQ.SetText(header).
+		SetBackgroundColor(tcell.ColorLime).
+		AddButtons([]string{"ok"})
 	return successQ
 }
 
@@ -131,7 +138,7 @@ func (v *View) NewCreateForm(header string, disablePublic bool) *tview.Form {
 	form.SetTitle(header)
 	form.AddInputField("Name", "", 52, nil, nil)
 	if disablePublic {
-		form.AddCheckbox("Public?", false, func(checked bool) {})
+		form.AddCheckbox("Public?", false, func(bool) {})
 	}
 	form.SetBorder(true)
 	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {

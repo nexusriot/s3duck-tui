@@ -232,6 +232,27 @@ func (c *Controller) Download() error {
 	return nil
 }
 
+// coloredLabelFor returns a colorized icon + plain name for best selection contrast.
+func coloredLabelFor(o *model.Object) string {
+	if o.Key == nil {
+		return ""
+	}
+	name := *o.Key
+	switch o.Ot {
+	case model.Folder:
+		// 📁 folder icon (cyan) + plain name with trailing slash
+		return "[cyan]📁[-] " + name + "/"
+	case model.File:
+		// 📄 file icon + plain name (no inline filename color for selection contrast)
+		return "📄 " + name
+	case model.Bucket:
+		// yellow bucket dot + plain name
+		return "[yellow]●[-] " + name
+	default:
+		return "  " + name
+	}
+}
+
 func (c *Controller) updateList() ([]string, error) {
 	err := c.makeObjectMap()
 	if err != nil {
@@ -264,25 +285,37 @@ func (c *Controller) updateList() ([]string, error) {
 		return *objs[i].Key < *objs[j].Key
 	})
 
-	// Extract keys
-	for _, v := range objs {
-		if v.Key != nil {
-			keys = append(keys, *v.Key)
-		}
-	}
-
 	// Queue UI update
 	c.view.App.QueueUpdateDraw(func() {
 		c.view.List.Clear()
 		c.view.List.SetTitle(title)
 		c.view.SetFrameText(fText)
 
-		for _, k := range keys {
-			key := k // capture local copy
-			c.view.List.AddItem(key, key, 0, func() {
+		// Add classic "[..]" at top when inside a bucket (go up one level)
+		if c.currentBucket != nil {
+			c.view.List.AddItem("[..]", "..", 0, func() {
+				c.Up()
+			})
+		}
+
+		for _, o := range objs {
+			if o.Key == nil {
+				continue
+			}
+			raw := *o.Key               // secondary text (plain) – used for lookups
+			label := coloredLabelFor(o) // primary (icon colored, name plain)
+
+			c.view.List.AddItem(label, raw, 0, func() {
 				i := c.view.List.GetCurrentItem()
-				_, cur := c.view.List.GetItemText(i)
+				_, cur := c.view.List.GetItemText(i) // secondary text
 				cur = strings.TrimSpace(cur)
+
+				// Special entry: "[..]" uses secondary text ".."
+				if cur == ".." {
+					c.Up()
+					return
+				}
+
 				if val, ok := c.objs[cur]; ok {
 					if val.Ot == model.Folder || val.Ot == model.Bucket {
 						if val.Ot == model.Folder {
@@ -295,6 +328,8 @@ func (c *Controller) updateList() ([]string, error) {
 					}
 				}
 			})
+
+			keys = append(keys, raw)
 		}
 
 		// Restore position if available
@@ -808,7 +843,7 @@ func (c *Controller) ShowLocalFSModal(startPath string) {
 	buttonRow := tview.NewFlex().
 		SetDirection(tview.FlexColumn).
 		AddItem(okBtn, 0, 1, false).
-		AddItem(tview.NewBox(), 2, 0, false). // <- spacer: fixed width 2
+		AddItem(tview.NewBox(), 2, 0, false).
 		AddItem(cancelBtn, 0, 1, false)
 
 	flex, _ := layout.(*tview.Flex)
@@ -891,7 +926,7 @@ func (c *Controller) ShowLocalFSModal(startPath string) {
 
 	modal := c.view.ModalEdit(layout, 60, 25)
 	c.view.Pages.AddPage("modal", modal, true, true)
-	renderList(startPath) // Initial directory render
+	renderList(startPath)
 }
 
 func (c *Controller) Upload(localPath string) error {
@@ -989,7 +1024,6 @@ func (c *Controller) ShowFileProperties(key string) {
 	bucketName := *c.currentBucket.Key
 	fullPath := *obj.FullPath
 
-	// Determine if it's AWS-style or custom endpoint
 	var url string
 	if strings.Contains(c.model.Cf.Url, "amazonaws.com") && c.model.Cf.Region != nil {
 		url = fmt.Sprintf("https://%s.s3.%s.amazonaws.com/%s", bucketName, *c.model.Cf.Region, fullPath)
