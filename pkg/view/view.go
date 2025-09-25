@@ -7,7 +7,7 @@ import (
 	"github.com/rivo/tview"
 )
 
-const versionText = "S3Duck 🦆 TUI v.0.0.24"
+const versionText = "S3Duck 🦆 TUI v.0.0.25"
 
 // View ...
 type View struct {
@@ -149,4 +149,91 @@ func (v *View) NewCreateForm(header string, disablePublic bool) *tview.Form {
 		return event
 	})
 	return form
+}
+
+func (v *View) HotkeysModal(profiles bool) *tview.TextView {
+	helpText := `
+		[::b]Navigation[::-]
+          [↓,↑]Down/Up 
+		  Enter         Open selected profile
+
+		[::b]Actions[::-]
+		  Ctrl+N        Create new profile
+          Ctrl+Y        Copy profile
+		  Ctrl+E        Edit profile
+          Ctrl+V        Verify profile (test connection)
+		  Del           Delete profile
+
+		[::b]Misc[::-]
+		  Ctrl+H        This help
+	      Ctrl+A        Show About
+		  Ctrl+Q        Quit
+		
+		[dim]Press any key to close.[-]
+	`
+	if !profiles {
+		helpText = `
+		[::b]Navigation[::-]
+		  [↓,↑]Down/Up 
+		  Enter         Open folder / select
+		  Backspace     Up ([..])
+          Ctrl+P        Show Profiles
+
+		[::b]Actions[::-]
+		  Ctrl+N        Create bucket / folder
+		  Ctrl+D        Download file/folder (for files and folders)
+          Ctrl+U        Open local file manager (for upload)
+		  Del           Delete (recursive for dirs)
+
+		[::b]Misc[::-]
+		  Ctrl+H        This help
+          Ctrl+A        Show About
+		  Ctrl+Q        Quit
+		
+		[dim]Press any key to close.[-]
+	`
+	}
+
+	tv := tview.NewTextView()
+	tv.SetDynamicColors(true)
+	tv.SetTextAlign(tview.AlignLeft)
+	tv.SetWordWrap(true)
+	tv.SetText(helpText)
+	tv.SetBorder(true)
+	tv.SetTitle(" Hotkeys ")
+
+	return tv
+}
+
+func (v *View) AboutModal() *tview.TextView {
+	about := `
+                         [::b]%s[::-]
+			A tiny TUI browser for etcd S3-like storage.
+			Github: https://github.com/nexusriot/s3duck-tui
+
+			(C) Vladislav Ananev 2023-2025 
+			
+                    _  [dim](quack)[-]
+				 __( )> 
+				 \__\      [::b]Features[::-]
+							• Profiles support
+							• Walking dirs support
+							• Download files/dirs support
+							• Uploads files/dirs support
+
+         [dim]Press any key to close.[-]
+			`
+
+	tv := tview.NewTextView()
+	tv.SetDynamicColors(true)
+	tv.SetTextAlign(tview.AlignLeft)
+	tv.SetWordWrap(true)
+	tv.SetText(fmt.Sprintf(about, versionText))
+	tv.SetBorder(true)
+	tv.SetTitle(" About ")
+
+	// ensure redraw on content changes
+	tv.SetChangedFunc(func() { v.App.Draw() })
+
+	return tv
 }

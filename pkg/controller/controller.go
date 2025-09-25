@@ -269,10 +269,10 @@ func (c *Controller) updateList() ([]string, error) {
 		suff = ""
 	} else {
 		title = fmt.Sprintf("(%s)/%s", *c.currentBucket.Key, c.currentPath)
-		suff = "[::b][ctrl+d[][::-]Download [::b][::b][ctrl+u[][::-]Upload [::b]"
+		suff = "[::b][Ctrl+D[][::-]Download [::b][::b][Ctrl+U[][::-]Upload [::b]"
 	}
 
-	fText := fmt.Sprintf("[::b][↓,↑][::-]Down/Up [::b][Enter/Backspace][::-]Lower/Upper %s[::b][Del[][::-]Delete [::b][ctrl+b][::-]Create [::b][ctrl+p][::-]Profiles [::b][ctrl+l][::-]Properties [::b][Ctrl+q][::-]Quit", suff)
+	fText := fmt.Sprintf("[::b][↓,↑][::-]Down/Up [::b][Enter/Backspace][::-]Lower/Upper %s[::b][Del[][::-]Delete [::b][Ctrl+N][::-]Create [::b][Ctrl+P][::-]Profiles [::b][Ctrl+L][::-]Properties [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit", suff)
 
 	objs := make([]*model.Object, 0, len(c.objs))
 	for _, k := range c.objs {
@@ -636,18 +636,38 @@ func (c *Controller) setConfigInput() {
 
 	c.view.List.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
-		case tcell.KeyCtrlB:
+		case tcell.KeyCtrlN:
 			c.CreateConfigEntry()
 			return nil
-		case tcell.KeyCtrlH:
+		case tcell.KeyCtrlE:
 			c.EditConfigEntry()
 			return nil
-		case tcell.KeyCtrlJ:
+		case tcell.KeyCtrlY:
 			c.CopyProfile()
 			return nil
-		case tcell.KeyCtrlO:
+		case tcell.KeyCtrlH:
+			help := c.view.HotkeysModal(true)
+
+			// Close help on any key press inside the help view
+			help.SetInputCapture(func(_ *tcell.EventKey) *tcell.EventKey {
+				c.view.Pages.RemovePage("modal-help")
+				return nil
+			})
+
+			c.view.Pages.AddPage("modal-help", c.view.ModalEdit(help, 70, 18), true, true)
+			return nil
+		case tcell.KeyCtrlV:
 			c.CheckProfile()
 			return nil
+		case tcell.KeyCtrlA:
+			about := c.view.AboutModal()
+			about.SetInputCapture(func(_ *tcell.EventKey) *tcell.EventKey {
+				c.view.Pages.RemovePage("modal-about")
+				return nil
+			})
+			c.view.Pages.AddPage("modal-about", c.view.ModalEdit(about, 70, 18), true, true)
+			return nil
+
 		}
 		return event
 	})
@@ -670,7 +690,7 @@ func (c *Controller) setInput() {
 		case tcell.KeyBackspace2:
 			c.Up()
 			return nil
-		case tcell.KeyCtrlB:
+		case tcell.KeyCtrlN:
 			c.Create()
 			return nil
 		case tcell.KeyCtrlD:
@@ -686,7 +706,27 @@ func (c *Controller) setInput() {
 		case tcell.KeyCtrlU:
 			c.ShowLocalFSModal(c.params.HomeDir)
 			return nil
+		case tcell.KeyCtrlH:
+			help := c.view.HotkeysModal(false)
+
+			// Close help on any key press inside the help view
+			help.SetInputCapture(func(_ *tcell.EventKey) *tcell.EventKey {
+				c.view.Pages.RemovePage("modal-help")
+				return nil
+			})
+
+			c.view.Pages.AddPage("modal-help", c.view.ModalEdit(help, 70, 18), true, true)
+			return nil
+		case tcell.KeyCtrlA:
+			about := c.view.AboutModal()
+			about.SetInputCapture(func(_ *tcell.EventKey) *tcell.EventKey {
+				c.view.Pages.RemovePage("modal-about")
+				return nil
+			})
+			c.view.Pages.AddPage("modal-about", c.view.ModalEdit(about, 70, 18), true, true)
+			return nil
 		}
+
 		return event
 	})
 }
@@ -732,7 +772,7 @@ func (c *Controller) fillConfigData() {
 			c.Duck(conf.BaseUrl, conf.Region, conf.AccessKey, conf.SecretKey, !conf.IgnoreSsl)
 		})
 	}
-	c.view.SetFrameText("[::b][↓,↑][::-]Down/Up [::b][Enter[][::-]Use Profile [::b][ctrl+b[][::-]Create [::b][ctrl+j[][::-]Copy [::b][ctrl+h[][::-]Edit [::b][ctrl+o[][::-]Verify [::b][Del[][::-]Delete [::b][Ctrl+q][::-]Quit")
+	c.view.SetFrameText("[::b][↓,↑][::-]Down/Up [::b][Enter[][::-]Use [::b][Ctrl+N[][::-]New [::b][Ctrl+Y[][::-]Yank(Copy) [::b][Ctrl+E[][::-]Edit [::b][Ctrl+V[][::-]Verify [::b][Del[][::-]Delete [::b][Ctrl+H[][::-]Hotkeys [::b][Ctrl+Q][::-]Quit")
 }
 
 func (c *Controller) fillDetails(key string) {
