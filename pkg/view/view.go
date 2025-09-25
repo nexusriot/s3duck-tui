@@ -208,6 +208,7 @@ func (v *View) HotkeysModal(profiles bool) *tview.TextView {
 func (v *View) AboutModal() *tview.TextView {
 	about := `
                          [::b]%s[::-]
+
 			A tiny TUI browser for etcd S3-like storage.
 			Github: https://github.com/nexusriot/s3duck-tui
 
