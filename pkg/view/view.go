@@ -211,7 +211,7 @@ func (v *View) AboutModal() *tview.TextView {
 			A tiny TUI browser for etcd S3-like storage.
 			Github: https://github.com/nexusriot/s3duck-tui
 
-			(C) Vladislav Ananev 2023-2025 
+			(C)2023-2025 Vladislav Ananev
 			
                     _  [dim](quack)[-]
 				 __( )> 
