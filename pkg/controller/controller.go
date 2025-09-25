@@ -665,7 +665,7 @@ func (c *Controller) setConfigInput() {
 				c.view.Pages.RemovePage("modal-about")
 				return nil
 			})
-			c.view.Pages.AddPage("modal-about", c.view.ModalEdit(about, 70, 18), true, true)
+			c.view.Pages.AddPage("modal-about", c.view.ModalEdit(about, 70, 19), true, true)
 			return nil
 
 		}
@@ -723,7 +723,7 @@ func (c *Controller) setInput() {
 				c.view.Pages.RemovePage("modal-about")
 				return nil
 			})
-			c.view.Pages.AddPage("modal-about", c.view.ModalEdit(about, 70, 18), true, true)
+			c.view.Pages.AddPage("modal-about", c.view.ModalEdit(about, 70, 19), true, true)
 			return nil
 		}
 
