@@ -299,7 +299,7 @@ func (m *Model) List(path string, bucket *Object) ([]*Object, error) {
 	for paginator.HasMorePages() {
 		output, err := paginator.NextPage(context.TODO())
 		if err != nil {
-			panic(err)
+			return nil, err
 		}
 
 		for _, p := range output.CommonPrefixes {
@@ -340,7 +340,6 @@ func (m *Model) List(path string, bucket *Object) ([]*Object, error) {
 				&ts,
 				&size,
 				nil,
-				//o.StorageClass,
 				o.LastModified,
 				o.Key,
 			}
@@ -371,7 +370,6 @@ func (m *Model) ListBuckets() ([]*Object, error) {
 			Size:         nil,
 			StorageClass: nil,
 			LastModified: td,
-			// Add other fields if necessary
 		}
 		objs = append(objs, ko)
 	}
@@ -645,13 +643,11 @@ func (m *Model) MakeBucketPublic(bucketName string) error {
 	policy := fmt.Sprintf(`{
 		"Version":"2012-10-17",
 		"Statement":[{
+			"Sid":"PublicReadGetObject",
 			"Effect":"Allow",
-			 "Principal": {
-			 "AWS": "*"
-			 },
+			"Principal":"*",
 			"Action":"s3:GetObject",
-			"Resource":["arn:aws:s3:::%s"],
-			"Condition": {}
+			"Resource":"arn:aws:s3:::%s/*"
 		}]
 	}`, bucketName)
 

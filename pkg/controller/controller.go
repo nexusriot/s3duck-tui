@@ -147,7 +147,7 @@ func (c *Controller) Download() error {
 		return nil
 	}
 
-	cwd := path.Join(c.params.HomeDir, "Downloads") + "/"
+	cwd := filepath.Join(c.params.HomeDir, "Downloads") + string(os.PathSeparator)
 	key := c.currentPath + cur
 
 	objects, totalSize, err := c.model.ResolveDownloadObjects(key, val.Ot == model.Folder, val.Size, c.currentBucket)
