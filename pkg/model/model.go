@@ -12,6 +12,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -89,20 +90,10 @@ type progressWriterAt struct {
 
 func (pwa *progressWriterAt) WriteAt(p []byte, off int64) (int, error) {
 	n, err := pwa.w.WriteAt(p, off)
-	pwa.written += int64(n)
-	pwa.updateFunc(pwa.written, pwa.total)
-	return n, err
-}
-
-type timeoutReader struct {
-	r     io.Reader
-	timer *time.Timer
-}
-
-func (tr *timeoutReader) Read(p []byte) (int, error) {
-	tr.timer.Reset(30 * time.Second)
-	n, err := tr.r.Read(p)
-	tr.timer.Stop()
+	w := atomic.AddInt64(&pwa.written, int64(n))
+	if pwa.updateFunc != nil {
+		pwa.updateFunc(w, pwa.total)
+	}
 	return n, err
 }
 
@@ -188,9 +179,12 @@ func (m *Model) RefreshClient(bucket *string) {
 	m.Client = s3.NewFromConfig(cfg)
 	m.Downloader = GetDownloader(m.Client)
 }
-func (m *Model) ListObjects(key string, bucket *Object) []s3t.Object {
-	var objects []s3t.Object
+func (m *Model) ListObjects(key string, bucket *Object) ([]s3t.Object, error) {
+	if bucket == nil || bucket.Key == nil {
+		return nil, fmt.Errorf("bucket is nil")
+	}
 
+	var objects []s3t.Object
 	input := &s3.ListObjectsV2Input{
 		Bucket: aws.String(*bucket.Key),
 		Prefix: aws.String(key),
@@ -200,12 +194,11 @@ func (m *Model) ListObjects(key string, bucket *Object) []s3t.Object {
 	for paginator.HasMorePages() {
 		output, err := paginator.NextPage(context.TODO())
 		if err != nil {
-			panic(err)
+			return nil, err
 		}
-
 		objects = append(objects, output.Contents...)
 	}
-	return objects
+	return objects, nil
 }
 
 func (m *Model) Download(
@@ -386,22 +379,61 @@ func (m *Model) ListBuckets() ([]*Object, error) {
 }
 
 func (m *Model) Delete(key *string, bucket *Object) error {
+	if bucket == nil || bucket.Key == nil {
+		return fmt.Errorf("bucket is nil")
+	}
+	if key == nil || *key == "" {
+		return fmt.Errorf("key is empty")
+	}
 
 	var objectIds []s3t.ObjectIdentifier
 
 	if strings.HasSuffix(*key, "/") {
-		ks := m.ListObjects(*key, bucket)
+		ks, err := m.ListObjects(*key, bucket)
+
+		if err != nil {
+			return err
+		}
 		for _, o := range ks {
+			if o.Key == nil {
+				continue
+			}
 			objectIds = append(objectIds, s3t.ObjectIdentifier{Key: aws.String(*o.Key)})
 		}
 	} else {
 		objectIds = append(objectIds, s3t.ObjectIdentifier{Key: aws.String(*key)})
 	}
-	_, err := m.Client.DeleteObjects(context.TODO(), &s3.DeleteObjectsInput{
-		Bucket: aws.String(*bucket.Key),
-		Delete: &s3t.Delete{Objects: objectIds},
-	})
-	return err
+
+	if len(objectIds) == 0 {
+		return nil
+	}
+
+	const maxDelete = 1000
+	ctx := context.TODO()
+
+	for i := 0; i < len(objectIds); i += maxDelete {
+		end := i + maxDelete
+		if end > len(objectIds) {
+			end = len(objectIds)
+		}
+
+		out, err := m.Client.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: aws.String(*bucket.Key),
+			Delete: &s3t.Delete{
+				Objects: objectIds[i:end],
+				Quiet:   true,
+			},
+		})
+		if err != nil {
+			return err
+		}
+		if out != nil && len(out.Errors) > 0 {
+			e := out.Errors[0]
+			return fmt.Errorf("delete failed for %s: %s", aws.ToString(e.Key), aws.ToString(e.Message))
+		}
+	}
+
+	return nil
 }
 
 func (m *Model) DeleteBucket(name *string) error {
@@ -556,31 +588,50 @@ func (m *Model) Upload(
 
 // PrepareUpload returns list of files to upload with remote keys and total size.
 func (m *Model) PrepareUpload(localPath string, currentPath string, bucket *Object) ([]UploadTarget, int64, error) {
+	info, err := os.Stat(localPath)
+	if err != nil {
+		return nil, 0, err
+	}
+
 	var targets []UploadTarget
 	var totalSize int64
 
-	err := filepath.Walk(localPath, func(p string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err // skip unreadable file
-		}
-		if info.IsDir() {
-			return nil
-		}
+	// Normalize currentPath to S3 prefix style
+	prefix := filepath.ToSlash(currentPath)
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
 
-		relPath, err := filepath.Rel(localPath, p)
+	if !info.IsDir() {
+		remote := prefix + filepath.ToSlash(filepath.Base(localPath))
+		targets = append(targets, UploadTarget{
+			LocalPath:  localPath,
+			RemotePath: remote,
+			Size:       info.Size(),
+		})
+		return targets, info.Size(), nil
+	}
+
+	err = filepath.Walk(localPath, func(p string, fi os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
+		if fi.IsDir() {
+			return nil
+		}
 
-		// S3 expects forward slashes
-		remotePath := filepath.ToSlash(filepath.Join(currentPath, relPath))
+		rel, err := filepath.Rel(localPath, p)
+		if err != nil {
+			return err
+		}
+		remote := prefix + filepath.ToSlash(rel)
 
 		targets = append(targets, UploadTarget{
 			LocalPath:  p,
-			RemotePath: remotePath,
-			Size:       info.Size(),
+			RemotePath: remote,
+			Size:       fi.Size(),
 		})
-		totalSize += info.Size()
+		totalSize += fi.Size()
 		return nil
 	})
 
@@ -619,7 +670,11 @@ func (m *Model) ResolveDownloadObjects(key string, isFolder bool, size *int64, b
 		if !strings.HasSuffix(key, "/") {
 			key += "/"
 		}
-		objs := m.ListObjects(key, bucket)
+		objs, err := m.ListObjects(key, bucket)
+
+		if err != nil {
+			return nil, 0, err
+		}
 
 		var totalSize int64
 		for _, obj := range objs {

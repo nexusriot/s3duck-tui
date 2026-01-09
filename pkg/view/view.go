@@ -7,7 +7,7 @@ import (
 	"github.com/rivo/tview"
 )
 
-const versionText = "S3Duck 🦆 TUI v.0.0.25"
+const versionText = "S3Duck 🦆 TUI v.0.0.28"
 
 // View ...
 type View struct {
@@ -212,7 +212,7 @@ func (v *View) AboutModal() *tview.TextView {
 			A tiny TUI browser for etcd S3-like storage.
 			Github: https://github.com/nexusriot/s3duck-tui
 
-			(C)2023-2025 Vladislav Ananev
+			(C)2023-2026 Vladislav Ananev
 			
                     _  [dim](quack)[-]
 				 __( )> 
