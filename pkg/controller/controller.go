@@ -370,11 +370,20 @@ func (c *Controller) Download() error {
 
 			showSummary := func() {
 				c.view.App.QueueUpdateDraw(func() {
+					report := sum.text(totalSize, canceled)
+
 					progress.ClearButtons()
-					progress.AddButtons([]string{"Done"})
-					progress.SetText(sum.text(totalSize, canceled))
+					progress.AddButtons([]string{"Done", "Copy report"})
+					progress.SetText(report)
+
 					progress.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-						c.view.Pages.RemovePage("progress").SwitchToPage("main")
+						switch buttonLabel {
+						case "Copy report":
+							u.CopyToClipboard(report)
+							go c.success("Download report copied")
+						case "Done":
+							c.view.Pages.RemovePage("progress").SwitchToPage("main")
+						}
 					})
 					c.view.App.SetFocus(progress)
 				})
@@ -583,7 +592,7 @@ func (c *Controller) updateList() ([]string, error) {
 
 		n := c.selectedCount()
 		if n > 0 {
-			title = fmt.Sprintf("%s  [green]Selected: %d[-]", base, n)
+			title = fmt.Sprintf("%s  [green]Selected: %d", base, n)
 		} else {
 			title = base
 		}
