@@ -100,11 +100,12 @@ func (s *downloadSummary) text(totalBytes int64, canceled bool) string {
 	return b.String()
 }
 
-func strPtr(s *string) string {
-	if s == nil {
-		return ""
+func (c *Controller) selectedCount() int {
+	sel := c.selectionMap()
+	if sel == nil {
+		return 0
 	}
-	return *s
+	return len(sel)
 }
 
 type Controller struct {
@@ -578,7 +579,15 @@ func (c *Controller) updateList() ([]string, error) {
 		title = "(buckets)"
 		suff = ""
 	} else {
-		title = fmt.Sprintf("(%s)/%s", *c.currentBucket.Key, c.currentPath)
+		base := fmt.Sprintf("(%s)/%s", *c.currentBucket.Key, c.currentPath)
+
+		n := c.selectedCount()
+		if n > 0 {
+			title = fmt.Sprintf("%s  [green]Selected: %d[-]", base, n)
+		} else {
+			title = base
+		}
+
 		suff = "[::b][Ctrl+D[][::-]Download [::b][::b][Ctrl+U[][::-]Upload [::b]"
 	}
 
