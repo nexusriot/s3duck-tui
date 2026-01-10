@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	s3t "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/dustin/go-humanize"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -306,7 +305,7 @@ func (c *Controller) Download() error {
 	}
 	cwd := filepath.Join(c.params.HomeDir, "Downloads") + string(os.PathSeparator)
 
-	var allObjects []s3t.Object
+	var allObjects []model.DownloadTarget
 	var totalSize int64
 
 	for _, name := range names {
@@ -409,7 +408,7 @@ func (c *Controller) Download() error {
 				default:
 				}
 
-				keyStr := strPtr(object.Key)
+				keyStr := object.Key
 				if keyStr == "" {
 					sum.addFailed("<nil-key>", fmt.Errorf("object key is empty"))
 					continue
@@ -453,13 +452,12 @@ func (c *Controller) Download() error {
 					}
 				}
 
-				n, err := c.model.Download(
+				n, err := c.model.DownloadTarget(
 					ctx,
 					object,
 					c.currentPath,
 					cwd,
 					c.currentBucket.Key,
-					totalSize,
 					func(written, total int64, key string) {
 						showProgress(i, key, written)
 					},

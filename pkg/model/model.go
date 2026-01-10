@@ -52,6 +52,11 @@ type Config struct {
 	SSl       bool
 }
 
+type DownloadTarget struct {
+	Key  string
+	Size int64
+}
+
 type Object struct {
 	Key          *string
 	Ot           FType
@@ -717,32 +722,93 @@ func (m *Model) MakeBucketPublic(bucketName string) error {
 // ResolveDownloadObjects resolves the objects to be downloaded.
 // If `isFolder` is true, it performs a prefix-based list.
 // If false, returns a single exact match using the key and size.
-func (m *Model) ResolveDownloadObjects(key string, isFolder bool, size *int64, bucket *Object) ([]s3t.Object, int64, error) {
+func (m *Model) ResolveDownloadObjects(key string, isFolder bool, size *int64, bucket *Object) ([]DownloadTarget, int64, error) {
 	if isFolder {
 		if !strings.HasSuffix(key, "/") {
 			key += "/"
 		}
 		objs, err := m.ListObjects(key, bucket)
-
 		if err != nil {
 			return nil, 0, err
 		}
 
-		var totalSize int64
+		var out []DownloadTarget
+		var total int64
 		for _, obj := range objs {
-			totalSize += obj.Size
+			if obj.Key == nil {
+				continue
+			}
+			out = append(out, DownloadTarget{
+				Key:  *obj.Key,
+				Size: obj.Size,
+			})
+			total += obj.Size
 		}
-		return objs, totalSize, nil
+		return out, total, nil
 	}
 
 	if size == nil {
 		return nil, 0, fmt.Errorf("file size is nil for object %s", key)
 	}
+	return []DownloadTarget{{Key: key, Size: *size}}, *size, nil
+}
+func (m *Model) DownloadTarget(
+	ctx context.Context,
+	t DownloadTarget,
+	currentPath,
+	destPath string,
+	bucket *string,
+	progressCb func(written int64, total int64, key string),
+) (int64, error) {
+	// build local path based on key (same logic as your Download)
+	if err := os.MkdirAll(destPath, 0700); err != nil {
+		return 0, err
+	}
 
-	return []s3t.Object{
-		{
-			Key:  aws.String(key),
-			Size: *size,
+	key := filepath.ToSlash(t.Key)
+	prefix := filepath.ToSlash(currentPath)
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	relativeKey := key
+	if strings.HasPrefix(key, prefix) {
+		relativeKey = strings.TrimPrefix(key, prefix)
+	}
+	downloadPath := filepath.Join(destPath, relativeKey)
+
+	if strings.HasSuffix(t.Key, "/") {
+		return 0, os.MkdirAll(downloadPath, 0760)
+	}
+	if err := os.MkdirAll(filepath.Dir(downloadPath), 0760); err != nil {
+		return 0, err
+	}
+	if _, err := os.Stat(downloadPath); err == nil {
+		return 0, fmt.Errorf("file exists: %s", downloadPath)
+	}
+
+	fp, err := os.Create(downloadPath)
+	if err != nil {
+		return 0, err
+	}
+	defer fp.Close()
+
+	writerAt := &progressWriterAt{
+		w:     fp,
+		total: t.Size,
+		updateFunc: func(written int64, total int64) {
+			if progressCb != nil {
+				progressCb(written, total, t.Key)
+			}
 		},
-	}, *size, nil
+	}
+
+	n, err := m.Downloader.Download(ctx, writerAt, &s3.GetObjectInput{
+		Bucket: bucket,
+		Key:    aws.String(t.Key),
+	})
+	if ctx.Err() != nil {
+		_ = os.Remove(downloadPath)
+		return 0, ctx.Err()
+	}
+	return n, err
 }
