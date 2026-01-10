@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/dustin/go-humanize"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -30,6 +29,83 @@ const (
 	decSkipAll
 	decCancel
 )
+
+type downloadSummary struct {
+	totalObjects int
+	downloaded   int
+	skipped      int
+	overwritten  int
+	failed       int
+	bytesDone    int64
+
+	skippedPaths []string
+	failedItems  []string
+}
+
+func (s *downloadSummary) addSkipped(p string) {
+	s.skipped++
+	if len(s.skippedPaths) < 8 {
+		s.skippedPaths = append(s.skippedPaths, p)
+	}
+}
+
+func (s *downloadSummary) addFailed(key string, err error) {
+	s.failed++
+	if len(s.failedItems) < 8 {
+		s.failedItems = append(s.failedItems, fmt.Sprintf("%s: %v", key, err))
+	}
+}
+
+func (s *downloadSummary) text(totalBytes int64, canceled bool) string {
+	status := "Download complete."
+	if canceled {
+		status = "Download canceled."
+	} else if s.failed > 0 {
+		status = "Download finished with errors."
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s\n\n", status)
+	fmt.Fprintf(&b, "Objects: %d total\n", s.totalObjects)
+	fmt.Fprintf(&b, "Downloaded: %d\n", s.downloaded)
+	fmt.Fprintf(&b, "Skipped: %d\n", s.skipped)
+	fmt.Fprintf(&b, "Overwritten: %d\n", s.overwritten)
+	fmt.Fprintf(&b, "Failed: %d\n", s.failed)
+	fmt.Fprintf(&b, "Bytes: %s / %s\n",
+		humanize.IBytes(uint64(s.bytesDone)),
+		humanize.IBytes(uint64(totalBytes)),
+	)
+
+	if len(s.skippedPaths) > 0 {
+		fmt.Fprintf(&b, "\nSkipped:\n")
+		for _, p := range s.skippedPaths {
+			fmt.Fprintf(&b, "  - %s\n", p)
+		}
+		if s.skipped > len(s.skippedPaths) {
+			fmt.Fprintf(&b, "  ...and %d more\n", s.skipped-len(s.skippedPaths))
+		}
+	}
+
+	if len(s.failedItems) > 0 {
+		fmt.Fprintf(&b, "\nFailed:\n")
+		for _, it := range s.failedItems {
+			fmt.Fprintf(&b, "  - %s\n", it)
+		}
+		if s.failed > len(s.failedItems) {
+			fmt.Fprintf(&b, "  ...and %d more\n", s.failed-len(s.failedItems))
+		}
+	}
+
+	fmt.Fprintf(&b, "\nPress Done to return.")
+	return b.String()
+}
+
+func strPtr(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
+}
 
 type Controller struct {
 	debug         bool
@@ -193,8 +269,6 @@ func (c *Controller) Delete() error {
 }
 
 func (c *Controller) Download() error {
-	overwriteAll := false
-	skipAll := false
 
 	if c.view.List.GetItemCount() == 0 {
 		return nil
@@ -239,89 +313,127 @@ func (c *Controller) Download() error {
 		go func() {
 			downloadedSize := int64(0)
 
-			for i, object := range objects {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-				}
-				// TODO -> avoid using aws lib in controller
-				dst := localDownloadPath(c.currentPath, cwd, aws.ToString(object.Key))
+			sum := downloadSummary{totalObjects: len(objects)}
+			overwriteAll := false
+			skipAll := false
+			canceled := false
 
-				// Directory marker (S3 "folders"): let model handle mkdir logic, no prompt
-				if strings.HasSuffix(aws.ToString(object.Key), "/") {
-					// proceed as usual
-				} else {
-					// Existence check
-					if _, err := os.Stat(dst); err == nil {
-						if skipAll {
-							continue
-						}
-						if !overwriteAll {
-							d := c.askOverwrite(dst)
-							switch d {
-							case decSkip:
-								continue
-							case decOverwrite:
-								_ = os.Remove(dst)
-							case decOverwriteAll:
-								overwriteAll = true
-								_ = os.Remove(dst)
-							case decSkipAll:
-								skipAll = true
-								continue
-							default:
-								cancel()
-								c.view.App.QueueUpdateDraw(func() {
-									c.view.Pages.RemovePage("progress").SwitchToPage("main")
-								})
-								return
-							}
-						} else {
-							// overwriteAll already chosen
-							_ = os.Remove(dst)
-						}
-					}
-				}
+			var lastDraw time.Time
+			throttle := 100 * time.Millisecond
 
-				n, err := c.model.Download(ctx, object, c.currentPath, cwd, c.currentBucket.Key, totalSize, func(written, total int64, key string) {
-					percentage := float64(downloadedSize+written) / float64(totalSize) * 100
-					c.view.App.QueueUpdateDraw(func() {
-						progress.SetText(fmt.Sprintf(
-							"Downloading\n%d/%d object(s)\n%s/%s (%.1f%%)\nCurrent: %s",
-							i+1, len(objects),
-							humanize.IBytes(uint64(downloadedSize+written)),
-							humanize.IBytes(uint64(totalSize)),
-							percentage,
-							key,
-						))
-					})
-				})
-
-				if err != nil {
-					c.view.App.QueueUpdateDraw(func() {
-						c.view.Pages.RemovePage("progress").SwitchToPage("main")
-					})
-					go c.error(fmt.Sprintf("Failed to download %s", *object.Key), err, false)
-					return
-				}
-				downloadedSize += n
-			}
-
-			select {
-			case <-ctx.Done():
-				return
-			default:
+			showSummary := func() {
 				c.view.App.QueueUpdateDraw(func() {
 					progress.ClearButtons()
 					progress.AddButtons([]string{"Done"})
-					progress.SetText("Download complete.\n\nPress Done to return.")
+					progress.SetText(sum.text(totalSize, canceled))
 					progress.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
 						c.view.Pages.RemovePage("progress").SwitchToPage("main")
 					})
 					c.view.App.SetFocus(progress)
 				})
 			}
+
+			showProgress := func(i int, key string, written int64) {
+				now := time.Now()
+				if now.Sub(lastDraw) < throttle {
+					return
+				}
+				lastDraw = now
+
+				percentage := float64(downloadedSize+written) / float64(totalSize) * 100
+				c.view.App.QueueUpdateDraw(func() {
+					progress.SetText(fmt.Sprintf(
+						"Downloading\n%d/%d object(s)\n%s/%s (%.1f%%)\nCurrent: %s",
+						i+1, len(objects),
+						humanize.IBytes(uint64(downloadedSize+written)),
+						humanize.IBytes(uint64(totalSize)),
+						percentage,
+						key,
+					))
+				})
+			}
+
+		loop:
+			for i, object := range objects {
+				select {
+				case <-ctx.Done():
+					canceled = true
+					break loop
+				default:
+				}
+
+				keyStr := strPtr(object.Key)
+				if keyStr == "" {
+					sum.addFailed("<nil-key>", fmt.Errorf("object key is empty"))
+					continue
+				}
+
+				if !strings.HasSuffix(keyStr, "/") {
+					dst := localDownloadPath(c.currentPath, cwd, keyStr)
+
+					if _, err := os.Stat(dst); err == nil {
+						if skipAll {
+							sum.addSkipped(dst)
+							continue
+						}
+
+						if !overwriteAll {
+							d := c.askOverwrite(dst)
+							switch d {
+							case decSkip:
+								sum.addSkipped(dst)
+								continue
+							case decSkipAll:
+								skipAll = true
+								sum.addSkipped(dst)
+								continue
+							case decOverwrite:
+								sum.overwritten++
+								_ = os.Remove(dst)
+							case decOverwriteAll:
+								overwriteAll = true
+								sum.overwritten++
+								_ = os.Remove(dst)
+							default: // cancel
+								canceled = true
+								cancel()
+								break loop
+							}
+						} else {
+							sum.overwritten++
+							_ = os.Remove(dst)
+						}
+					}
+				}
+
+				n, err := c.model.Download(
+					ctx,
+					object,
+					c.currentPath,
+					cwd,
+					c.currentBucket.Key,
+					totalSize,
+					func(written, total int64, key string) {
+						showProgress(i, key, written)
+					},
+				)
+
+				if ctx.Err() != nil {
+					canceled = true
+					break loop
+				}
+
+				if err != nil {
+					sum.addFailed(keyStr, err)
+					continue
+				}
+
+				downloadedSize += n
+				sum.downloaded++
+				sum.bytesDone = downloadedSize
+			}
+
+			showSummary()
 		}()
 	})
 
