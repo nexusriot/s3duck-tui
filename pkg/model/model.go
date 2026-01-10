@@ -495,14 +495,19 @@ func (m *Model) Upload(
 
 	isDir := info.IsDir()
 	var files []string
+	var dirs []string
 	var totalSize int64
 
 	if isDir {
-		err := filepath.Walk(localPath, func(path string, fi os.FileInfo, err error) error {
-			if err != nil || fi.IsDir() {
+		err := filepath.Walk(localPath, func(p string, fi os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if fi.IsDir() {
+				dirs = append(dirs, p)
 				return nil
 			}
-			files = append(files, path)
+			files = append(files, p)
 			totalSize += fi.Size()
 			return nil
 		})
@@ -512,6 +517,54 @@ func (m *Model) Upload(
 	} else {
 		files = []string{localPath}
 		totalSize = info.Size()
+	}
+
+	// If uploading a directory, create S3 "folder marker" objects for empty dirs.
+	// S3 has no real folders; empty folders exist only if there's a key ending with "/".
+	if isDir {
+		// Mark all directories that have at least one file somewhere under them.
+		nonEmpty := make(map[string]bool, len(dirs))
+		for _, f := range files {
+			d := filepath.Dir(f)
+			for {
+				nonEmpty[d] = true
+				if d == localPath {
+					break
+				}
+				parent := filepath.Dir(d)
+				if parent == d {
+					break
+				}
+				d = parent
+			}
+		}
+		// Create markers for dirs that have no file descendants.
+		// Also supports the case when the root folder itself is empty
+		for _, d := range dirs {
+			if nonEmpty[d] {
+				continue
+			}
+
+			parent := filepath.Dir(localPath)
+			relPath, err := filepath.Rel(parent, d)
+			if err != nil {
+				return err
+			}
+
+			s3Key := filepath.ToSlash(path.Join(s3Prefix, relPath))
+			if !strings.HasSuffix(s3Key, "/") {
+				s3Key += "/"
+			}
+
+			_, err = m.Client.PutObject(ctx, &s3.PutObjectInput{
+				Bucket: aws.String(*bucket.Key),
+				Key:    aws.String(s3Key),
+				Body:   strings.NewReader(""),
+			})
+			if err != nil {
+				return fmt.Errorf("failed to create folder marker %s: %w", s3Key, err)
+			}
+		}
 	}
 
 	uploader := s3m.NewUploader(m.Client, func(u *s3m.Uploader) {
