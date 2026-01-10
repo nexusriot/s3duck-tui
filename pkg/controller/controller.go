@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/dustin/go-humanize"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -18,6 +19,16 @@ import (
 	"github.com/nexusriot/s3duck-tui/pkg/model"
 	u "github.com/nexusriot/s3duck-tui/pkg/utils"
 	"github.com/nexusriot/s3duck-tui/pkg/view"
+)
+
+type overwriteDecision int
+
+const (
+	decOverwrite overwriteDecision = iota
+	decSkip
+	decOverwriteAll
+	decSkipAll
+	decCancel
 )
 
 type Controller struct {
@@ -50,6 +61,36 @@ func NewController(debug bool) *Controller {
 	return &controller
 }
 
+func (c *Controller) askOverwrite(path string) overwriteDecision {
+	ch := make(chan overwriteDecision, 1)
+
+	c.view.App.QueueUpdateDraw(func() {
+		m := tview.NewModal().
+			SetText(fmt.Sprintf("File already exists:\n%s\n\nWhat do you want to do?", path)).
+			AddButtons([]string{"Overwrite", "Skip", "Overwrite All", "Skip All", "Cancel"}).
+			SetDoneFunc(func(_ int, label string) {
+				c.view.Pages.RemovePage("overwrite")
+				switch label {
+				case "Overwrite":
+					ch <- decOverwrite
+				case "Skip":
+					ch <- decSkip
+				case "Overwrite All":
+					ch <- decOverwriteAll
+				case "Skip All":
+					ch <- decSkipAll
+				default:
+					ch <- decCancel
+				}
+			})
+
+		c.view.Pages.AddPage("overwrite", c.view.ModalEdit(m, 80, 10), true, true)
+		c.view.App.SetFocus(m)
+	})
+
+	return <-ch
+}
+
 func (c *Controller) makeObjectMap() error {
 	var list []*model.Object
 	var err error
@@ -71,6 +112,22 @@ func (c *Controller) makeObjectMap() error {
 	}
 	c.objs = dirs
 	return nil
+}
+
+func localDownloadPath(currentPath, destPath, s3Key string) string {
+	key := filepath.ToSlash(s3Key)
+	prefix := filepath.ToSlash(currentPath)
+
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+
+	relativeKey := key
+	if strings.HasPrefix(key, prefix) {
+		relativeKey = strings.TrimPrefix(key, prefix)
+	}
+
+	return filepath.Join(destPath, relativeKey)
 }
 
 func getPosition(element string, slice []string) int {
@@ -136,6 +193,8 @@ func (c *Controller) Delete() error {
 }
 
 func (c *Controller) Download() error {
+	overwriteAll := false
+	skipAll := false
 
 	if c.view.List.GetItemCount() == 0 {
 		return nil
@@ -185,6 +244,44 @@ func (c *Controller) Download() error {
 				case <-ctx.Done():
 					return
 				default:
+				}
+				// TODO -> avoid using aws lib in controller
+				dst := localDownloadPath(c.currentPath, cwd, aws.ToString(object.Key))
+
+				// Directory marker (S3 "folders"): let model handle mkdir logic, no prompt
+				if strings.HasSuffix(aws.ToString(object.Key), "/") {
+					// proceed as usual
+				} else {
+					// Existence check
+					if _, err := os.Stat(dst); err == nil {
+						if skipAll {
+							continue
+						}
+						if !overwriteAll {
+							d := c.askOverwrite(dst)
+							switch d {
+							case decSkip:
+								continue
+							case decOverwrite:
+								_ = os.Remove(dst)
+							case decOverwriteAll:
+								overwriteAll = true
+								_ = os.Remove(dst)
+							case decSkipAll:
+								skipAll = true
+								continue
+							default:
+								cancel()
+								c.view.App.QueueUpdateDraw(func() {
+									c.view.Pages.RemovePage("progress").SwitchToPage("main")
+								})
+								return
+							}
+						} else {
+							// overwriteAll already chosen
+							_ = os.Remove(dst)
+						}
+					}
 				}
 
 				n, err := c.model.Download(ctx, object, c.currentPath, cwd, c.currentBucket.Key, totalSize, func(written, total int64, key string) {

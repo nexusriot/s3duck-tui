@@ -26,6 +26,8 @@ import (
 	u "github.com/nexusriot/s3duck-tui/pkg/utils"
 )
 
+var ErrFileExists = errors.New("file exists")
+
 type optsFunc = func(*config.LoadOptions) error
 
 type FType int8
@@ -234,8 +236,9 @@ func (m *Model) Download(
 	if err := os.MkdirAll(dir, 0760); err != nil {
 		return 0, err
 	}
+
 	if _, err := os.Stat(downloadPath); err == nil {
-		return 0, fmt.Errorf("file exists: %s", downloadPath)
+		return 0, ErrFileExists
 	}
 
 	fp, err := os.Create(downloadPath)
