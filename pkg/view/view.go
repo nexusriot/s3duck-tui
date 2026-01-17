@@ -7,7 +7,7 @@ import (
 	"github.com/rivo/tview"
 )
 
-const versionText = "S3Duck 🦆 TUI v.0.0.25"
+const versionText = "S3Duck 🦆 TUI v.0.0.30"
 
 // View ...
 type View struct {
@@ -183,6 +183,9 @@ func (v *View) HotkeysModal(profiles bool) *tview.TextView {
 		  Ctrl+N        Create bucket / folder
 		  Ctrl+D        Download file/folder (for files and folders)
           Ctrl+U        Open local file manager (for upload)
+          Space			Select object for download
+          Ctrl+S        Select all objects for download
+          Ctrl+X        Unselect all objects for download
 		  Del           Delete (recursive for dirs)
 
 		[::b]Misc[::-]
@@ -212,7 +215,7 @@ func (v *View) AboutModal() *tview.TextView {
 			A tiny TUI browser for etcd S3-like storage.
 			Github: https://github.com/nexusriot/s3duck-tui
 
-			(C)2023-2025 Vladislav Ananev
+			(C)2023-2026 Vladislav Ananev
 			
                     _  [dim](quack)[-]
 				 __( )> 

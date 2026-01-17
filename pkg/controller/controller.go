@@ -20,17 +20,107 @@ import (
 	"github.com/nexusriot/s3duck-tui/pkg/view"
 )
 
+type overwriteDecision int
+
+const (
+	decOverwrite overwriteDecision = iota
+	decSkip
+	decOverwriteAll
+	decSkipAll
+	decCancel
+)
+
+type downloadSummary struct {
+	totalObjects int
+	downloaded   int
+	skipped      int
+	overwritten  int
+	failed       int
+	bytesDone    int64
+
+	skippedPaths []string
+	failedItems  []string
+}
+
+func (s *downloadSummary) addSkipped(p string) {
+	s.skipped++
+	if len(s.skippedPaths) < 8 {
+		s.skippedPaths = append(s.skippedPaths, p)
+	}
+}
+
+func (s *downloadSummary) addFailed(key string, err error) {
+	s.failed++
+	if len(s.failedItems) < 8 {
+		s.failedItems = append(s.failedItems, fmt.Sprintf("%s: %v", key, err))
+	}
+}
+
+func (s *downloadSummary) text(totalBytes int64, canceled bool) string {
+	status := "Download complete."
+	if canceled {
+		status = "Download canceled."
+	} else if s.failed > 0 {
+		status = "Download finished with errors."
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "%s\n\n", status)
+	fmt.Fprintf(&b, "Objects: %d total\n", s.totalObjects)
+	fmt.Fprintf(&b, "Downloaded: %d\n", s.downloaded)
+	fmt.Fprintf(&b, "Skipped: %d\n", s.skipped)
+	fmt.Fprintf(&b, "Overwritten: %d\n", s.overwritten)
+	fmt.Fprintf(&b, "Failed: %d\n", s.failed)
+	fmt.Fprintf(&b, "Bytes: %s / %s\n",
+		humanize.IBytes(uint64(s.bytesDone)),
+		humanize.IBytes(uint64(totalBytes)),
+	)
+
+	if len(s.skippedPaths) > 0 {
+		fmt.Fprintf(&b, "\nSkipped:\n")
+		for _, p := range s.skippedPaths {
+			fmt.Fprintf(&b, "  - %s\n", p)
+		}
+		if s.skipped > len(s.skippedPaths) {
+			fmt.Fprintf(&b, "  ...and %d more\n", s.skipped-len(s.skippedPaths))
+		}
+	}
+
+	if len(s.failedItems) > 0 {
+		fmt.Fprintf(&b, "\nFailed:\n")
+		for _, it := range s.failedItems {
+			fmt.Fprintf(&b, "  - %s\n", it)
+		}
+		if s.failed > len(s.failedItems) {
+			fmt.Fprintf(&b, "  ...and %d more\n", s.failed-len(s.failedItems))
+		}
+	}
+
+	fmt.Fprintf(&b, "\nPress Done to return.")
+	return b.String()
+}
+
+func (c *Controller) selectedCount() int {
+	sel := c.selectionMap()
+	if sel == nil {
+		return 0
+	}
+	return len(sel)
+}
+
 type Controller struct {
-	debug         bool
-	view          *view.View
-	model         *model.Model
-	buckets       []*model.Object
-	objs          map[string]*model.Object
-	currentPath   string
-	currentBucket *model.Object
-	bucketPos     int
-	position      map[string]int
-	params        *cfg.Params
+	debug           bool
+	view            *view.View
+	model           *model.Model
+	buckets         []*model.Object
+	objs            map[string]*model.Object
+	currentPath     string
+	currentBucket   *model.Object
+	bucketPos       int
+	position        map[string]int
+	params          *cfg.Params
+	selectedByScope map[string]map[string]bool
+	restoreNext     string
 }
 
 func NewController(debug bool) *Controller {
@@ -39,15 +129,66 @@ func NewController(debug bool) *Controller {
 	params := cfg.NewParams()
 
 	controller := Controller{
-		debug:       debug,
-		view:        v,
-		model:       nil,
-		currentPath: "",
-		bucketPos:   0,
-		position:    make(map[string]int),
-		params:      params,
+		debug:           debug,
+		view:            v,
+		model:           nil,
+		currentPath:     "",
+		bucketPos:       0,
+		position:        make(map[string]int),
+		params:          params,
+		selectedByScope: make(map[string]map[string]bool),
 	}
 	return &controller
+}
+
+func (c *Controller) askOverwrite(path string) overwriteDecision {
+	ch := make(chan overwriteDecision, 1)
+
+	c.view.App.QueueUpdateDraw(func() {
+		m := tview.NewModal().
+			SetText(fmt.Sprintf("File already exists:\n%s\n\nWhat do you want to do?", path)).
+			AddButtons([]string{"Overwrite", "Skip", "Overwrite All", "Skip All", "Cancel"}).
+			SetDoneFunc(func(_ int, label string) {
+				c.view.Pages.RemovePage("overwrite")
+				switch label {
+				case "Overwrite":
+					ch <- decOverwrite
+				case "Skip":
+					ch <- decSkip
+				case "Overwrite All":
+					ch <- decOverwriteAll
+				case "Skip All":
+					ch <- decSkipAll
+				default:
+					ch <- decCancel
+				}
+			})
+
+		c.view.Pages.AddPage("overwrite", c.view.ModalEdit(m, 80, 10), true, true)
+		c.view.App.SetFocus(m)
+	})
+
+	return <-ch
+}
+
+func (c *Controller) scopeKey() string {
+	if c.currentBucket == nil || c.currentBucket.Key == nil {
+		return ""
+	}
+	return *c.currentBucket.Key + ":" + c.currentPath
+}
+
+func (c *Controller) selectionMap() map[string]bool {
+	s := c.scopeKey()
+	if s == "" {
+		return nil
+	}
+	m, ok := c.selectedByScope[s]
+	if !ok {
+		m = make(map[string]bool)
+		c.selectedByScope[s] = m
+	}
+	return m
 }
 
 func (c *Controller) makeObjectMap() error {
@@ -71,6 +212,22 @@ func (c *Controller) makeObjectMap() error {
 	}
 	c.objs = dirs
 	return nil
+}
+
+func localDownloadPath(currentPath, destPath, s3Key string) string {
+	key := filepath.ToSlash(s3Key)
+	prefix := filepath.ToSlash(currentPath)
+
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+
+	relativeKey := key
+	if strings.HasPrefix(key, prefix) {
+		relativeKey = strings.TrimPrefix(key, prefix)
+	}
+
+	return filepath.Join(destPath, relativeKey)
 }
 
 func getPosition(element string, slice []string) int {
@@ -137,28 +294,51 @@ func (c *Controller) Delete() error {
 
 func (c *Controller) Download() error {
 
-	if c.view.List.GetItemCount() == 0 {
+	if c.view.List.GetItemCount() == 0 || c.currentBucket == nil {
 		return nil
 	}
 
-	cur := c.getSelectedObjectName()
-	val, ok := c.objs[cur]
-	if !ok || (val.Ot != model.File && val.Ot != model.Folder) {
-		return nil
+	names := c.selectedNames()
+	if len(names) == 0 {
+		// current item only
+		cur := c.getSelectedObjectName()
+		names = []string{cur}
+	}
+	cwd := filepath.Join(c.params.HomeDir, "Downloads") + string(os.PathSeparator)
+
+	var allObjects []model.DownloadTarget
+	var totalSize int64
+
+	for _, name := range names {
+		val, ok := c.objs[name]
+		if !ok || (val.Ot != model.File && val.Ot != model.Folder) {
+			continue
+		}
+
+		key := c.currentPath + name
+		objs, size, err := c.model.ResolveDownloadObjects(
+			key,
+			val.Ot == model.Folder,
+			val.Size,
+			c.currentBucket,
+		)
+		if err != nil {
+			return err
+		}
+		allObjects = append(allObjects, objs...)
+		totalSize += size
 	}
 
-	cwd := path.Join(c.params.HomeDir, "Downloads") + "/"
-	key := c.currentPath + cur
-
-	objects, totalSize, err := c.model.ResolveDownloadObjects(key, val.Ot == model.Folder, val.Size, c.currentBucket)
-	if err != nil || len(objects) == 0 {
-		return err
+	if len(allObjects) == 0 {
+		return nil
 	}
 
 	confirm := c.view.NewConfirm()
-	confirm.SetText(fmt.Sprintf("Do you want to download to %s\n%d object(s)\ntotal size %s",
+	confirm.SetText(fmt.Sprintf(
+		"Download to %s\nSelected: %d item(s)\nResolved: %d object(s)\nTotal size: %s",
 		cwd,
-		len(objects),
+		len(names),
+		len(allObjects),
 		humanize.IBytes(uint64(totalSize)),
 	)).SetDoneFunc(func(buttonIndex int, buttonLabel string) {
 		c.view.Pages.RemovePage("confirm").SwitchToPage("main")
@@ -180,51 +360,135 @@ func (c *Controller) Download() error {
 		go func() {
 			downloadedSize := int64(0)
 
-			for i, object := range objects {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-				}
+			sum := downloadSummary{totalObjects: len(allObjects)}
+			overwriteAll := false
+			skipAll := false
+			canceled := false
 
-				n, err := c.model.Download(ctx, object, c.currentPath, cwd, c.currentBucket.Key, totalSize, func(written, total int64, key string) {
-					percentage := float64(downloadedSize+written) / float64(totalSize) * 100
-					c.view.App.QueueUpdateDraw(func() {
-						progress.SetText(fmt.Sprintf(
-							"Downloading\n%d/%d object(s)\n%s/%s (%.1f%%)\nCurrent: %s",
-							i+1, len(objects),
-							humanize.IBytes(uint64(downloadedSize+written)),
-							humanize.IBytes(uint64(totalSize)),
-							percentage,
-							key,
-						))
-					})
-				})
+			var lastDraw time.Time
+			throttle := 100 * time.Millisecond
 
-				if err != nil {
-					c.view.App.QueueUpdateDraw(func() {
-						c.view.Pages.RemovePage("progress").SwitchToPage("main")
-					})
-					go c.error(fmt.Sprintf("Failed to download %s", *object.Key), err, false)
-					return
-				}
-				downloadedSize += n
-			}
-
-			select {
-			case <-ctx.Done():
-				return
-			default:
+			showSummary := func() {
 				c.view.App.QueueUpdateDraw(func() {
+					report := sum.text(totalSize, canceled)
+
 					progress.ClearButtons()
-					progress.AddButtons([]string{"Done"})
-					progress.SetText("Download complete.\n\nPress Done to return.")
+					progress.AddButtons([]string{"Done", "Copy report"})
+					progress.SetText(report)
+
 					progress.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-						c.view.Pages.RemovePage("progress").SwitchToPage("main")
+						switch buttonLabel {
+						case "Copy report":
+							u.CopyToClipboard(report)
+							go c.success("Download report copied")
+						case "Done":
+							c.view.Pages.RemovePage("progress").SwitchToPage("main")
+						}
 					})
 					c.view.App.SetFocus(progress)
 				})
 			}
+
+			showProgress := func(i int, key string, written int64) {
+				now := time.Now()
+				if now.Sub(lastDraw) < throttle {
+					return
+				}
+				lastDraw = now
+
+				percentage := float64(downloadedSize+written) / float64(totalSize) * 100
+				c.view.App.QueueUpdateDraw(func() {
+					progress.SetText(fmt.Sprintf(
+						"Downloading\n%d/%d object(s)\n%s/%s (%.1f%%)\nCurrent: %s",
+						i+1, len(allObjects),
+						humanize.IBytes(uint64(downloadedSize+written)),
+						humanize.IBytes(uint64(totalSize)),
+						percentage,
+						key,
+					))
+				})
+			}
+
+		loop:
+			for i, object := range allObjects {
+				select {
+				case <-ctx.Done():
+					canceled = true
+					break loop
+				default:
+				}
+
+				keyStr := object.Key
+				if keyStr == "" {
+					sum.addFailed("<nil-key>", fmt.Errorf("object key is empty"))
+					continue
+				}
+
+				if !strings.HasSuffix(keyStr, "/") {
+					dst := localDownloadPath(c.currentPath, cwd, keyStr)
+
+					if _, err := os.Stat(dst); err == nil {
+						if skipAll {
+							sum.addSkipped(dst)
+							continue
+						}
+
+						if !overwriteAll {
+							d := c.askOverwrite(dst)
+							switch d {
+							case decSkip:
+								sum.addSkipped(dst)
+								continue
+							case decSkipAll:
+								skipAll = true
+								sum.addSkipped(dst)
+								continue
+							case decOverwrite:
+								sum.overwritten++
+								_ = os.Remove(dst)
+							case decOverwriteAll:
+								overwriteAll = true
+								sum.overwritten++
+								_ = os.Remove(dst)
+							default: // cancel
+								canceled = true
+								cancel()
+								break loop
+							}
+						} else {
+							sum.overwritten++
+							_ = os.Remove(dst)
+						}
+					}
+				}
+
+				n, err := c.model.DownloadTarget(
+					ctx,
+					object,
+					c.currentPath,
+					cwd,
+					c.currentBucket.Key,
+					func(written, total int64, key string) {
+						showProgress(i, key, written)
+					},
+				)
+
+				if ctx.Err() != nil {
+					canceled = true
+					break loop
+				}
+
+				if err != nil {
+					sum.addFailed(keyStr, err)
+					continue
+				}
+
+				downloadedSize += n
+				sum.downloaded++
+				sum.bytesDone = downloadedSize
+			}
+
+			showSummary()
 		}()
 	})
 
@@ -232,25 +496,81 @@ func (c *Controller) Download() error {
 	return nil
 }
 
-// coloredLabelFor returns a colorized icon + plain name for best selection contrast.
-func coloredLabelFor(o *model.Object) string {
+// coloredLabelFor returns a colorized icon
+func coloredLabelFor(o *model.Object, selected bool) string {
 	if o.Key == nil {
 		return ""
 	}
 	name := *o.Key
+
 	switch o.Ot {
 	case model.Folder:
-		// 📁 folder icon (cyan) + plain name with trailing slash
+		if selected {
+			return "[green]📁 " + name + "/[-]"
+		}
 		return "[cyan]📁[-] " + name + "/"
+
 	case model.File:
-		// 📄 file icon + plain name (no inline filename color for selection contrast)
+		if selected {
+			return "[green]📄 " + name + "[-]"
+		}
 		return "📄 " + name
+
 	case model.Bucket:
-		// yellow bucket dot + plain name
 		return "[yellow]●[-] " + name
+
 	default:
 		return "  " + name
 	}
+}
+
+func (c *Controller) labelForList(o *model.Object) (primary string, secondary string) {
+	if o == nil || o.Key == nil {
+		return "", ""
+	}
+	raw := *o.Key
+
+	selected := false
+	if c.currentBucket != nil && (o.Ot == model.File || o.Ot == model.Folder) {
+		sel := c.selectionMap()
+		selected = sel != nil && sel[raw]
+	}
+
+	return coloredLabelFor(o, selected), raw
+}
+
+func (c *Controller) ToggleSelectCurrent() {
+	if c.currentBucket == nil || c.view.List.GetItemCount() == 0 {
+		return
+	}
+
+	i := c.view.List.GetCurrentItem()
+	_, cur := c.view.List.GetItemText(i)
+	cur = strings.TrimSpace(cur)
+
+	// ignore special entry
+	if cur == "" || cur == ".." {
+		return
+	}
+
+	obj, ok := c.objs[cur]
+	if !ok || (obj.Ot != model.File && obj.Ot != model.Folder) {
+		return
+	}
+
+	sel := c.selectionMap()
+	if sel == nil {
+		return
+	}
+
+	// toggle
+	sel[cur] = !sel[cur]
+	if !sel[cur] {
+		delete(sel, cur)
+	}
+
+	// re-render list (keeps selection marker accurate)
+	go c.updateList()
 }
 
 func (c *Controller) updateList() ([]string, error) {
@@ -268,7 +588,15 @@ func (c *Controller) updateList() ([]string, error) {
 		title = "(buckets)"
 		suff = ""
 	} else {
-		title = fmt.Sprintf("(%s)/%s", *c.currentBucket.Key, c.currentPath)
+		base := fmt.Sprintf("(%s)/%s", *c.currentBucket.Key, c.currentPath)
+
+		n := c.selectedCount()
+		if n > 0 {
+			title = fmt.Sprintf("%s  [green]Selected: %d", base, n)
+		} else {
+			title = base
+		}
+
 		suff = "[::b][Ctrl+D[][::-]Download [::b][::b][Ctrl+U[][::-]Upload [::b]"
 	}
 
@@ -285,32 +613,40 @@ func (c *Controller) updateList() ([]string, error) {
 		return *objs[i].Key < *objs[j].Key
 	})
 
-	// Queue UI update
+	keepCur := ""
+	keepIdx := c.view.List.GetCurrentItem()
+	if keepIdx >= 0 && c.view.List.GetItemCount() > 0 {
+		_, t := c.view.List.GetItemText(keepIdx)
+		keepCur = strings.TrimSpace(t)
+	}
+
+	want := keepCur
+	if c.restoreNext != "" {
+		want = c.restoreNext
+	}
+
 	c.view.App.QueueUpdateDraw(func() {
 		c.view.List.Clear()
 		c.view.List.SetTitle(title)
 		c.view.SetFrameText(fText)
 
-		// Add classic "[..]" at top when inside a bucket (go up one level)
+		offset := 0
 		if c.currentBucket != nil {
-			c.view.List.AddItem("[..]", "..", 0, func() {
-				c.Up()
-			})
+			c.view.List.AddItem("[..]", "..", 0, func() { c.Up() })
+			offset = 1
 		}
 
 		for _, o := range objs {
 			if o.Key == nil {
 				continue
 			}
-			raw := *o.Key               // secondary text (plain) – used for lookups
-			label := coloredLabelFor(o) // primary (icon colored, name plain)
 
-			c.view.List.AddItem(label, raw, 0, func() {
+			primary, raw := c.labelForList(o)
+			c.view.List.AddItem(primary, raw, 0, func() {
 				i := c.view.List.GetCurrentItem()
-				_, cur := c.view.List.GetItemText(i) // secondary text
+				_, cur := c.view.List.GetItemText(i)
 				cur = strings.TrimSpace(cur)
 
-				// Special entry: "[..]" uses secondary text ".."
 				if cur == ".." {
 					c.Up()
 					return
@@ -318,9 +654,6 @@ func (c *Controller) updateList() ([]string, error) {
 
 				if val, ok := c.objs[cur]; ok {
 					if val.Ot == model.Folder || val.Ot == model.Bucket {
-						if val.Ot == model.Folder {
-							c.position[c.currentPath] = c.view.List.GetCurrentItem()
-						}
 						if val.Ot == model.Bucket {
 							c.bucketPos = c.view.List.GetCurrentItem()
 						}
@@ -332,13 +665,23 @@ func (c *Controller) updateList() ([]string, error) {
 			keys = append(keys, raw)
 		}
 
-		// Restore position if available
-		if c.currentBucket != nil {
-			if val, ok := c.position[c.currentPath]; ok {
-				c.view.List.SetCurrentItem(val)
-				delete(c.position, c.currentPath)
+		if want != "" {
+			target := -1
+			if want == ".." && offset == 1 {
+				target = 0
+			} else {
+				for i := 0; i < len(keys); i++ {
+					if keys[i] == want {
+						target = i + offset
+						break
+					}
+				}
+			}
+			if target >= 0 && target < c.view.List.GetItemCount() {
+				c.view.List.SetCurrentItem(target)
 			}
 		}
+		c.restoreNext = ""
 	})
 
 	return keys, nil
@@ -372,21 +715,30 @@ func (c *Controller) Down(name string) {
 
 func (c *Controller) Up() {
 	c.view.Details.Clear()
+
+	if c.currentBucket != nil && c.currentPath != "" {
+		p := strings.TrimSuffix(c.currentPath, "/")
+		if p != "" {
+			parts := strings.Split(p, "/")
+			c.restoreNext = parts[len(parts)-1] // folder name in parent
+		}
+	}
+
 	if c.currentPath == "" {
 		c.currentBucket = nil
+		go c.updateList()
+		return
 	}
+
 	fields := strings.FieldsFunc(strings.TrimSpace(c.currentPath), u.SplitFunc)
 	if len(fields) == 0 {
 		go c.updateList()
-		// TODO: do we really need this check?
-		if c.currentBucket == nil {
-			c.view.List.SetCurrentItem(c.bucketPos)
-		}
 		return
 	}
+
 	newDir := strings.Join(fields[:len(fields)-1], "/")
 	if len(fields) > 1 {
-		newDir = newDir + "/"
+		newDir += "/"
 	}
 	c.currentPath = newDir
 	go c.updateList()
@@ -523,11 +875,11 @@ func (c *Controller) create(isBucket bool) {
 		oTp = "folder"
 		disableBool = false
 	}
+
 	cForm := c.view.NewCreateForm(fmt.Sprintf("Create %s", oTp), disableBool)
 	cForm.AddButton("Save", func() {
 		var err error
 		name := cForm.GetFormItem(0).(*tview.InputField).GetText()
-
 		if name == "" {
 			return
 		}
@@ -539,6 +891,7 @@ func (c *Controller) create(isBucket bool) {
 			key := path.Join(c.currentPath, name) + "/"
 			err = c.model.CreateFolder(&key, c.currentBucket)
 		}
+
 		if err != nil {
 			c.view.Pages.RemovePage("modal")
 			go c.error("Error creating object", err, false)
@@ -546,20 +899,8 @@ func (c *Controller) create(isBucket bool) {
 		}
 
 		c.view.Pages.RemovePage("modal")
-
-		// Run updateList in a goroutine
-		go func() {
-			keys, err := c.updateList()
-			if err != nil {
-				return
-			}
-			pos := getPosition(name, keys)
-
-			// Set current item on UI thread
-			c.view.App.QueueUpdateDraw(func() {
-				c.view.List.SetCurrentItem(pos)
-			})
-		}()
+		c.restoreNext = name
+		go c.updateList()
 	})
 
 	cForm.AddButton("Cancel", func() {
@@ -621,6 +962,51 @@ func (c *Controller) DeleteConfigEntry() {
 	c.view.Pages.AddPage("confirm", confirm, true, true)
 }
 
+func (c *Controller) ClearSelection() {
+	sel := c.selectionMap()
+	if sel == nil {
+		return
+	}
+	for k := range sel {
+		delete(sel, k)
+	}
+	go c.updateList()
+}
+
+func (c *Controller) SelectAllVisible() {
+	if c.currentBucket == nil {
+		return
+	}
+	sel := c.selectionMap()
+	if sel == nil {
+		return
+	}
+	for name, obj := range c.objs {
+		if obj == nil {
+			continue
+		}
+		if obj.Ot == model.File || obj.Ot == model.Folder {
+			sel[name] = true
+		}
+	}
+	go c.updateList()
+}
+
+func (c *Controller) selectedNames() []string {
+	sel := c.selectionMap()
+	if sel == nil || len(sel) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(sel))
+	for name, ok := range sel {
+		if ok {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func (c *Controller) setConfigInput() {
 	c.view.App.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
@@ -654,7 +1040,7 @@ func (c *Controller) setConfigInput() {
 				return nil
 			})
 
-			c.view.Pages.AddPage("modal-help", c.view.ModalEdit(help, 70, 18), true, true)
+			c.view.Pages.AddPage("modal-help", c.view.ModalEdit(help, 70, 20), true, true)
 			return nil
 		case tcell.KeyCtrlV:
 			c.CheckProfile()
@@ -684,6 +1070,11 @@ func (c *Controller) setInput() {
 	})
 	c.view.List.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
+		case tcell.KeyRune:
+			if event.Rune() == ' ' { // Space
+				c.ToggleSelectCurrent()
+				return nil
+			}
 		case tcell.KeyDelete:
 			c.Delete()
 			return nil
@@ -706,6 +1097,12 @@ func (c *Controller) setInput() {
 		case tcell.KeyCtrlU:
 			c.ShowLocalFSModal(c.params.HomeDir)
 			return nil
+		case tcell.KeyCtrlX:
+			c.ClearSelection()
+			return nil
+		case tcell.KeyCtrlS:
+			c.SelectAllVisible()
+			return nil
 		case tcell.KeyCtrlH:
 			help := c.view.HotkeysModal(false)
 
@@ -715,7 +1112,7 @@ func (c *Controller) setInput() {
 				return nil
 			})
 
-			c.view.Pages.AddPage("modal-help", c.view.ModalEdit(help, 70, 18), true, true)
+			c.view.Pages.AddPage("modal-help", c.view.ModalEdit(help, 70, 25), true, true)
 			return nil
 		case tcell.KeyCtrlA:
 			about := c.view.AboutModal()
