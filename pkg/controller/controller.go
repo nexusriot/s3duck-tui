@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	s3t "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/dustin/go-humanize"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
@@ -704,6 +705,7 @@ func (c *Controller) Down(name string) {
 		if bucket != nil {
 			c.currentBucket = bucket
 			c.model.RefreshClient(&name)
+			c.restoreNext = ".."
 		}
 	} else {
 		newDir := c.currentPath + name + "/"
@@ -1059,6 +1061,214 @@ func (c *Controller) setConfigInput() {
 	})
 }
 
+// ShowSummary keeps backward compatibility if some places call ShowSummary().
+func (c *Controller) ShowSummary() { c.ShowSummaryModal() }
+
+// ShowSummaryModal opens graphical bucket/folder summary.
+func (c *Controller) ShowSummaryModal() {
+	// Determine scope
+	var bucket *model.Object
+	prefix := c.currentPath
+
+	if c.currentBucket == nil {
+		cur := c.getSelectedObjectName()
+		if cur == "" {
+			return
+		}
+		if val, ok := c.objs[cur]; ok && val != nil && val.Ot == model.Bucket {
+			bucket = val
+		} else {
+			tmp := cur
+			bucket = &model.Object{Key: &tmp, Ot: model.Bucket}
+		}
+		prefix = ""
+	} else {
+		bucket = c.currentBucket
+
+		// If a folder is selected, summarize that folder; else summarize current path.
+		cur := c.getSelectedObjectName()
+		if cur != "" {
+			if val, ok := c.objs[cur]; ok && val != nil && val.Ot == model.Folder {
+				prefix = path.Join(c.currentPath, cur)
+				if prefix != "" && !strings.HasSuffix(prefix, "/") {
+					prefix += "/"
+				}
+			}
+		}
+	}
+
+	if bucket == nil || bucket.Key == nil {
+		return
+	}
+
+	c.showSummaryModalFor(bucket, prefix)
+}
+
+func (c *Controller) showSummaryModalFor(bucket *model.Object, prefix string) {
+	// Normalize prefix
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+
+	scopeLabel := *bucket.Key
+	if prefix != "" {
+		scopeLabel = fmt.Sprintf("%s/%s", *bucket.Key, strings.TrimSuffix(prefix, "/"))
+	}
+
+	go func() {
+		objects, err := c.model.ListObjects(prefix, bucket)
+		if err != nil {
+			c.error("Failed to build summary", err, false)
+			return
+		}
+
+		total, catRows, groupRows := buildSummary(objects, prefix)
+
+		c.view.App.QueueUpdateDraw(func() {
+			graph := c.view.NewSummaryGraph(" Summary ", scopeLabel, total, catRows, groupRows, func(groupName string) {
+				if groupName == "" || groupName == "(root)" {
+					return
+				}
+				if !strings.HasSuffix(groupName, "/") {
+					return
+				}
+				nextPrefix := prefix + groupName
+				c.view.Pages.RemovePage("modal-summary")
+				c.showSummaryModalFor(bucket, nextPrefix)
+			})
+
+			// Global keys for modal
+			if prim, ok := graph.Root.(interface {
+				SetInputCapture(func(*tcell.EventKey) *tcell.EventKey) *tview.Box
+			}); ok {
+				_ = prim
+			}
+
+			wrapper := tview.NewFlex().SetDirection(tview.FlexRow)
+			wrapper.AddItem(graph.Root, 0, 1, true)
+			wrapper.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
+				switch ev.Key() {
+				case tcell.KeyEsc:
+					c.view.Pages.RemovePage("modal-summary")
+					return nil
+				case tcell.KeyTAB:
+					if c.view.App.GetFocus() == graph.Cats {
+						c.view.App.SetFocus(graph.Groups)
+					} else {
+						c.view.App.SetFocus(graph.Cats)
+					}
+					return nil
+				}
+				if ev.Key() == tcell.KeyRune && (ev.Rune() == 'q' || ev.Rune() == 'Q') {
+					c.view.Pages.RemovePage("modal-summary")
+					return nil
+				}
+				return ev
+			})
+
+			c.view.Pages.AddPage("modal-summary", c.view.ModalEdit(wrapper, 100, 28), true, true)
+			c.view.App.SetFocus(graph.Cats)
+		})
+	}()
+}
+
+func buildSummary(objs []s3t.Object, prefix string) (total int64, cats []view.SummaryRow, groups []view.SummaryRow) {
+	var docs, arch, media, other int64
+	groupBytes := make(map[string]int64)
+
+	for _, o := range objs {
+		if o.Key == nil {
+			continue
+		}
+		key := *o.Key
+		if key == prefix {
+			continue
+		}
+		// Ignore folder marker objects
+		if strings.HasSuffix(key, "/") {
+			continue
+		}
+		sz := o.Size
+		if sz < 0 {
+			sz = 0
+		}
+		total += sz
+
+		switch detectCategory(key) {
+		case "documents":
+			docs += sz
+		case "archives":
+			arch += sz
+		case "media":
+			media += sz
+		default:
+			other += sz
+		}
+
+		rel := key
+		if prefix != "" && strings.HasPrefix(key, prefix) {
+			rel = strings.TrimPrefix(key, prefix)
+		}
+		if rel == "" {
+			continue
+		}
+		parts := strings.SplitN(rel, "/", 2)
+		g := "(root)"
+		if len(parts) >= 2 && parts[0] != "" {
+			g = parts[0] + "/"
+		}
+		groupBytes[g] += sz
+	}
+
+	cats = []view.SummaryRow{
+		{Name: "Documents", Bytes: docs},
+		{Name: "Archives", Bytes: arch},
+		{Name: "Media", Bytes: media},
+		{Name: "Other", Bytes: other},
+	}
+
+	for name, b := range groupBytes {
+		groups = append(groups, view.SummaryRow{Name: name, Bytes: b})
+	}
+
+	sort.Slice(groups, func(i, j int) bool {
+		if groups[i].Bytes == groups[j].Bytes {
+			return groups[i].Name < groups[j].Name
+		}
+		return groups[i].Bytes > groups[j].Bytes
+	})
+
+	// Top 10
+	if len(groups) > 10 {
+		groups = groups[:10]
+	}
+
+	return total, cats, groups
+}
+
+func detectCategory(key string) string {
+	ext := strings.ToLower(strings.TrimPrefix(path.Ext(key), "."))
+	if ext == "" {
+		return "other"
+	}
+	switch ext {
+	// documents
+	case "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+		"txt", "md", "rtf", "odt", "ods", "odp", "csv", "json", "yaml", "yml":
+		return "documents"
+	// archives
+	case "zip", "rar", "7z", "tar", "gz", "bz2", "xz", "tgz", "tbz", "zst":
+		return "archives"
+	// media
+	case "jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff",
+		"mp3", "wav", "flac", "aac", "ogg",
+		"mp4", "mkv", "mov", "avi", "webm":
+		return "media"
+	default:
+		return "other"
+	}
+}
+
 func (c *Controller) setInput() {
 	c.view.App.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
@@ -1096,6 +1306,9 @@ func (c *Controller) setInput() {
 			return nil
 		case tcell.KeyCtrlU:
 			c.ShowLocalFSModal(c.params.HomeDir)
+			return nil
+		case tcell.KeyCtrlG:
+			c.ShowSummaryModal()
 			return nil
 		case tcell.KeyCtrlX:
 			c.ClearSelection()
