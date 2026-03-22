@@ -619,13 +619,13 @@ func (m *Model) Upload(
 		}
 
 		uploadCtx, cancel := context.WithCancel(ctx)
-		defer cancel()
 
 		_, err = uploader.Upload(uploadCtx, &s3.PutObjectInput{
 			Bucket: aws.String(*bucket.Key),
 			Key:    aws.String(s3Key),
 			Body:   reader,
 		})
+		cancel()
 		fp.Close()
 
 		if err != nil {

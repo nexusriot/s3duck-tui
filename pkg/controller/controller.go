@@ -1681,12 +1681,22 @@ func (c *Controller) ShowFileProperties(key string) {
 		url = fmt.Sprintf("%s/%s/%s", c.model.Cf.Url, bucketName, fullPath)
 	}
 
+	sizeText := "unknown"
+	if obj.Size != nil {
+		sizeText = humanize.IBytes(uint64(*obj.Size))
+	}
+
+	etagText := ""
+	if obj.Etag != nil {
+		etagText = *obj.Etag
+	}
+
 	text := fmt.Sprintf(
 		"[black]Name: [white]%s\n[black]Size: [white]%s\n[black]Modified: [white]%v\n[black]Etag: [white]%s\n[black]Link: [black]%s",
 		*obj.Key,
-		humanize.IBytes(uint64(*obj.Size)),
+		sizeText,
 		obj.LastModified,
-		*obj.Etag,
+		etagText,
 		url,
 	)
 

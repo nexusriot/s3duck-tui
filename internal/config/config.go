@@ -41,12 +41,14 @@ func GetHomeDir() string {
 }
 
 func (p *Params) WriteConfig() {
-
-	file, _ := json.Marshal(p.Config)
-	err := os.WriteFile(p.FileName, file, 0700)
-
+	file, err := json.Marshal(p.Config)
 	if err != nil {
-		log.Fatalf("failed to write config file: %s", filename)
+		log.Fatalf("failed to serialize config file %s: %v", p.FileName, err)
+	}
+
+	err = os.WriteFile(p.FileName, file, 0600)
+	if err != nil {
+		log.Fatalf("failed to write config file %s: %v", p.FileName, err)
 	}
 }
 
@@ -96,15 +98,19 @@ func (p *Params) DeleteConfig(i int) {
 }
 
 func CreateEmptyConfig(configFile string) {
-	err := os.MkdirAll(filepath.Dir(configFile), 0700)
-	f, err := os.Create(configFile)
+	if err := os.MkdirAll(filepath.Dir(configFile), 0700); err != nil {
+		log.Fatal(err)
+	}
+
 	ap := make([]Config, 0)
-	a, _ := json.Marshal(ap)
-	err = os.WriteFile(configFile, a, 0700)
+	a, err := json.Marshal(ap)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer f.Close()
+
+	if err := os.WriteFile(configFile, a, 0600); err != nil {
+		log.Fatal(err)
+	}
 }
 
 func NewParams() *Params {
