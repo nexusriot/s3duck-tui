@@ -665,7 +665,7 @@ func (c *Controller) updateList() ([]string, error) {
 			title = base
 		}
 
-		suff = "[::b][Ctrl+D[][::-]Download [::b][::b][Ctrl+U[][::-]Upload [::b]"
+		suff = "[::b][Ctrl+D[][::-]Download [::b][Ctrl+U[][::-]Upload [::b][Ctrl+R[][::-]Rename [::b][Ctrl+Y[][::-]Copy [::b][Ctrl+T[][::-]Move [::b]"
 	}
 
 	fText := fmt.Sprintf("[::b][↓,↑][::-]Down/Up [::b][Enter/Backspace][::-]Lower/Upper %s[::b][Del[][::-]Delete [::b][Ctrl+N][::-]Create [::b][Ctrl+P][::-]Profiles [::b][Ctrl+L][::-]Properties [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit", suff)
@@ -1067,6 +1067,214 @@ func (c *Controller) selectedNames() []string {
 	return out
 }
 
+// currentObject returns the highlighted file/folder (ignores "..", buckets).
+func (c *Controller) currentObject() (string, *model.Object, bool) {
+	if c.currentBucket == nil || c.view.List.GetItemCount() == 0 {
+		return "", nil, false
+	}
+	name := c.getSelectedObjectName()
+	if name == "" || name == ".." {
+		return "", nil, false
+	}
+	o, ok := c.lookupObj(name)
+	if !ok || (o.Ot != model.File && o.Ot != model.Folder) {
+		return "", nil, false
+	}
+	return name, o, true
+}
+
+// Rename renames the highlighted object within its current folder
+// (server-side copy + delete; recursive for folders).
+func (c *Controller) Rename() {
+	name, obj, ok := c.currentObject()
+	if !ok {
+		return
+	}
+	isFolder := obj.Ot == model.Folder
+
+	srcKey := c.currentPath + name
+	if isFolder {
+		srcKey += "/"
+	}
+
+	form := c.view.NewInputForm("Rename", "New name", name)
+	form.AddButton("Save", func() {
+		newName := strings.TrimSpace(form.GetFormItem(0).(*tview.InputField).GetText())
+		c.view.Pages.RemovePage("modal")
+
+		if newName == "" || newName == name {
+			return
+		}
+		if strings.Contains(newName, "/") {
+			go c.error("Invalid name", fmt.Errorf("name must not contain '/'"), false)
+			return
+		}
+
+		dstKey := c.currentPath + newName
+		if isFolder {
+			dstKey += "/"
+		}
+
+		go func() {
+			if _, err := c.model.MoveKeys(context.Background(), c.currentBucket, srcKey, dstKey, isFolder, nil); err != nil {
+				c.error("Rename failed", err, false)
+				return
+			}
+			c.restoreNext = newName
+			c.updateList()
+			go c.success("Renamed")
+		}()
+	})
+	form.AddButton("Cancel", func() {
+		c.view.Pages.RemovePage("modal")
+	})
+
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(form, 65, 9), true, true)
+}
+
+// copyOrMove copies (isMove=false) or moves (isMove=true) the marked items,
+// or the highlighted one when nothing is marked, to a destination prefix.
+func (c *Controller) copyOrMove(isMove bool) {
+	if c.currentBucket == nil || c.view.List.GetItemCount() == 0 {
+		return
+	}
+
+	title := "Copy"
+	if isMove {
+		title = "Move"
+	}
+
+	names := c.selectedNames()
+	if len(names) == 0 {
+		n := c.getSelectedObjectName()
+		if n == "" || n == ".." {
+			return
+		}
+		names = []string{n}
+	}
+
+	type item struct {
+		name     string
+		isFolder bool
+	}
+	var items []item
+	for _, n := range names {
+		o, ok := c.lookupObj(n)
+		if !ok || (o.Ot != model.File && o.Ot != model.Folder) {
+			continue
+		}
+		items = append(items, item{n, o.Ot == model.Folder})
+	}
+	if len(items) == 0 {
+		return
+	}
+
+	srcPrefix := c.currentPath
+
+	form := c.view.NewInputForm(title, "Destination prefix", srcPrefix)
+	form.AddButton(title, func() {
+		dstPrefix := strings.TrimSpace(form.GetFormItem(0).(*tview.InputField).GetText())
+		c.view.Pages.RemovePage("modal")
+
+		dstPrefix = filepath.ToSlash(dstPrefix)
+		if dstPrefix != "" && !strings.HasSuffix(dstPrefix, "/") {
+			dstPrefix += "/"
+		}
+		if dstPrefix == srcPrefix {
+			go c.error(title+" failed", fmt.Errorf("destination equals source prefix"), false)
+			return
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		progress := tview.NewModal().
+			SetText(fmt.Sprintf("Starting %s...\n", strings.ToLower(title))).
+			AddButtons([]string{"Cancel"}).
+			SetDoneFunc(func(_ int, _ string) {
+				cancel()
+				c.view.Pages.RemovePage("progress").SwitchToPage("main")
+			})
+		c.view.Pages.AddPage("progress", progress, true, true)
+
+		go func() {
+			var failed []string
+			okCount := 0
+			canceled := false
+
+		loop:
+			for _, it := range items {
+				select {
+				case <-ctx.Done():
+					canceled = true
+					break loop
+				default:
+				}
+
+				srcKey := srcPrefix + it.name
+				dstKey := dstPrefix + it.name
+				if it.isFolder {
+					srcKey += "/"
+					dstKey += "/"
+				}
+
+				cb := func(done, total int, key string) {
+					c.view.App.QueueUpdateDraw(func() {
+						progress.SetText(fmt.Sprintf("%s: %s\n%d/%d object(s)\n%s",
+							title, it.name, done, total, key))
+					})
+				}
+
+				var err error
+				if isMove {
+					_, err = c.model.MoveKeys(ctx, c.currentBucket, srcKey, dstKey, it.isFolder, cb)
+				} else {
+					_, err = c.model.CopyKeys(ctx, c.currentBucket, srcKey, dstKey, it.isFolder, cb)
+				}
+				if err != nil {
+					failed = append(failed, fmt.Sprintf("%s: %v", it.name, err))
+					continue
+				}
+				okCount++
+			}
+
+			if canceled {
+				// progress page already removed by the Cancel handler.
+				c.updateList()
+				return
+			}
+
+			c.view.App.QueueUpdateDraw(func() {
+				status := title + " complete."
+				if len(failed) > 0 {
+					status = title + " finished with errors."
+				}
+				msg := fmt.Sprintf("%s\n\nOK: %d\nFailed: %d", status, okCount, len(failed))
+				for _, f := range failed {
+					msg += "\n  - " + f
+				}
+				msg += "\n\nPress Done to return."
+
+				progress.ClearButtons()
+				progress.AddButtons([]string{"Done"})
+				progress.SetText(msg)
+				progress.SetDoneFunc(func(_ int, _ string) {
+					c.view.Pages.RemovePage("progress").SwitchToPage("main")
+				})
+				c.view.App.SetFocus(progress)
+			})
+
+			if isMove {
+				c.clearSelected()
+			}
+			c.updateList()
+		}()
+	})
+	form.AddButton("Cancel", func() {
+		c.view.Pages.RemovePage("modal")
+	})
+
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(form, 75, 9), true, true)
+}
+
 func (c *Controller) setConfigInput() {
 	c.view.App.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
@@ -1373,6 +1581,15 @@ func (c *Controller) setInput() {
 			return nil
 		case tcell.KeyCtrlS:
 			c.SelectAllVisible()
+			return nil
+		case tcell.KeyCtrlR:
+			c.Rename()
+			return nil
+		case tcell.KeyCtrlY:
+			c.copyOrMove(false)
+			return nil
+		case tcell.KeyCtrlT:
+			c.copyOrMove(true)
 			return nil
 		case tcell.KeyCtrlH:
 			help := c.view.HotkeysModal(false)

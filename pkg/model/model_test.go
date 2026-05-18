@@ -83,8 +83,8 @@ func TestPrepareUploadDirectory(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	mustWrite("a.txt", []byte("aa"))            // size 2
-	mustWrite("sub/b.txt", []byte("bbbb"))      // size 4
+	mustWrite("a.txt", []byte("aa"))              // size 2
+	mustWrite("sub/b.txt", []byte("bbbb"))        // size 4
 	mustWrite("sub/deep/c.txt", []byte("cccccc")) // size 6
 
 	targets, total, err := (&Model{}).PrepareUpload(root, "pre", nil)

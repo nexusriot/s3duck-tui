@@ -106,8 +106,8 @@ func TestBuildSummary(t *testing.T) {
 		{Key: strptr("doc.pdf"), Size: 100},
 		{Key: strptr("sub/a.zip"), Size: 200},
 		{Key: strptr("sub/b.mp4"), Size: 50},
-		{Key: strptr("sub/"), Size: 0}, // folder marker, ignored
-		{Key: nil, Size: 999},          // nil key, ignored
+		{Key: strptr("sub/"), Size: 0},     // folder marker, ignored
+		{Key: nil, Size: 999},              // nil key, ignored
 		{Key: strptr("neg.bin"), Size: -5}, // negative size clamped to 0
 	}
 

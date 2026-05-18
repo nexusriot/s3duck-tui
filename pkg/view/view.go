@@ -116,6 +116,22 @@ func (v *View) NewCreateProfileForm(header string) *tview.Form {
 	return form
 }
 
+// NewInputForm builds a single-field form pre-filled with value, used by
+// rename / copy / move. Esc closes the "modal" page.
+func (v *View) NewInputForm(header, label, value string) *tview.Form {
+	form := tview.NewForm()
+	form.SetTitle(header)
+	form.AddInputField(label, value, 60, nil, nil)
+	form.SetBorder(true)
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEsc {
+			v.Pages.RemovePage("modal")
+		}
+		return event
+	})
+	return form
+}
+
 func (v *View) NewCreateLocalFileListForm() (tview.Primitive, *tview.List) {
 	localList := tview.NewList().
 		ShowSecondaryText(false)
@@ -184,6 +200,9 @@ func (v *View) HotkeysModal(profiles bool) *tview.TextView {
 		[::b]Actions[::-]
 		  Ctrl+N        Create bucket / folder
 		  Ctrl+D        Download file/folder (for files and folders)
+          Ctrl+R        Rename selected object (same folder)
+          Ctrl+Y        Copy selected/marked to a destination prefix
+          Ctrl+T        Move selected/marked to a destination prefix
           Ctrl+G        Bucket/folder summary
           Ctrl+U        Open local file manager (for upload)
           Space			Select object for download

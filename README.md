@@ -18,8 +18,9 @@ Features
 8. Bucket / folder size summary (Ctrl+G)
 9. Object properties (size, ETag, storage class, last modified) in the side panel
 10. Clipboard yank of profile data (Ctrl+Y)
-11. Custom endpoints and self-signed TLS support (`ignore_ssl`)
-12. Linux, FreeBSD and macOS / Windows builds (statically linkable)
+11. Server-side copy / move / rename, recursive for folders, multi-select aware (Ctrl+Y copy, Ctrl+T move, Ctrl+R rename)
+12. Custom endpoints and self-signed TLS support (`ignore_ssl`)
+13. Linux, FreeBSD and macOS / Windows builds (statically linkable)
 
 Screenshots
 -------------
