@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	s3t "github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -102,11 +103,9 @@ func (s *downloadSummary) text(totalBytes int64, canceled bool) string {
 }
 
 func (c *Controller) selectedCount() int {
-	sel := c.selectionMap()
-	if sel == nil {
-		return 0
-	}
-	return len(sel)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.selScopeLocked())
 }
 
 type Controller struct {
@@ -122,6 +121,14 @@ type Controller struct {
 	params          *cfg.Params
 	selectedByScope map[string]map[string]bool
 	restoreNext     string
+
+	// mu guards objs and selectedByScope, which are read on tview's UI
+	// goroutine (input/list callbacks) while being written by background
+	// refresh/upload/download goroutines.
+	mu sync.Mutex
+	// refreshMu serializes updateList so overlapping refreshes can't stack
+	// network calls or race on the object map.
+	refreshMu sync.Mutex
 }
 
 func NewController(debug bool) *Controller {
@@ -179,7 +186,9 @@ func (c *Controller) scopeKey() string {
 	return *c.currentBucket.Key + ":" + c.currentPath
 }
 
-func (c *Controller) selectionMap() map[string]bool {
+// selScopeLocked returns the selection set for the current scope.
+// Callers must hold c.mu.
+func (c *Controller) selScopeLocked() map[string]bool {
 	s := c.scopeKey()
 	if s == "" {
 		return nil
@@ -190,6 +199,71 @@ func (c *Controller) selectionMap() map[string]bool {
 		c.selectedByScope[s] = m
 	}
 	return m
+}
+
+func (c *Controller) isSelected(name string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	m := c.selScopeLocked()
+	return m != nil && m[name]
+}
+
+func (c *Controller) toggleSelected(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	m := c.selScopeLocked()
+	if m == nil {
+		return
+	}
+	if m[name] {
+		delete(m, name)
+	} else {
+		m[name] = true
+	}
+}
+
+func (c *Controller) clearSelected() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	m := c.selScopeLocked()
+	for k := range m {
+		delete(m, k)
+	}
+}
+
+func (c *Controller) selectNames(names []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	m := c.selScopeLocked()
+	if m == nil {
+		return
+	}
+	for _, n := range names {
+		m[n] = true
+	}
+}
+
+func (c *Controller) lookupObj(name string) (*model.Object, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	o, ok := c.objs[name]
+	return o, ok
+}
+
+func (c *Controller) objsSnapshot() []*model.Object {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]*model.Object, 0, len(c.objs))
+	for _, o := range c.objs {
+		out = append(out, o)
+	}
+	return out
+}
+
+func (c *Controller) setObjs(m map[string]*model.Object) {
+	c.mu.Lock()
+	c.objs = m
+	c.mu.Unlock()
 }
 
 func (c *Controller) makeObjectMap() error {
@@ -211,7 +285,7 @@ func (c *Controller) makeObjectMap() error {
 	for _, obj := range list {
 		dirs[*obj.Key] = obj
 	}
-	c.objs = dirs
+	c.setObjs(dirs)
 	return nil
 }
 
@@ -257,7 +331,7 @@ func (c *Controller) Delete() error {
 	}
 	cur := c.getSelectedObjectName()
 
-	if val, ok := c.objs[cur]; ok {
+	if val, ok := c.lookupObj(cur); ok {
 		op := path.Join(c.currentPath, cur)
 
 		confirm := c.view.NewConfirm()
@@ -311,7 +385,7 @@ func (c *Controller) Download() error {
 	var totalSize int64
 
 	for _, name := range names {
-		val, ok := c.objs[name]
+		val, ok := c.lookupObj(name)
 		if !ok || (val.Ot != model.File && val.Ot != model.Folder) {
 			continue
 		}
@@ -533,8 +607,7 @@ func (c *Controller) labelForList(o *model.Object) (primary string, secondary st
 
 	selected := false
 	if c.currentBucket != nil && (o.Ot == model.File || o.Ot == model.Folder) {
-		sel := c.selectionMap()
-		selected = sel != nil && sel[raw]
+		selected = c.isSelected(raw)
 	}
 
 	return coloredLabelFor(o, selected), raw
@@ -554,27 +627,21 @@ func (c *Controller) ToggleSelectCurrent() {
 		return
 	}
 
-	obj, ok := c.objs[cur]
+	obj, ok := c.lookupObj(cur)
 	if !ok || (obj.Ot != model.File && obj.Ot != model.Folder) {
 		return
 	}
 
-	sel := c.selectionMap()
-	if sel == nil {
-		return
-	}
-
-	// toggle
-	sel[cur] = !sel[cur]
-	if !sel[cur] {
-		delete(sel, cur)
-	}
+	c.toggleSelected(cur)
 
 	// re-render list (keeps selection marker accurate)
 	go c.updateList()
 }
 
 func (c *Controller) updateList() ([]string, error) {
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
+
 	err := c.makeObjectMap()
 	if err != nil {
 		go c.error("Failed to fetch folder", err, false)
@@ -603,10 +670,7 @@ func (c *Controller) updateList() ([]string, error) {
 
 	fText := fmt.Sprintf("[::b][↓,↑][::-]Down/Up [::b][Enter/Backspace][::-]Lower/Upper %s[::b][Del[][::-]Delete [::b][Ctrl+N][::-]Create [::b][Ctrl+P][::-]Profiles [::b][Ctrl+L][::-]Properties [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit", suff)
 
-	objs := make([]*model.Object, 0, len(c.objs))
-	for _, k := range c.objs {
-		objs = append(objs, k)
-	}
+	objs := c.objsSnapshot()
 	sort.Slice(objs, func(i, j int) bool {
 		if objs[i].Ot != objs[j].Ot {
 			return objs[i].Ot > objs[j].Ot
@@ -653,7 +717,7 @@ func (c *Controller) updateList() ([]string, error) {
 					return
 				}
 
-				if val, ok := c.objs[cur]; ok {
+				if val, ok := c.lookupObj(cur); ok {
 					if val.Ot == model.Folder || val.Ot == model.Bucket {
 						if val.Ot == model.Bucket {
 							c.bucketPos = c.view.List.GetCurrentItem()
@@ -965,13 +1029,7 @@ func (c *Controller) DeleteConfigEntry() {
 }
 
 func (c *Controller) ClearSelection() {
-	sel := c.selectionMap()
-	if sel == nil {
-		return
-	}
-	for k := range sel {
-		delete(sel, k)
-	}
+	c.clearSelected()
 	go c.updateList()
 }
 
@@ -979,24 +1037,24 @@ func (c *Controller) SelectAllVisible() {
 	if c.currentBucket == nil {
 		return
 	}
-	sel := c.selectionMap()
-	if sel == nil {
-		return
-	}
-	for name, obj := range c.objs {
-		if obj == nil {
+	var names []string
+	for _, obj := range c.objsSnapshot() {
+		if obj == nil || obj.Key == nil {
 			continue
 		}
 		if obj.Ot == model.File || obj.Ot == model.Folder {
-			sel[name] = true
+			names = append(names, *obj.Key)
 		}
 	}
+	c.selectNames(names)
 	go c.updateList()
 }
 
 func (c *Controller) selectedNames() []string {
-	sel := c.selectionMap()
-	if sel == nil || len(sel) == 0 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	sel := c.selScopeLocked()
+	if len(sel) == 0 {
 		return nil
 	}
 	out := make([]string, 0, len(sel))
@@ -1075,7 +1133,7 @@ func (c *Controller) ShowSummaryModal() {
 		if cur == "" {
 			return
 		}
-		if val, ok := c.objs[cur]; ok && val != nil && val.Ot == model.Bucket {
+		if val, ok := c.lookupObj(cur); ok && val != nil && val.Ot == model.Bucket {
 			bucket = val
 		} else {
 			tmp := cur
@@ -1088,7 +1146,7 @@ func (c *Controller) ShowSummaryModal() {
 		// If a folder is selected, summarize that folder; else summarize current path.
 		cur := c.getSelectedObjectName()
 		if cur != "" {
-			if val, ok := c.objs[cur]; ok && val != nil && val.Ot == model.Folder {
+			if val, ok := c.lookupObj(cur); ok && val != nil && val.Ot == model.Folder {
 				prefix = path.Join(c.currentPath, cur)
 				if prefix != "" && !strings.HasSuffix(prefix, "/") {
 					prefix += "/"
@@ -1388,7 +1446,7 @@ func (c *Controller) fillConfigData() {
 func (c *Controller) fillDetails(key string) {
 	c.view.Details.Clear()
 	var otype string
-	if val, ok := c.objs[key]; ok {
+	if val, ok := c.lookupObj(key); ok {
 		switch ot := val.Ot; ot {
 		case model.File:
 			otype = "File"
@@ -1666,7 +1724,7 @@ func (c *Controller) Upload(localPath string) error {
 }
 
 func (c *Controller) ShowFileProperties(key string) {
-	obj, ok := c.objs[key]
+	obj, ok := c.lookupObj(key)
 	if !ok || obj.Ot != model.File {
 		return
 	}

@@ -334,10 +334,13 @@ func (m *Model) List(path string, bucket *Object) ([]*Object, error) {
 			objs = append(objs, ko)
 		}
 		for _, o := range output.Contents {
-			if *o.Key == path {
+			if o.Key == nil || *o.Key == path {
 				continue
 			}
 			fields := strings.FieldsFunc(strings.TrimSpace(*o.Key), u.SplitFunc)
+			if len(fields) == 0 {
+				continue
+			}
 			appKey := fields[len(fields)-1]
 			ts := strings.Trim(*o.ETag, "\"")
 			size := o.Size
