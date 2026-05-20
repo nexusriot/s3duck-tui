@@ -12,9 +12,9 @@ Features
 2. Bucket browsing with folder-style navigation (delimiter `/`)
 3. Bucket creation (private or public-read) and deletion
 4. Folder creation (zero-byte `prefix/` markers)
-5. Recursive download of files and folders, with progress and overwrite prompts (Overwrite / Skip / Overwrite All / Skip All / Cancel)
+5. Recursive download of files and folders, with progress and overwrite prompts (Overwrite / Skip / Overwrite All / Skip All / Cancel); configurable per-profile destination directory (defaults to `~/Downloads`, supports a leading `~`)
 6. Multi-select for batch download (Space, Ctrl+S all, Ctrl+X none)
-7. Upload with built-in local filesystem browser; preserves directory tree, creates markers for empty folders
+7. Upload with a built-in, icon-styled local filesystem browser; preserves directory tree, creates markers for empty folders
 8. Bucket / folder size summary (Ctrl+G)
 9. Object properties (size, ETag, storage class, last modified) in the side panel
 10. Clipboard yank of profile data (Ctrl+Y)

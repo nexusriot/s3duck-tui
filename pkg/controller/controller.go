@@ -121,6 +121,9 @@ type Controller struct {
 	params          *cfg.Params
 	selectedByScope map[string]map[string]bool
 	restoreNext     string
+	// activeConfig is the profile currently being browsed (nil on the
+	// profiles screen). Used to resolve the per-profile download directory.
+	activeConfig *cfg.Config
 
 	// mu guards objs and selectedByScope, which are read on tview's UI
 	// goroutine (input/list callbacks) while being written by background
@@ -367,6 +370,28 @@ func (c *Controller) Delete() error {
 	return nil
 }
 
+// resolveDownloadDir returns the destination directory for downloads,
+// always terminated with a path separator. It uses the active profile's
+// DownloadDir, expands a leading "~" to the user's home, and falls back to
+// ~/Downloads when unset.
+func (c *Controller) resolveDownloadDir() string {
+	dir := ""
+	if c.activeConfig != nil {
+		dir = strings.TrimSpace(c.activeConfig.DownloadDir)
+	}
+	if dir == "" {
+		dir = filepath.Join(c.params.HomeDir, "Downloads")
+	} else if dir == "~" {
+		dir = c.params.HomeDir
+	} else if strings.HasPrefix(dir, "~/") {
+		dir = filepath.Join(c.params.HomeDir, dir[2:])
+	}
+	if !strings.HasSuffix(dir, string(os.PathSeparator)) {
+		dir += string(os.PathSeparator)
+	}
+	return dir
+}
+
 func (c *Controller) Download() error {
 
 	if c.view.List.GetItemCount() == 0 || c.currentBucket == nil {
@@ -379,8 +404,6 @@ func (c *Controller) Download() error {
 		cur := c.getSelectedObjectName()
 		names = []string{cur}
 	}
-	cwd := filepath.Join(c.params.HomeDir, "Downloads") + string(os.PathSeparator)
-
 	var allObjects []model.DownloadTarget
 	var totalSize int64
 
@@ -408,166 +431,178 @@ func (c *Controller) Download() error {
 		return nil
 	}
 
-	confirm := c.view.NewConfirm()
-	confirm.SetText(fmt.Sprintf(
-		"Download to %s\nSelected: %d item(s)\nResolved: %d object(s)\nTotal size: %s",
-		cwd,
-		len(names),
-		len(allObjects),
-		humanize.IBytes(uint64(totalSize)),
-	)).SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-		c.view.Pages.RemovePage("confirm").SwitchToPage("main")
+	proceed := func(cwd string) {
+		confirm := c.view.NewConfirm()
+		confirm.SetText(fmt.Sprintf(
+			"Download to %s\nSelected: %d item(s)\nResolved: %d object(s)\nTotal size: %s",
+			cwd,
+			len(names),
+			len(allObjects),
+			humanize.IBytes(uint64(totalSize)),
+		)).SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+			c.view.Pages.RemovePage("confirm").SwitchToPage("main")
 
-		if buttonLabel != "OK" {
-			return
-		}
-
-		ctx, cancel := context.WithCancel(context.Background())
-		progress := tview.NewModal().
-			SetText("Starting download...\n").
-			AddButtons([]string{"Cancel"}).
-			SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-				cancel()
-				c.view.Pages.RemovePage("progress").SwitchToPage("main")
-			})
-		c.view.Pages.AddPage("progress", progress, true, true)
-
-		go func() {
-			downloadedSize := int64(0)
-
-			sum := downloadSummary{totalObjects: len(allObjects)}
-			overwriteAll := false
-			skipAll := false
-			canceled := false
-
-			var lastDraw time.Time
-			throttle := 100 * time.Millisecond
-
-			showSummary := func() {
-				c.view.App.QueueUpdateDraw(func() {
-					report := sum.text(totalSize, canceled)
-
-					progress.ClearButtons()
-					progress.AddButtons([]string{"Done", "Copy report"})
-					progress.SetText(report)
-
-					progress.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-						switch buttonLabel {
-						case "Copy report":
-							u.CopyToClipboard(report)
-							go c.success("Download report copied")
-						case "Done":
-							c.view.Pages.RemovePage("progress").SwitchToPage("main")
-						}
-					})
-					c.view.App.SetFocus(progress)
-				})
+			if buttonLabel != "OK" {
+				return
 			}
 
-			showProgress := func(i int, key string, written int64) {
-				now := time.Now()
-				if now.Sub(lastDraw) < throttle {
-					return
-				}
-				lastDraw = now
-
-				percentage := float64(downloadedSize+written) / float64(totalSize) * 100
-				c.view.App.QueueUpdateDraw(func() {
-					progress.SetText(fmt.Sprintf(
-						"Downloading\n%d/%d object(s)\n%s/%s (%.1f%%)\nCurrent: %s",
-						i+1, len(allObjects),
-						humanize.IBytes(uint64(downloadedSize+written)),
-						humanize.IBytes(uint64(totalSize)),
-						percentage,
-						key,
-					))
+			ctx, cancel := context.WithCancel(context.Background())
+			progress := tview.NewModal().
+				SetText("Starting download...\n").
+				AddButtons([]string{"Cancel"}).
+				SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+					cancel()
+					c.view.Pages.RemovePage("progress").SwitchToPage("main")
 				})
-			}
+			c.view.Pages.AddPage("progress", progress, true, true)
 
-		loop:
-			for i, object := range allObjects {
-				select {
-				case <-ctx.Done():
-					canceled = true
-					break loop
-				default:
-				}
+			go func() {
+				downloadedSize := int64(0)
 
-				keyStr := object.Key
-				if keyStr == "" {
-					sum.addFailed("<nil-key>", fmt.Errorf("object key is empty"))
-					continue
-				}
+				sum := downloadSummary{totalObjects: len(allObjects)}
+				overwriteAll := false
+				skipAll := false
+				canceled := false
 
-				if !strings.HasSuffix(keyStr, "/") {
-					dst := localDownloadPath(c.currentPath, cwd, keyStr)
+				var lastDraw time.Time
+				throttle := 100 * time.Millisecond
 
-					if _, err := os.Stat(dst); err == nil {
-						if skipAll {
-							sum.addSkipped(dst)
-							continue
-						}
+				showSummary := func() {
+					c.view.App.QueueUpdateDraw(func() {
+						report := sum.text(totalSize, canceled)
 
-						if !overwriteAll {
-							d := c.askOverwrite(dst)
-							switch d {
-							case decSkip:
-								sum.addSkipped(dst)
-								continue
-							case decSkipAll:
-								skipAll = true
-								sum.addSkipped(dst)
-								continue
-							case decOverwrite:
-								sum.overwritten++
-								_ = os.Remove(dst)
-							case decOverwriteAll:
-								overwriteAll = true
-								sum.overwritten++
-								_ = os.Remove(dst)
-							default: // cancel
-								canceled = true
-								cancel()
-								break loop
+						progress.ClearButtons()
+						progress.AddButtons([]string{"Done", "Copy report"})
+						progress.SetText(report)
+
+						progress.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+							switch buttonLabel {
+							case "Copy report":
+								u.CopyToClipboard(report)
+								go c.success("Download report copied")
+							case "Done":
+								c.view.Pages.RemovePage("progress").SwitchToPage("main")
 							}
-						} else {
-							sum.overwritten++
-							_ = os.Remove(dst)
+						})
+						c.view.App.SetFocus(progress)
+					})
+				}
+
+				showProgress := func(i int, key string, written int64) {
+					now := time.Now()
+					if now.Sub(lastDraw) < throttle {
+						return
+					}
+					lastDraw = now
+
+					percentage := float64(downloadedSize+written) / float64(totalSize) * 100
+					c.view.App.QueueUpdateDraw(func() {
+						progress.SetText(fmt.Sprintf(
+							"Downloading\n%d/%d object(s)\n%s/%s (%.1f%%)\nCurrent: %s",
+							i+1, len(allObjects),
+							humanize.IBytes(uint64(downloadedSize+written)),
+							humanize.IBytes(uint64(totalSize)),
+							percentage,
+							key,
+						))
+					})
+				}
+
+			loop:
+				for i, object := range allObjects {
+					select {
+					case <-ctx.Done():
+						canceled = true
+						break loop
+					default:
+					}
+
+					keyStr := object.Key
+					if keyStr == "" {
+						sum.addFailed("<nil-key>", fmt.Errorf("object key is empty"))
+						continue
+					}
+
+					if !strings.HasSuffix(keyStr, "/") {
+						dst := localDownloadPath(c.currentPath, cwd, keyStr)
+
+						if _, err := os.Stat(dst); err == nil {
+							if skipAll {
+								sum.addSkipped(dst)
+								continue
+							}
+
+							if !overwriteAll {
+								d := c.askOverwrite(dst)
+								switch d {
+								case decSkip:
+									sum.addSkipped(dst)
+									continue
+								case decSkipAll:
+									skipAll = true
+									sum.addSkipped(dst)
+									continue
+								case decOverwrite:
+									sum.overwritten++
+									_ = os.Remove(dst)
+								case decOverwriteAll:
+									overwriteAll = true
+									sum.overwritten++
+									_ = os.Remove(dst)
+								default: // cancel
+									canceled = true
+									cancel()
+									break loop
+								}
+							} else {
+								sum.overwritten++
+								_ = os.Remove(dst)
+							}
 						}
 					}
+
+					n, err := c.model.DownloadTarget(
+						ctx,
+						object,
+						c.currentPath,
+						cwd,
+						c.currentBucket.Key,
+						func(written, total int64, key string) {
+							showProgress(i, key, written)
+						},
+					)
+
+					if ctx.Err() != nil {
+						canceled = true
+						break loop
+					}
+
+					if err != nil {
+						sum.addFailed(keyStr, err)
+						continue
+					}
+
+					downloadedSize += n
+					sum.downloaded++
+					sum.bytesDone = downloadedSize
 				}
 
-				n, err := c.model.DownloadTarget(
-					ctx,
-					object,
-					c.currentPath,
-					cwd,
-					c.currentBucket.Key,
-					func(written, total int64, key string) {
-						showProgress(i, key, written)
-					},
-				)
+				showSummary()
+			}()
+		})
 
-				if ctx.Err() != nil {
-					canceled = true
-					break loop
-				}
+		c.view.Pages.AddPage("confirm", confirm, true, true)
+	}
 
-				if err != nil {
-					sum.addFailed(keyStr, err)
-					continue
-				}
-
-				downloadedSize += n
-				sum.downloaded++
-				sum.bytesDone = downloadedSize
-			}
-
-			showSummary()
-		}()
-	})
-
-	c.view.Pages.AddPage("confirm", confirm, true, true)
+	// If the active profile defines a download directory, use it directly.
+	// Otherwise let the user pick one with the FS browser dialog.
+	if c.activeConfig != nil && strings.TrimSpace(c.activeConfig.DownloadDir) != "" {
+		proceed(c.resolveDownloadDir())
+	} else {
+		c.chooseDir(c.params.HomeDir, func(dir string) {
+			proceed(dir)
+		})
+	}
 	return nil
 }
 
@@ -824,18 +859,20 @@ func (c *Controller) CreateConfigEntry() {
 		reg := cForm.GetFormItem(2).(*tview.InputField).GetText()
 		accessKey := cForm.GetFormItem(3).(*tview.InputField).GetText()
 		secretKey := cForm.GetFormItem(4).(*tview.InputField).GetText()
-		ignoreSsl := cForm.GetFormItem(5).(*tview.Checkbox).IsChecked()
+		downloadDir := cForm.GetFormItem(5).(*tview.InputField).GetText()
+		ignoreSsl := cForm.GetFormItem(6).(*tview.Checkbox).IsChecked()
 
 		if reg != "" {
 			region = &reg
 		}
 		conf := cfg.Config{
-			Name:      name,
-			BaseUrl:   url,
-			Region:    region,
-			AccessKey: accessKey,
-			SecretKey: secretKey,
-			IgnoreSsl: ignoreSsl,
+			Name:        name,
+			BaseUrl:     url,
+			Region:      region,
+			AccessKey:   accessKey,
+			SecretKey:   secretKey,
+			IgnoreSsl:   ignoreSsl,
+			DownloadDir: strings.TrimSpace(downloadDir),
 		}
 		err := c.params.NewConfiguration(&conf)
 
@@ -851,7 +888,7 @@ func (c *Controller) CreateConfigEntry() {
 		c.view.Pages.RemovePage("modal")
 	})
 
-	c.view.Pages.AddPage("modal", c.view.ModalEdit(cForm, 75, 17), true, true)
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(cForm, 75, 19), true, true)
 }
 
 func (c *Controller) EditConfigEntry() {
@@ -870,7 +907,8 @@ func (c *Controller) EditConfigEntry() {
 	}
 	cForm.GetFormItem(3).(*tview.InputField).SetText(entry.AccessKey)
 	cForm.GetFormItem(4).(*tview.InputField).SetText(entry.SecretKey)
-	cForm.GetFormItem(5).(*tview.Checkbox).SetChecked(entry.IgnoreSsl)
+	cForm.GetFormItem(5).(*tview.InputField).SetText(entry.DownloadDir)
+	cForm.GetFormItem(6).(*tview.Checkbox).SetChecked(entry.IgnoreSsl)
 
 	cForm.AddButton("Save", func() {
 		name := cForm.GetFormItem(0).(*tview.InputField).GetText()
@@ -878,7 +916,8 @@ func (c *Controller) EditConfigEntry() {
 		reg := cForm.GetFormItem(2).(*tview.InputField).GetText()
 		accessKey := cForm.GetFormItem(3).(*tview.InputField).GetText()
 		secretKey := cForm.GetFormItem(4).(*tview.InputField).GetText()
-		ignoreSsl := cForm.GetFormItem(5).(*tview.Checkbox).IsChecked()
+		downloadDir := cForm.GetFormItem(5).(*tview.InputField).GetText()
+		ignoreSsl := cForm.GetFormItem(6).(*tview.Checkbox).IsChecked()
 		var region *string
 		if reg != "" {
 			region = &reg
@@ -890,6 +929,7 @@ func (c *Controller) EditConfigEntry() {
 		entry.AccessKey = accessKey
 		entry.SecretKey = secretKey
 		entry.IgnoreSsl = ignoreSsl
+		entry.DownloadDir = strings.TrimSpace(downloadDir)
 
 		c.params.WriteConfig()
 		c.view.Pages.RemovePage("modal")
@@ -900,7 +940,7 @@ func (c *Controller) EditConfigEntry() {
 		c.view.Pages.RemovePage("modal")
 	})
 
-	c.view.Pages.AddPage("modal", c.view.ModalEdit(cForm, 75, 17), true, true)
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(cForm, 75, 19), true, true)
 }
 
 func (c *Controller) CopyProfile() {
@@ -1654,6 +1694,7 @@ func (c *Controller) fillConfigData() {
 		c.view.List.AddItem(cf.Name, cf.Name, 0, func() {
 			i := c.view.List.GetCurrentItem()
 			conf := c.params.Config[i]
+			c.activeConfig = conf
 			c.Duck(conf.BaseUrl, conf.Region, conf.AccessKey, conf.SecretKey, !conf.IgnoreSsl)
 		})
 	}
@@ -1740,6 +1781,110 @@ func (c *Controller) success(header string) {
 	})
 }
 
+// chooseDir opens an icon-styled directory browser (same look as the upload
+// browser) and calls onChosen with the directory the user picks. Used as the
+// download-destination fallback when the active profile has no DownloadDir.
+func (c *Controller) chooseDir(startPath string, onChosen func(dir string)) {
+	currentPath := startPath
+	layout, localList := c.view.NewCreateLocalFileListForm()
+	app := c.view.App
+
+	selectBtn := tview.NewButton("Select here").SetSelectedFunc(func() {
+		dir := currentPath
+		if !strings.HasSuffix(dir, string(os.PathSeparator)) {
+			dir += string(os.PathSeparator)
+		}
+		c.view.Pages.RemovePage("modal")
+		onChosen(dir)
+	})
+	cancelBtn := tview.NewButton("Cancel").SetSelectedFunc(func() {
+		c.view.Pages.RemovePage("modal")
+	})
+
+	buttonRow := tview.NewFlex().
+		SetDirection(tview.FlexColumn).
+		AddItem(selectBtn, 0, 1, false).
+		AddItem(tview.NewBox(), 2, 0, false).
+		AddItem(cancelBtn, 0, 1, false)
+
+	flex, _ := layout.(*tview.Flex)
+	flex.AddItem(buttonRow, 1, 0, false)
+
+	focusables := []tview.Primitive{localList, selectBtn, cancelBtn}
+	focusIndex := 0
+	setNextFocus := func() {
+		focusIndex = (focusIndex + 1) % len(focusables)
+		app.SetFocus(focusables[focusIndex])
+	}
+
+	var renderList func(string)
+	renderList = func(curPath string) {
+		currentPath = curPath
+		localList.Clear()
+		localList.SetTitle(fmt.Sprintf("Choose download dir: %s", curPath)).SetBorder(true)
+
+		entries, err := os.ReadDir(curPath)
+		if err != nil {
+			go c.error("Failed to read directory", err, false)
+			return
+		}
+
+		sort.Slice(entries, func(i, j int) bool {
+			return entries[i].Name() < entries[j].Name()
+		})
+
+		if parent := filepath.Dir(curPath); parent != curPath {
+			localList.AddItem("[cyan]📁[-] ..", "..", 0, func(p string) func() {
+				return func() { renderList(p) }
+			}(filepath.Dir(curPath)))
+		}
+
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			name := entry.Name()
+			full := filepath.Join(curPath, name)
+			localList.AddItem("[cyan]📁[-] "+name+"/", name, 0, func(p string) func() {
+				return func() { renderList(p) }
+			}(full))
+		}
+	}
+
+	localList.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyTab:
+			setNextFocus()
+			return nil
+		case tcell.KeyEsc:
+			c.view.Pages.RemovePage("modal")
+			return nil
+		case tcell.KeyBackspace2:
+			renderList(filepath.Dir(currentPath))
+			return nil
+		}
+		return event
+	})
+	selectBtn.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyTab {
+			setNextFocus()
+			return nil
+		}
+		return event
+	})
+	cancelBtn.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyTab {
+			setNextFocus()
+			return nil
+		}
+		return event
+	})
+
+	modal := c.view.ModalEdit(layout, 60, 25)
+	c.view.Pages.AddPage("modal", modal, true, true)
+	renderList(startPath)
+}
+
 func (c *Controller) ShowLocalFSModal(startPath string) {
 	if c.currentBucket == nil {
 		return
@@ -1751,8 +1896,14 @@ func (c *Controller) ShowLocalFSModal(startPath string) {
 
 	okBtn := tview.NewButton("Upload").SetSelectedFunc(func() {
 		i := localList.GetCurrentItem()
-		name, _ := localList.GetItemText(i)
-		fullPath := filepath.Join(currentPath, strings.TrimSuffix(name, "/"))
+		if i < 0 || localList.GetItemCount() == 0 {
+			return
+		}
+		_, raw := localList.GetItemText(i)
+		if raw == "" || raw == ".." {
+			return
+		}
+		fullPath := filepath.Join(currentPath, raw)
 
 		c.view.Pages.RemovePage("modal")
 		err := c.Upload(fullPath)
@@ -1801,20 +1952,35 @@ func (c *Controller) ShowLocalFSModal(startPath string) {
 			return entries[i].Name() < entries[j].Name()
 		})
 
+		// Parent navigation entry.
+		if parent := filepath.Dir(curPath); parent != curPath {
+			localList.AddItem("[cyan]📁[-] ..", "..", 0, func(p string) func() {
+				return func() { renderList(p) }
+			}(filepath.Dir(curPath)))
+		}
+
 		for _, entry := range entries {
 			name := entry.Name()
 			fullPath := filepath.Join(curPath, name)
-			display := name
-			if entry.IsDir() {
-				display += "/"
+			isDir := entry.IsDir()
+
+			var label string
+			switch {
+			case isDir:
+				label = "[cyan]📁[-] " + name + "/"
+			case entry.Type()&os.ModeSymlink != 0:
+				label = "[magenta]🔗[-] " + name
+			default:
+				label = "📄 " + name
 			}
-			localList.AddItem(display, "", 0, func(p string, isDir bool) func() {
+
+			localList.AddItem(label, name, 0, func(p string, dir bool) func() {
 				return func() {
-					if isDir {
+					if dir {
 						renderList(p)
 					}
 				}
-			}(fullPath, entry.IsDir()))
+			}(fullPath, isDir))
 		}
 	}
 

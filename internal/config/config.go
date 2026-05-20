@@ -29,6 +29,9 @@ type Config struct {
 	AccessKey string  `json:"access_key"`
 	SecretKey string  `json:"secret_key"`
 	IgnoreSsl bool    `json:"ignore_ssl"`
+	// DownloadDir is the destination for downloads. Empty -> ~/Downloads.
+	// A leading "~" is expanded to the user's home directory.
+	DownloadDir string `json:"download_dir,omitempty"`
 }
 
 func GetHomeDir() string {
