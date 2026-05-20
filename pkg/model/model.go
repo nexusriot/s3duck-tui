@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"path/filepath"
@@ -334,10 +335,13 @@ func (m *Model) List(path string, bucket *Object) ([]*Object, error) {
 			objs = append(objs, ko)
 		}
 		for _, o := range output.Contents {
-			if *o.Key == path {
+			if o.Key == nil || *o.Key == path {
 				continue
 			}
 			fields := strings.FieldsFunc(strings.TrimSpace(*o.Key), u.SplitFunc)
+			if len(fields) == 0 {
+				continue
+			}
 			appKey := fields[len(fields)-1]
 			ts := strings.Trim(*o.ETag, "\"")
 			size := o.Size
@@ -811,4 +815,119 @@ func (m *Model) DownloadTarget(
 		return 0, ctx.Err()
 	}
 	return n, err
+}
+
+// copySource builds a URL-encoded CopySource value ("bucket/key"); the AWS
+// SDK does not encode it for us, so keys with spaces/unicode would otherwise
+// break.
+func copySource(bucket, key string) string {
+	u := &url.URL{Path: "/" + bucket + "/" + key}
+	return strings.TrimPrefix(u.EscapedPath(), "/")
+}
+
+// CopyObject performs a single server-side object copy.
+func (m *Model) CopyObject(bucket *Object, srcKey, dstKey string) error {
+	if bucket == nil || bucket.Key == nil {
+		return fmt.Errorf("bucket is nil")
+	}
+	if srcKey == dstKey {
+		return fmt.Errorf("source and destination are the same")
+	}
+	_, err := m.Client.CopyObject(context.TODO(), &s3.CopyObjectInput{
+		Bucket:     aws.String(*bucket.Key),
+		CopySource: aws.String(copySource(*bucket.Key, srcKey)),
+		Key:        aws.String(dstKey),
+	})
+	return err
+}
+
+// CopyKeys copies srcKey to dstKey. When isFolder is true it recursively
+// copies every object under srcKey/ into dstKey/. Returns the number of
+// objects copied.
+func (m *Model) CopyKeys(
+	ctx context.Context,
+	bucket *Object,
+	srcKey, dstKey string,
+	isFolder bool,
+	progressCb func(done, total int, key string),
+) (int, error) {
+	if bucket == nil || bucket.Key == nil {
+		return 0, fmt.Errorf("bucket is nil")
+	}
+
+	if !isFolder {
+		if err := m.CopyObject(bucket, srcKey, dstKey); err != nil {
+			return 0, err
+		}
+		if progressCb != nil {
+			progressCb(1, 1, dstKey)
+		}
+		return 1, nil
+	}
+
+	src := srcKey
+	if !strings.HasSuffix(src, "/") {
+		src += "/"
+	}
+	dst := dstKey
+	if !strings.HasSuffix(dst, "/") {
+		dst += "/"
+	}
+	if dst == src {
+		return 0, fmt.Errorf("source and destination are the same")
+	}
+	if strings.HasPrefix(dst, src) {
+		return 0, fmt.Errorf("cannot copy/move a folder into itself")
+	}
+
+	objs, err := m.ListObjects(src, bucket)
+	if err != nil {
+		return 0, err
+	}
+
+	total := len(objs)
+	done := 0
+	for _, o := range objs {
+		if o.Key == nil {
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return done, ctx.Err()
+		default:
+		}
+		newKey := dst + strings.TrimPrefix(*o.Key, src)
+		if err := m.CopyObject(bucket, *o.Key, newKey); err != nil {
+			return done, fmt.Errorf("copy %s: %w", *o.Key, err)
+		}
+		done++
+		if progressCb != nil {
+			progressCb(done, total, newKey)
+		}
+	}
+	return done, nil
+}
+
+// MoveKeys copies srcKey to dstKey and then deletes the source. Rename is a
+// move whose destination shares the source prefix.
+func (m *Model) MoveKeys(
+	ctx context.Context,
+	bucket *Object,
+	srcKey, dstKey string,
+	isFolder bool,
+	progressCb func(done, total int, key string),
+) (int, error) {
+	n, err := m.CopyKeys(ctx, bucket, srcKey, dstKey, isFolder, progressCb)
+	if err != nil {
+		return n, err
+	}
+
+	delKey := srcKey
+	if isFolder && !strings.HasSuffix(delKey, "/") {
+		delKey += "/"
+	}
+	if err := m.Delete(&delKey, bucket); err != nil {
+		return n, fmt.Errorf("copied ok, but failed to delete source: %w", err)
+	}
+	return n, nil
 }

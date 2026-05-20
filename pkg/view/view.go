@@ -9,7 +9,7 @@ import (
 	"github.com/rivo/tview"
 )
 
-const versionText = "S3Duck 🦆 TUI v.0.0.40"
+const versionText = "S3Duck 🦆 TUI v.0.1.0"
 
 // View ...
 type View struct {
@@ -104,11 +104,28 @@ func (v *View) NewCreateProfileForm(header string) *tview.Form {
 	form.AddInputField("Region", "", 52, nil, nil)
 	form.AddInputField("Access key", "", 52, nil, nil)
 	form.AddPasswordField("Secret key", "", 52, '*', nil)
+	form.AddInputField("Download dir", "", 52, nil, nil)
 	form.AddCheckbox("Disable ssl check", false, func(bool) {})
 	form.SetBorder(true)
 	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyEsc:
+			v.Pages.RemovePage("modal")
+		}
+		return event
+	})
+	return form
+}
+
+// NewInputForm builds a single-field form pre-filled with value, used by
+// rename / copy / move. Esc closes the "modal" page.
+func (v *View) NewInputForm(header, label, value string) *tview.Form {
+	form := tview.NewForm()
+	form.SetTitle(header)
+	form.AddInputField(label, value, 50, nil, nil)
+	form.SetBorder(true)
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEsc {
 			v.Pages.RemovePage("modal")
 		}
 		return event
@@ -184,6 +201,9 @@ func (v *View) HotkeysModal(profiles bool) *tview.TextView {
 		[::b]Actions[::-]
 		  Ctrl+N        Create bucket / folder
 		  Ctrl+D        Download file/folder (for files and folders)
+          Ctrl+R        Rename selected object (same folder)
+          Ctrl+Y        Copy selected/marked to a destination prefix
+          Ctrl+T        Move selected/marked to a destination prefix
           Ctrl+G        Bucket/folder summary
           Ctrl+U        Open local file manager (for upload)
           Space			Select object for download
