@@ -700,10 +700,10 @@ func (c *Controller) updateList() ([]string, error) {
 			title = base
 		}
 
-		suff = "[::b][Ctrl+D[][::-]Download [::b][Ctrl+U[][::-]Upload [::b][Ctrl+R[][::-]Rename [::b][Ctrl+Y[][::-]Copy [::b][Ctrl+T[][::-]Move [::b]"
+		suff = "[::b][Ctrl+D[][::-]Download [::b][Ctrl+U[][::-]Upload [::b]"
 	}
 
-	fText := fmt.Sprintf("[::b][↓,↑][::-]Down/Up [::b][Enter/Backspace][::-]Lower/Upper %s[::b][Del[][::-]Delete [::b][Ctrl+N][::-]Create [::b][Ctrl+P][::-]Profiles [::b][Ctrl+L][::-]Properties [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit", suff)
+	fText := fmt.Sprintf("[::b][↓,↑][::-]D/U [::b][Ent/Bck][::-]L/U %s[::b][Del[][::-]Delete [::b][Ctrl+N][::-]Create [::b][Ctrl+P][::-]Profiles [::b][Ctrl+L][::-]Properties [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit", suff)
 
 	objs := c.objsSnapshot()
 	sort.Slice(objs, func(i, j int) bool {
@@ -1640,7 +1640,7 @@ func (c *Controller) setInput() {
 				return nil
 			})
 
-			c.view.Pages.AddPage("modal-help", c.view.ModalEdit(help, 70, 25), true, true)
+			c.view.Pages.AddPage("modal-help", c.view.ModalEdit(help, 70, 30), true, true)
 			return nil
 		case tcell.KeyCtrlA:
 			about := c.view.AboutModal()

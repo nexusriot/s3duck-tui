@@ -122,7 +122,7 @@ func (v *View) NewCreateProfileForm(header string) *tview.Form {
 func (v *View) NewInputForm(header, label, value string) *tview.Form {
 	form := tview.NewForm()
 	form.SetTitle(header)
-	form.AddInputField(label, value, 60, nil, nil)
+	form.AddInputField(label, value, 50, nil, nil)
 	form.SetBorder(true)
 	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEsc {
