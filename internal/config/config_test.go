@@ -59,7 +59,10 @@ func TestConfigRoundTrip(t *testing.T) {
 		t.Fatalf("len(Config) = %d, want 1", len(p.Config))
 	}
 
-	loaded := LoadConfiguration(p.FileName)
+	loaded, err := LoadConfiguration(p.FileName)
+	if err != nil {
+		t.Fatalf("LoadConfiguration: %v", err)
+	}
 	if len(loaded) != 1 {
 		t.Fatalf("LoadConfiguration returned %d entries, want 1", len(loaded))
 	}
@@ -85,7 +88,7 @@ func TestCopyAndDeleteConfig(t *testing.T) {
 	if len(p.Config) != 2 {
 		t.Fatalf("after CopyConfig len = %d, want 2", len(p.Config))
 	}
-	if reloaded := LoadConfiguration(p.FileName); len(reloaded) != 2 {
+	if reloaded, _ := LoadConfiguration(p.FileName); len(reloaded) != 2 {
 		t.Errorf("persisted entries = %d, want 2", len(reloaded))
 	}
 
@@ -96,7 +99,7 @@ func TestCopyAndDeleteConfig(t *testing.T) {
 	if p.Config[0].Name != "a_copy" {
 		t.Errorf("remaining entry = %q, want %q", p.Config[0].Name, "a_copy")
 	}
-	if reloaded := LoadConfiguration(p.FileName); len(reloaded) != 1 || reloaded[0].Name != "a_copy" {
+	if reloaded, _ := LoadConfiguration(p.FileName); len(reloaded) != 1 || reloaded[0].Name != "a_copy" {
 		t.Errorf("persisted state after delete = %+v, want single 'a_copy'", reloaded)
 	}
 }
@@ -108,7 +111,7 @@ func TestCreateEmptyConfigCreatesParentDirs(t *testing.T) {
 	if ok, err := FileExist(nested); !ok || err != nil {
 		t.Fatalf("FileExist(nested) = (%v, %v), want (true, nil)", ok, err)
 	}
-	if entries := LoadConfiguration(nested); len(entries) != 0 {
+	if entries, _ := LoadConfiguration(nested); len(entries) != 0 {
 		t.Errorf("empty config loaded %d entries, want 0", len(entries))
 	}
 }
