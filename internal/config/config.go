@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"path"
 	"path/filepath"
@@ -20,6 +19,10 @@ type Params struct {
 	HomeDir  string
 	FileName string
 	Config   []*Config
+	// LoadErr holds a non-fatal startup error (missing/corrupt config file).
+	// The app starts with an empty profile list and surfaces this in the UI
+	// instead of crashing.
+	LoadErr error
 }
 
 type Config struct {
@@ -34,47 +37,36 @@ type Config struct {
 	DownloadDir string `json:"download_dir,omitempty"`
 }
 
-func GetHomeDir() string {
-	homeDir, err := os.UserHomeDir()
-
+func (p *Params) WriteConfig() error {
+	file, err := json.Marshal(p.Config)
 	if err != nil {
-		panic("can't get user homedir")
+		return fmt.Errorf("failed to marshal config: %w", err)
 	}
-	return homeDir
-}
-
-func (p *Params) WriteConfig() {
-
-	file, _ := json.Marshal(p.Config)
-	err := os.WriteFile(p.FileName, file, 0700)
-
-	if err != nil {
-		log.Fatalf("failed to write config file: %s", filename)
+	if err := os.WriteFile(p.FileName, file, 0600); err != nil {
+		return fmt.Errorf("failed to write config file %s: %w", p.FileName, err)
 	}
+	return nil
 }
 
 func (p *Params) NewConfiguration(config *Config) error {
 	if config.Name == "" {
-		return errors.New(fmt.Sprintf("empty name not allowed"))
+		return errors.New("empty name not allowed")
 	}
 
 	p.Config = append(p.Config, config)
-	p.WriteConfig()
-	return nil
+	return p.WriteConfig()
 }
 
-func LoadConfiguration(fileName string) []*Config {
+func LoadConfiguration(fileName string) ([]*Config, error) {
 	var config []*Config
 	configFile, err := os.ReadFile(fileName)
-
 	if err != nil {
-		log.Fatalf("failed to open config file: %s", fileName)
+		return nil, fmt.Errorf("failed to read config file %s: %w", fileName, err)
 	}
-	err = json.Unmarshal(configFile, &config)
-	if err != nil {
-		log.Fatalf("failed to parse config file: %s", fileName)
+	if err := json.Unmarshal(configFile, &config); err != nil {
+		return nil, fmt.Errorf("failed to parse config file %s: %w", fileName, err)
 	}
-	return config
+	return config, nil
 }
 
 func FileExist(fileName string) (bool, error) {
@@ -88,44 +80,50 @@ func FileExist(fileName string) (bool, error) {
 	return false, err
 }
 
-func (p *Params) CopyConfig(conf Config) {
+func (p *Params) CopyConfig(conf Config) error {
 	p.Config = append(p.Config, &conf)
-	p.WriteConfig()
+	return p.WriteConfig()
 }
 
-func (p *Params) DeleteConfig(i int) {
+func (p *Params) DeleteConfig(i int) error {
 	p.Config = append(p.Config[:i], p.Config[i+1:]...)
-	p.WriteConfig()
+	return p.WriteConfig()
 }
 
-func CreateEmptyConfig(configFile string) {
-	err := os.MkdirAll(filepath.Dir(configFile), 0700)
-	f, err := os.Create(configFile)
-	ap := make([]Config, 0)
-	a, _ := json.Marshal(ap)
-	err = os.WriteFile(configFile, a, 0700)
-	if err != nil {
-		log.Fatal(err)
+func CreateEmptyConfig(configFile string) error {
+	if err := os.MkdirAll(filepath.Dir(configFile), 0700); err != nil {
+		return err
 	}
-	defer f.Close()
+	a, _ := json.Marshal(make([]Config, 0))
+	return os.WriteFile(configFile, a, 0600)
 }
 
 func NewParams() *Params {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return &Params{LoadErr: fmt.Errorf("can't get user home dir: %w", err)}
+	}
 
-	homeDir := GetHomeDir()
 	configFile := path.Join(homeDir, configFolder, configDirName, filename)
+	params := &Params{HomeDir: homeDir, FileName: configFile}
+
 	exists, err := FileExist(configFile)
 	if err != nil {
-		log.Fatalf(err.Error())
+		params.LoadErr = err
+		return params
 	}
 	if !exists {
-		CreateEmptyConfig(configFile)
+		if err := CreateEmptyConfig(configFile); err != nil {
+			params.LoadErr = fmt.Errorf("failed to create config: %w", err)
+			return params
+		}
 	}
-	config := LoadConfiguration(configFile)
-	params := Params{
-		homeDir,
-		configFile,
-		config,
+
+	config, err := LoadConfiguration(configFile)
+	if err != nil {
+		params.LoadErr = err
+		return params
 	}
-	return &params
+	params.Config = config
+	return params
 }

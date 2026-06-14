@@ -269,6 +269,21 @@ func (c *Controller) setObjs(m map[string]*model.Object) {
 	c.mu.Unlock()
 }
 
+// objKey is the unique identity used as the list's secondary text, the c.objs
+// map key, and the selection-set key. It is the full S3 key (FullPath) for
+// files/folders, or the bucket name. Using the full key instead of the short
+// display name avoids collisions between, e.g., a file "x" and a folder "x/"
+// living under the same prefix.
+func objKey(o *model.Object) string {
+	if o == nil || o.Key == nil {
+		return ""
+	}
+	if o.Ot == model.Bucket || o.FullPath == nil {
+		return *o.Key
+	}
+	return *o.FullPath
+}
+
 func (c *Controller) makeObjectMap() error {
 	var list []*model.Object
 	var err error
@@ -286,7 +301,7 @@ func (c *Controller) makeObjectMap() error {
 		return err
 	}
 	for _, obj := range list {
-		dirs[*obj.Key] = obj
+		dirs[objKey(obj)] = obj
 	}
 	c.setObjs(dirs)
 	return nil
@@ -334,39 +349,51 @@ func (c *Controller) Delete() error {
 	}
 	cur := c.getSelectedObjectName()
 
-	if val, ok := c.lookupObj(cur); ok {
-		op := path.Join(c.currentPath, cur)
-
-		confirm := c.view.NewConfirm()
-		confirm.SetText(fmt.Sprintf("Do you want to delete to %s", op)).
-			SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-				c.view.Pages.RemovePage("confirm").SwitchToPage("main")
-
-				if buttonLabel == "OK" {
-					go func() {
-						var err error
-						if val.Ot == model.Bucket {
-							err = c.model.DeleteBucket(&cur)
-						} else {
-							if val.Ot == model.Folder {
-								op = op + "/"
-							}
-							err = c.model.Delete(&op, c.currentBucket)
-						}
-						go func() {
-							if err != nil {
-								c.error(fmt.Sprintf("Failed to delete %s", cur), err, false)
-							} else {
-								c.updateList()
-								c.clearDetailsIfNoSelection()
-							}
-						}()
-
-					}()
-				}
-			})
-		c.view.Pages.AddPage("confirm", confirm, true, true)
+	val, ok := c.lookupObj(cur)
+	if !ok {
+		return nil
 	}
+
+	// op is the S3 key to delete: the bucket name for buckets, otherwise the
+	// full key (FullPath already ends with "/" for folders, which model.Delete
+	// treats as a recursive prefix delete).
+	op := *val.Key
+	if val.Ot != model.Bucket {
+		op = *val.FullPath
+	}
+
+	confirm := c.view.NewConfirm()
+	confirm.SetText(fmt.Sprintf("Do you want to delete %s", op)).
+		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+			c.view.Pages.RemovePage("confirm").SwitchToPage("main")
+
+			if buttonLabel != "OK" {
+				return
+			}
+			go func() {
+				var err error
+				if val.Ot == model.Bucket {
+					err = c.model.DeleteBucket(val.Key)
+				} else {
+					err = c.model.Delete(&op, c.currentBucket)
+				}
+				if err != nil {
+					c.error(fmt.Sprintf("Failed to delete %s", *val.Key), err, false)
+					return
+				}
+				// Drop the deleted item from the selection set so the
+				// "Selected: N" count and markers stay accurate.
+				c.mu.Lock()
+				if m := c.selScopeLocked(); m != nil {
+					delete(m, cur)
+				}
+				c.mu.Unlock()
+
+				c.updateList()
+				c.clearDetailsIfNoSelection()
+			}()
+		})
+	c.view.Pages.AddPage("confirm", confirm, true, true)
 	return nil
 }
 
@@ -413,7 +440,7 @@ func (c *Controller) Download() error {
 			continue
 		}
 
-		key := c.currentPath + name
+		key := *val.FullPath
 		objs, size, err := c.model.ResolveDownloadObjects(
 			key,
 			val.Ot == model.Folder,
@@ -495,7 +522,10 @@ func (c *Controller) Download() error {
 					}
 					lastDraw = now
 
-					percentage := float64(downloadedSize+written) / float64(totalSize) * 100
+					percentage := 0.0
+					if totalSize > 0 {
+						percentage = float64(downloadedSize+written) / float64(totalSize) * 100
+					}
 					c.view.App.QueueUpdateDraw(func() {
 						progress.SetText(fmt.Sprintf(
 							"Downloading\n%d/%d object(s)\n%s/%s (%.1f%%)\nCurrent: %s",
@@ -638,14 +668,14 @@ func (c *Controller) labelForList(o *model.Object) (primary string, secondary st
 	if o == nil || o.Key == nil {
 		return "", ""
 	}
-	raw := *o.Key
+	key := objKey(o)
 
 	selected := false
 	if c.currentBucket != nil && (o.Ot == model.File || o.Ot == model.Folder) {
-		selected = c.isSelected(raw)
+		selected = c.isSelected(key)
 	}
 
-	return coloredLabelFor(o, selected), raw
+	return coloredLabelFor(o, selected), key
 }
 
 func (c *Controller) ToggleSelectCurrent() {
@@ -798,38 +828,49 @@ func (c *Controller) findBucketByName(name string) *model.Object {
 	return nil
 }
 
+// Down enters the bucket or folder identified by name (a unique objKey: the
+// bucket name when on the buckets screen, otherwise the full folder prefix).
 func (c *Controller) Down(name string) {
+	c.view.Details.Clear()
+
 	if c.currentBucket == nil {
-		bucket := c.findBucketByName(name)
-		if bucket != nil {
+		// Entering a bucket triggers network calls (ListBuckets +
+		// GetBucketLocation); run them off the UI goroutine so the TUI
+		// doesn't freeze on a slow or unreachable endpoint.
+		go func() {
+			bucket := c.findBucketByName(name)
+			if bucket == nil {
+				return
+			}
 			c.currentBucket = bucket
 			c.model.RefreshClient(&name)
 			c.restoreNext = ".."
-		}
-	} else {
-		newDir := c.currentPath + name + "/"
-		c.currentPath = newDir
+			c.updateList()
+		}()
+		return
 	}
-	c.view.Details.Clear()
+
+	// name is the full folder prefix (already ends with "/").
+	c.currentPath = name
 	go c.updateList()
 }
 
 func (c *Controller) Up() {
 	c.view.Details.Clear()
 
-	if c.currentBucket != nil && c.currentPath != "" {
-		p := strings.TrimSuffix(c.currentPath, "/")
-		if p != "" {
-			parts := strings.Split(p, "/")
-			c.restoreNext = parts[len(parts)-1] // folder name in parent
-		}
-	}
-
 	if c.currentPath == "" {
+		// Leaving a bucket: restore the cursor onto it in the buckets list.
+		if c.currentBucket != nil {
+			c.restoreNext = *c.currentBucket.Key
+		}
 		c.currentBucket = nil
 		go c.updateList()
 		return
 	}
+
+	// Restore the cursor onto the folder we're leaving. Its unique objKey is
+	// the full prefix, which equals the current path.
+	c.restoreNext = c.currentPath
 
 	fields := strings.FieldsFunc(strings.TrimSpace(c.currentPath), u.SplitFunc)
 	if len(fields) == 0 {
@@ -931,8 +972,11 @@ func (c *Controller) EditConfigEntry() {
 		entry.IgnoreSsl = ignoreSsl
 		entry.DownloadDir = strings.TrimSpace(downloadDir)
 
-		c.params.WriteConfig()
+		err := c.params.WriteConfig()
 		c.view.Pages.RemovePage("modal")
+		if err != nil {
+			go c.error("Failed to save config", err, false)
+		}
 		c.fillConfigData()
 		c.view.List.SetCurrentItem(i)
 	})
@@ -961,7 +1005,10 @@ func (c *Controller) CopyProfile() {
 				go func() {
 					conf := *c.params.Config[i]
 					conf.Name = newName
-					c.params.CopyConfig(conf)
+					if err := c.params.CopyConfig(conf); err != nil {
+						c.error("Failed to copy config", err, false)
+						return
+					}
 					c.fillConfigData()
 					c.view.List.SetCurrentItem(len(c.params.Config) - 1)
 				}()
@@ -990,12 +1037,16 @@ func (c *Controller) create(isBucket bool) {
 			return
 		}
 
+		// restore is the new object's unique objKey, so the cursor lands on it
+		// after the refresh: the bucket name, or the full folder prefix.
+		restore := name
 		if isBucket {
 			public := cForm.GetFormItem(1).(*tview.Checkbox).IsChecked()
 			err = c.model.CreateBucket(&name, public)
 		} else {
 			key := path.Join(c.currentPath, name) + "/"
 			err = c.model.CreateFolder(&key, c.currentBucket)
+			restore = key
 		}
 
 		if err != nil {
@@ -1005,7 +1056,7 @@ func (c *Controller) create(isBucket bool) {
 		}
 
 		c.view.Pages.RemovePage("modal")
-		c.restoreNext = name
+		c.restoreNext = restore
 		go c.updateList()
 	})
 
@@ -1035,14 +1086,15 @@ func (c *Controller) CheckProfile() {
 	mCf := model.NewConfig(cf.BaseUrl, cf.Region, cf.AccessKey, cf.SecretKey, !cf.IgnoreSsl)
 	c.model = model.NewModel(mCf)
 
-	_, err := c.model.ListBuckets()
-
-	if err != nil {
-		go c.error(fmt.Sprintf("error checking profile %s", cf.Name), err, false)
-	} else {
-		go c.success(fmt.Sprintf("successfully checked profile %s", cf.Name))
-	}
-
+	// ListBuckets is a network round-trip; run it off the UI goroutine so a
+	// slow or unreachable endpoint can't freeze the TUI.
+	go func() {
+		if _, err := c.model.ListBuckets(); err != nil {
+			c.error(fmt.Sprintf("error checking profile %s", cf.Name), err, false)
+		} else {
+			c.success(fmt.Sprintf("successfully checked profile %s", cf.Name))
+		}
+	}()
 }
 
 func (c *Controller) DeleteConfigEntry() {
@@ -1059,7 +1111,10 @@ func (c *Controller) DeleteConfigEntry() {
 
 			if buttonLabel == "OK" {
 				go func() {
-					c.params.DeleteConfig(i)
+					if err := c.params.DeleteConfig(i); err != nil {
+						c.error("Failed to delete config", err, false)
+						return
+					}
 					c.fillConfigData()
 				}()
 
@@ -1083,7 +1138,7 @@ func (c *Controller) SelectAllVisible() {
 			continue
 		}
 		if obj.Ot == model.File || obj.Ot == model.Folder {
-			names = append(names, *obj.Key)
+			names = append(names, objKey(obj))
 		}
 	}
 	c.selectNames(names)
@@ -1126,23 +1181,20 @@ func (c *Controller) currentObject() (string, *model.Object, bool) {
 // Rename renames the highlighted object within its current folder
 // (server-side copy + delete; recursive for folders).
 func (c *Controller) Rename() {
-	name, obj, ok := c.currentObject()
+	_, obj, ok := c.currentObject()
 	if !ok {
 		return
 	}
 	isFolder := obj.Ot == model.Folder
+	short := *obj.Key       // display name shown in the form
+	srcKey := *obj.FullPath // full key; already ends with "/" for folders
 
-	srcKey := c.currentPath + name
-	if isFolder {
-		srcKey += "/"
-	}
-
-	form := c.view.NewInputForm("Rename", "New name", name)
+	form := c.view.NewInputForm("Rename", "New name", short)
 	form.AddButton("Save", func() {
 		newName := strings.TrimSpace(form.GetFormItem(0).(*tview.InputField).GetText())
 		c.view.Pages.RemovePage("modal")
 
-		if newName == "" || newName == name {
+		if newName == "" || newName == short {
 			return
 		}
 		if strings.Contains(newName, "/") {
@@ -1160,7 +1212,7 @@ func (c *Controller) Rename() {
 				c.error("Rename failed", err, false)
 				return
 			}
-			c.restoreNext = newName
+			c.restoreNext = dstKey // unique objKey of the renamed item
 			c.updateList()
 			go c.success("Renamed")
 		}()
@@ -1194,8 +1246,9 @@ func (c *Controller) copyOrMove(isMove bool) {
 	}
 
 	type item struct {
-		name     string
-		isFolder bool
+		shortName string // display name, appended to the destination prefix
+		srcKey    string // full source key (ends with "/" for folders)
+		isFolder  bool
 	}
 	var items []item
 	for _, n := range names {
@@ -1203,7 +1256,11 @@ func (c *Controller) copyOrMove(isMove bool) {
 		if !ok || (o.Ot != model.File && o.Ot != model.Folder) {
 			continue
 		}
-		items = append(items, item{n, o.Ot == model.Folder})
+		items = append(items, item{
+			shortName: *o.Key,
+			srcKey:    *o.FullPath,
+			isFolder:  o.Ot == model.Folder,
+		})
 	}
 	if len(items) == 0 {
 		return
@@ -1249,17 +1306,16 @@ func (c *Controller) copyOrMove(isMove bool) {
 				default:
 				}
 
-				srcKey := srcPrefix + it.name
-				dstKey := dstPrefix + it.name
+				srcKey := it.srcKey
+				dstKey := dstPrefix + it.shortName
 				if it.isFolder {
-					srcKey += "/"
 					dstKey += "/"
 				}
 
 				cb := func(done, total int, key string) {
 					c.view.App.QueueUpdateDraw(func() {
 						progress.SetText(fmt.Sprintf("%s: %s\n%d/%d object(s)\n%s",
-							title, it.name, done, total, key))
+							title, it.shortName, done, total, key))
 					})
 				}
 
@@ -1270,7 +1326,7 @@ func (c *Controller) copyOrMove(isMove bool) {
 					_, err = c.model.CopyKeys(ctx, c.currentBucket, srcKey, dstKey, it.isFolder, cb)
 				}
 				if err != nil {
-					failed = append(failed, fmt.Sprintf("%s: %v", it.name, err))
+					failed = append(failed, fmt.Sprintf("%s: %v", it.shortName, err))
 					continue
 				}
 				okCount++
@@ -1395,10 +1451,7 @@ func (c *Controller) ShowSummaryModal() {
 		cur := c.getSelectedObjectName()
 		if cur != "" {
 			if val, ok := c.lookupObj(cur); ok && val != nil && val.Ot == model.Folder {
-				prefix = path.Join(c.currentPath, cur)
-				if prefix != "" && !strings.HasSuffix(prefix, "/") {
-					prefix += "/"
-				}
+				prefix = *val.FullPath // full prefix, already ends with "/"
 			}
 		}
 	}
@@ -1754,6 +1807,15 @@ func (c *Controller) Duck(url string, region *string, acc string, sec string, ss
 
 func (c *Controller) Run() error {
 	c.Profiles()
+	// A missing/corrupt config no longer crashes startup; surface it as a
+	// modal over the (empty) profiles screen so the user can recover.
+	if c.params.LoadErr != nil {
+		errMsg := c.view.NewErrorMessageQ("Config error", c.params.LoadErr.Error())
+		errMsg.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
+			c.view.Pages.RemovePage("modal")
+		})
+		c.view.Pages.AddPage("modal", c.view.ModalEdit(errMsg, 8, 3), true, true)
+	}
 	return c.view.App.Run()
 }
 
@@ -2065,7 +2127,10 @@ func (c *Controller) Upload(localPath string) error {
 			}
 			lastDraw = now
 
-			percentage := float64(n) / float64(total) * 100
+			percentage := 0.0
+			if total > 0 {
+				percentage = float64(n) / float64(total) * 100
+			}
 			c.view.App.QueueUpdateDraw(func() {
 				progress.SetText(fmt.Sprintf(
 					"Uploading\n%d/%d file(s)\n%s/%s (%.1f%%)\nLast: %s\n-> %s",
