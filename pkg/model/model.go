@@ -13,6 +13,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -46,11 +47,73 @@ type UploadTarget struct {
 }
 
 type Config struct {
-	Url       string
-	Region    *string
-	AccessKey string
-	SecretKey string
-	SSl       bool
+	Url            string
+	Region         *string
+	AccessKey      string
+	SecretKey      string
+	SSl            bool
+	MaxBytesPerSec int64 // 0 = unlimited
+}
+
+// rateLimiter is a token-bucket throttle shared across all transfer workers of
+// a Model, so uploads and the parallel download pool honor one global cap. A
+// nil *rateLimiter is unlimited (the zero-config case), making the call sites
+// free when throttling is off.
+type rateLimiter struct {
+	mu     sync.Mutex
+	rate   float64 // bytes/sec; <= 0 means unlimited
+	tokens float64
+	last   time.Time
+}
+
+func newRateLimiter(bytesPerSec int64) *rateLimiter {
+	if bytesPerSec <= 0 {
+		return nil
+	}
+	return &rateLimiter{
+		rate:   float64(bytesPerSec),
+		tokens: float64(bytesPerSec), // start with a 1s burst allowance
+		last:   time.Now(),
+	}
+}
+
+// throttleStep is the pure core of the token bucket: given the rate (bytes/sec),
+// current token balance, time elapsed since the last refill, and the number of
+// bytes about to move, it returns how long to sleep and the new token balance.
+// A non-positive rate is unlimited. Tokens may go negative (debt paid off by
+// the next refill), which is what bounds the long-run rate without over-
+// crediting the time spent sleeping.
+func throttleStep(rate, tokens float64, elapsed time.Duration, n int) (sleep time.Duration, newTokens float64) {
+	if rate <= 0 {
+		return 0, tokens
+	}
+	tokens += rate * elapsed.Seconds()
+	if tokens > rate { // burst cap of one second's worth
+		tokens = rate
+	}
+	tokens -= float64(n)
+	if tokens < 0 {
+		sleep = time.Duration((-tokens / rate) * float64(time.Second))
+	}
+	return sleep, tokens
+}
+
+// wait blocks until n bytes may be transferred under the configured rate. Safe
+// for concurrent use; a nil limiter returns immediately (unlimited).
+func (l *rateLimiter) wait(n int) {
+	if l == nil || n <= 0 {
+		return
+	}
+	l.mu.Lock()
+	now := time.Now()
+	elapsed := now.Sub(l.last)
+	l.last = now
+	sleep, tokens := throttleStep(l.rate, l.tokens, elapsed, n)
+	l.tokens = tokens
+	l.mu.Unlock()
+	if sleep > 0 {
+		time.Sleep(sleep)
+	}
 }
 
 type DownloadTarget struct {
@@ -73,6 +136,7 @@ type Model struct {
 	Client     *s3.Client
 	Downloader *s3m.Downloader
 	Cf         *Config
+	Limiter    *rateLimiter
 }
 
 type progressReader struct {
@@ -80,12 +144,14 @@ type progressReader struct {
 	written int64
 	total   int64
 	update  func(written int64, total int64)
+	limiter *rateLimiter
 }
 
 func (pr *progressReader) Read(p []byte) (int, error) {
 	n, err := pr.r.Read(p)
 	pr.written += int64(n)
 	pr.update(pr.written, pr.total)
+	pr.limiter.wait(n)
 	return n, err
 }
 
@@ -94,6 +160,7 @@ type progressWriterAt struct {
 	written    int64
 	total      int64
 	updateFunc func(written int64, total int64)
+	limiter    *rateLimiter
 }
 
 func (pwa *progressWriterAt) WriteAt(p []byte, off int64) (int, error) {
@@ -102,6 +169,7 @@ func (pwa *progressWriterAt) WriteAt(p []byte, off int64) (int, error) {
 	if pwa.updateFunc != nil {
 		pwa.updateFunc(w, pwa.total)
 	}
+	pwa.limiter.wait(n)
 	return n, err
 }
 
@@ -112,13 +180,14 @@ func GetDownloader(client *s3.Client) *s3m.Downloader {
 	return d
 }
 
-func NewConfig(url string, region *string, accKey string, secKey string, ssl bool) Config {
+func NewConfig(url string, region *string, accKey string, secKey string, ssl bool, maxBytesPerSec int64) Config {
 	return Config{
-		url,
-		region,
-		accKey,
-		secKey,
-		ssl,
+		Url:            url,
+		Region:         region,
+		AccessKey:      accKey,
+		SecretKey:      secKey,
+		SSl:            ssl,
+		MaxBytesPerSec: maxBytesPerSec,
 	}
 }
 
@@ -173,6 +242,7 @@ func NewModel(cf Config) *Model {
 		Client:     client,
 		Downloader: GetDownloader(client),
 		Cf:         &cf,
+		Limiter:    newRateLimiter(cf.MaxBytesPerSec),
 	}
 	return &m
 }
@@ -265,6 +335,7 @@ func (m *Model) Download(
 				progressCb(written, total, *object.Key)
 			}
 		},
+		limiter: m.Limiter,
 	}
 
 	n, err := m.Downloader.Download(ctx, writerAt, &s3.GetObjectInput{
@@ -275,6 +346,12 @@ func (m *Model) Download(
 	if ctx.Err() != nil {
 		os.Remove(downloadPath)
 		return 0, ctx.Err()
+	}
+	if err != nil {
+		// Remove the partial/empty file created by os.Create above; otherwise a
+		// later retry is permanently blocked by the "file exists" stat guard.
+		os.Remove(downloadPath)
+		return n, err
 	}
 
 	return n, err
@@ -287,15 +364,20 @@ func (m *Model) GetBucketLocation(name *string) (*string, error) {
 			Bucket: name,
 		},
 	)
-	location := string(bl.LocationConstraint)
-	if location == "" {
-		loc := "us-east-1"
-		location = loc
+	loc := "us-east-1"
+	if err != nil || bl == nil {
+		return &loc, err
 	}
-	return &location, err
+	if location := string(bl.LocationConstraint); location != "" {
+		loc = location
+	}
+	return &loc, nil
 }
 
 func (m *Model) List(path string, bucket *Object) ([]*Object, error) {
+	if bucket == nil || bucket.Key == nil {
+		return nil, fmt.Errorf("bucket is nil")
+	}
 	objs := make([]*Object, 0)
 	input := &s3.ListObjectsV2Input{
 		Bucket:    aws.String(*bucket.Key),
@@ -343,15 +425,20 @@ func (m *Model) List(path string, bucket *Object) ([]*Object, error) {
 				continue
 			}
 			appKey := fields[len(fields)-1]
-			ts := strings.Trim(*o.ETag, "\"")
+			ts := strings.Trim(aws.ToString(o.ETag), "\"")
 			size := o.Size
 
+			var sc *string
+			if o.StorageClass != "" {
+				s := string(o.StorageClass)
+				sc = &s
+			}
 			ko := &Object{
 				&appKey,
 				File,
 				&ts,
 				&size,
-				nil,
+				sc,
 				o.LastModified,
 				o.Key,
 			}
@@ -373,15 +460,15 @@ func (m *Model) ListBuckets() ([]*Object, error) {
 	}
 
 	for _, b := range result.Buckets {
-		sv := aws.String(*b.Name)
-		td := aws.Time(*b.CreationDate)
+		// S3-compatible endpoints may omit Name/CreationDate; avoid deref panics.
+		name := aws.ToString(b.Name)
 		ko := &Object{
-			Key:          sv,
+			Key:          &name,
 			Ot:           Bucket,
 			Etag:         nil,
 			Size:         nil,
 			StorageClass: nil,
-			LastModified: td,
+			LastModified: b.CreationDate,
 		}
 		objs = append(objs, ko)
 	}
@@ -452,6 +539,94 @@ func (m *Model) DeleteBucket(name *string) error {
 	if err != nil {
 		log.Printf("Couldn't delete bucket %v because of %v\n", *name, err)
 	}
+	return err
+}
+
+// MultipartUpload is one in-progress (incomplete) multipart upload.
+type MultipartUpload struct {
+	Key       string
+	UploadID  string
+	Initiated *time.Time
+}
+
+// ListMultipartUploads returns the bucket's in-progress multipart uploads —
+// orphaned parts from interrupted uploads that keep costing storage until
+// aborted. Returns up to the first page (1000) of uploads, which is ample for
+// cleaning up orphans.
+func (m *Model) ListMultipartUploads(bucket *Object) ([]MultipartUpload, error) {
+	if bucket == nil || bucket.Key == nil {
+		return nil, fmt.Errorf("bucket is nil")
+	}
+	out, err := m.Client.ListMultipartUploads(context.TODO(), &s3.ListMultipartUploadsInput{
+		Bucket: aws.String(*bucket.Key),
+	})
+	if err != nil {
+		return nil, err
+	}
+	var ups []MultipartUpload
+	for _, u := range out.Uploads {
+		ups = append(ups, MultipartUpload{
+			Key:       aws.ToString(u.Key),
+			UploadID:  aws.ToString(u.UploadId),
+			Initiated: u.Initiated,
+		})
+	}
+	return ups, nil
+}
+
+// BucketConfigInfo is a read-only snapshot of a bucket's configuration.
+type BucketConfigInfo struct {
+	Region     string
+	Versioning string // "Enabled" / "Suspended" / "off"
+	Encryption string // e.g. "AES256" / "aws:kms" / "none"
+	ObjectLock string // "on" / "off"
+}
+
+// BucketConfig gathers a bucket's versioning, default encryption, object-lock,
+// and region. Optional features that the endpoint doesn't support (common on
+// MinIO/Ceph) error out and are reported as their "off"/"none" default rather
+// than failing the whole call.
+func (m *Model) BucketConfig(bucket *Object) (BucketConfigInfo, error) {
+	if bucket == nil || bucket.Key == nil {
+		return BucketConfigInfo{}, fmt.Errorf("bucket is nil")
+	}
+	name := aws.String(*bucket.Key)
+	ctx := context.TODO()
+	info := BucketConfigInfo{Region: "us-east-1", Versioning: "off", Encryption: "none", ObjectLock: "off"}
+
+	if loc, err := m.GetBucketLocation(bucket.Key); err == nil && loc != nil && *loc != "" {
+		info.Region = *loc
+	}
+	if v, err := m.Client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: name}); err == nil {
+		if s := string(v.Status); s != "" {
+			info.Versioning = s
+		}
+	}
+	if e, err := m.Client.GetBucketEncryption(ctx, &s3.GetBucketEncryptionInput{Bucket: name}); err == nil {
+		if e.ServerSideEncryptionConfiguration != nil && len(e.ServerSideEncryptionConfiguration.Rules) > 0 {
+			if d := e.ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault; d != nil {
+				info.Encryption = string(d.SSEAlgorithm)
+			}
+		}
+	}
+	if l, err := m.Client.GetObjectLockConfiguration(ctx, &s3.GetObjectLockConfigurationInput{Bucket: name}); err == nil {
+		if l.ObjectLockConfiguration != nil && string(l.ObjectLockConfiguration.ObjectLockEnabled) == "Enabled" {
+			info.ObjectLock = "on"
+		}
+	}
+	return info, nil
+}
+
+// AbortMultipartUpload discards one incomplete multipart upload and its parts.
+func (m *Model) AbortMultipartUpload(bucket *Object, key, uploadID string) error {
+	if bucket == nil || bucket.Key == nil {
+		return fmt.Errorf("bucket is nil")
+	}
+	_, err := m.Client.AbortMultipartUpload(context.TODO(), &s3.AbortMultipartUploadInput{
+		Bucket:   aws.String(*bucket.Key),
+		Key:      aws.String(key),
+		UploadId: aws.String(uploadID),
+	})
 	return err
 }
 
@@ -620,10 +795,10 @@ func (m *Model) Upload(
 					progressCb(uploadedTotal+written, totalSize, i+1, len(files), fpath, s3Key)
 				}
 			},
+			limiter: m.Limiter,
 		}
 
 		uploadCtx, cancel := context.WithCancel(ctx)
-		defer cancel()
 
 		_, err = uploader.Upload(uploadCtx, &s3.PutObjectInput{
 			Bucket: aws.String(*bucket.Key),
@@ -631,6 +806,7 @@ func (m *Model) Upload(
 			Body:   reader,
 		})
 		fp.Close()
+		cancel() // release per-file context immediately, not at Upload() return
 
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
@@ -804,6 +980,7 @@ func (m *Model) DownloadTarget(
 				progressCb(written, total, t.Key)
 			}
 		},
+		limiter: m.Limiter,
 	}
 
 	n, err := m.Downloader.Download(ctx, writerAt, &s3.GetObjectInput{
@@ -814,7 +991,44 @@ func (m *Model) DownloadTarget(
 		_ = os.Remove(downloadPath)
 		return 0, ctx.Err()
 	}
+	if err != nil {
+		// Drop the partial/empty file so a retry isn't blocked by the
+		// "file exists" stat guard above.
+		_ = os.Remove(downloadPath)
+		return n, err
+	}
 	return n, err
+}
+
+// PresignMaxTTL is the maximum lifetime AWS SigV4 allows for a presigned URL.
+const PresignMaxTTL = 7 * 24 * time.Hour
+
+// PresignGetURL returns a time-limited presigned GET URL for an object, so a
+// private object can be shared without making the bucket public. ttl is capped
+// at PresignMaxTTL (the SigV4 ceiling).
+func (m *Model) PresignGetURL(bucket *Object, key string, ttl time.Duration) (string, error) {
+	if bucket == nil || bucket.Key == nil {
+		return "", fmt.Errorf("bucket is nil")
+	}
+	if key == "" {
+		return "", fmt.Errorf("key is empty")
+	}
+	if ttl <= 0 {
+		return "", fmt.Errorf("ttl must be positive")
+	}
+	if ttl > PresignMaxTTL {
+		ttl = PresignMaxTTL
+	}
+
+	ps := s3.NewPresignClient(m.Client)
+	req, err := ps.PresignGetObject(context.TODO(), &s3.GetObjectInput{
+		Bucket: aws.String(*bucket.Key),
+		Key:    aws.String(key),
+	}, s3.WithPresignExpires(ttl))
+	if err != nil {
+		return "", err
+	}
+	return req.URL, nil
 }
 
 // copySource builds a URL-encoded CopySource value ("bucket/key"); the AWS
@@ -825,38 +1039,77 @@ func copySource(bucket, key string) string {
 	return strings.TrimPrefix(u.EscapedPath(), "/")
 }
 
-// CopyObject performs a single server-side object copy.
-func (m *Model) CopyObject(bucket *Object, srcKey, dstKey string) error {
-	if bucket == nil || bucket.Key == nil {
+// planFolderCopy normalizes source/destination folder prefixes (each terminated
+// with "/") and validates them. The self-overlap guards — copying a folder onto
+// itself or into its own subtree — only make sense within a single bucket, so
+// sameBucket=false relaxes them (the same prefix in another bucket is fine).
+func planFolderCopy(sameBucket bool, srcKey, dstKey string) (src, dst string, err error) {
+	src = srcKey
+	if !strings.HasSuffix(src, "/") {
+		src += "/"
+	}
+	dst = dstKey
+	if !strings.HasSuffix(dst, "/") {
+		dst += "/"
+	}
+	if sameBucket {
+		if dst == src {
+			return "", "", fmt.Errorf("source and destination are the same")
+		}
+		if strings.HasPrefix(dst, src) {
+			return "", "", fmt.Errorf("cannot copy/move a folder into itself")
+		}
+	}
+	return src, dst, nil
+}
+
+// remapKey maps a source object key living under prefix src to its destination
+// key under prefix dst (both prefixes end with "/").
+func remapKey(src, dst, key string) string {
+	return dst + strings.TrimPrefix(key, src)
+}
+
+// CopyObject performs a single server-side object copy. Source and destination
+// may live in different buckets; the copy is issued against the destination
+// bucket with the source expressed as CopySource. (Both must be reachable
+// through the same endpoint — see CopyKeys.)
+func (m *Model) CopyObject(srcBucket, dstBucket *Object, srcKey, dstKey string) error {
+	if srcBucket == nil || srcBucket.Key == nil || dstBucket == nil || dstBucket.Key == nil {
 		return fmt.Errorf("bucket is nil")
 	}
-	if srcKey == dstKey {
+	if *srcBucket.Key == *dstBucket.Key && srcKey == dstKey {
 		return fmt.Errorf("source and destination are the same")
 	}
 	_, err := m.Client.CopyObject(context.TODO(), &s3.CopyObjectInput{
-		Bucket:     aws.String(*bucket.Key),
-		CopySource: aws.String(copySource(*bucket.Key, srcKey)),
+		Bucket:     aws.String(*dstBucket.Key),
+		CopySource: aws.String(copySource(*srcBucket.Key, srcKey)),
 		Key:        aws.String(dstKey),
 	})
 	return err
 }
 
-// CopyKeys copies srcKey to dstKey. When isFolder is true it recursively
-// copies every object under srcKey/ into dstKey/. Returns the number of
-// objects copied.
+// CopyKeys copies srcKey (in srcBucket) to dstKey (in dstBucket). When isFolder
+// is true it recursively copies every object under srcKey/ into dstKey/. Returns
+// the number of objects copied.
+//
+// Cross-bucket copy uses the server-side CopyObject and therefore assumes both
+// buckets are reachable through the currently configured endpoint (always true
+// for a single S3-compatible endpoint such as MinIO/Ceph, and for same-region
+// AWS buckets). Copying between AWS buckets in different regions is not handled
+// here.
 func (m *Model) CopyKeys(
 	ctx context.Context,
-	bucket *Object,
+	srcBucket, dstBucket *Object,
 	srcKey, dstKey string,
 	isFolder bool,
 	progressCb func(done, total int, key string),
 ) (int, error) {
-	if bucket == nil || bucket.Key == nil {
+	if srcBucket == nil || srcBucket.Key == nil || dstBucket == nil || dstBucket.Key == nil {
 		return 0, fmt.Errorf("bucket is nil")
 	}
 
 	if !isFolder {
-		if err := m.CopyObject(bucket, srcKey, dstKey); err != nil {
+		if err := m.CopyObject(srcBucket, dstBucket, srcKey, dstKey); err != nil {
 			return 0, err
 		}
 		if progressCb != nil {
@@ -865,22 +1118,13 @@ func (m *Model) CopyKeys(
 		return 1, nil
 	}
 
-	src := srcKey
-	if !strings.HasSuffix(src, "/") {
-		src += "/"
-	}
-	dst := dstKey
-	if !strings.HasSuffix(dst, "/") {
-		dst += "/"
-	}
-	if dst == src {
-		return 0, fmt.Errorf("source and destination are the same")
-	}
-	if strings.HasPrefix(dst, src) {
-		return 0, fmt.Errorf("cannot copy/move a folder into itself")
+	sameBucket := *srcBucket.Key == *dstBucket.Key
+	src, dst, err := planFolderCopy(sameBucket, srcKey, dstKey)
+	if err != nil {
+		return 0, err
 	}
 
-	objs, err := m.ListObjects(src, bucket)
+	objs, err := m.ListObjects(src, srcBucket)
 	if err != nil {
 		return 0, err
 	}
@@ -896,8 +1140,8 @@ func (m *Model) CopyKeys(
 			return done, ctx.Err()
 		default:
 		}
-		newKey := dst + strings.TrimPrefix(*o.Key, src)
-		if err := m.CopyObject(bucket, *o.Key, newKey); err != nil {
+		newKey := remapKey(src, dst, *o.Key)
+		if err := m.CopyObject(srcBucket, dstBucket, *o.Key, newKey); err != nil {
 			return done, fmt.Errorf("copy %s: %w", *o.Key, err)
 		}
 		done++
@@ -908,16 +1152,17 @@ func (m *Model) CopyKeys(
 	return done, nil
 }
 
-// MoveKeys copies srcKey to dstKey and then deletes the source. Rename is a
-// move whose destination shares the source prefix.
+// MoveKeys copies srcKey (in srcBucket) to dstKey (in dstBucket) and then
+// deletes the source. Rename is a same-bucket move whose destination shares the
+// source prefix.
 func (m *Model) MoveKeys(
 	ctx context.Context,
-	bucket *Object,
+	srcBucket, dstBucket *Object,
 	srcKey, dstKey string,
 	isFolder bool,
 	progressCb func(done, total int, key string),
 ) (int, error) {
-	n, err := m.CopyKeys(ctx, bucket, srcKey, dstKey, isFolder, progressCb)
+	n, err := m.CopyKeys(ctx, srcBucket, dstBucket, srcKey, dstKey, isFolder, progressCb)
 	if err != nil {
 		return n, err
 	}
@@ -926,7 +1171,7 @@ func (m *Model) MoveKeys(
 	if isFolder && !strings.HasSuffix(delKey, "/") {
 		delKey += "/"
 	}
-	if err := m.Delete(&delKey, bucket); err != nil {
+	if err := m.Delete(&delKey, srcBucket); err != nil {
 		return n, fmt.Errorf("copied ok, but failed to delete source: %w", err)
 	}
 	return n, nil

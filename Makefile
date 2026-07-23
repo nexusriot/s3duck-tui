@@ -24,7 +24,7 @@
 APP        := s3duck-tui
 PKG        := ./cmd/s3duck-tui
 GO         ?= go
-VERSION    ?= 0.1.3
+VERSION    ?= 0.1.8
 LDFLAGS    ?= -s -w
 BUILD_DIR  := build
 DIST_DIR   := dist

@@ -9,29 +9,85 @@ import (
 	"github.com/rivo/tview"
 )
 
-const versionText = "S3Duck 🦆 TUI v.0.1.3"
+const versionText = "S3Duck 🦆 TUI v.0.1.8"
 
 // View ...
 type View struct {
 	App       *tview.Application
 	Frame     *tview.Frame
 	Pages     *tview.Pages
-	List      *tview.List
+	List      *tview.List       // the active pane's list (repointed on pane switch)
+	Filter    *tview.InputField // the active pane's filter
 	Details   *tview.TextView
 	ModalEdit func(p tview.Primitive, width, height int) tview.Primitive
+
+	// Dual-pane widgets. Pane i always owns lists[i]/filters[i]/cols[i]; the
+	// active pane's widgets are mirrored into List/Filter. main is the root
+	// content flex, rebuilt when toggling single/dual layout.
+	lists   [2]*tview.List
+	filters [2]*tview.InputField
+	cols    [2]*tview.Flex
+	main    *tview.Flex
+}
+
+// newPaneColumn builds one browser pane: a bordered list above a one-line
+// filter box.
+func newPaneColumn() (*tview.List, *tview.InputField, *tview.Flex) {
+	list := tview.NewList().ShowSecondaryText(false)
+	list.SetBorder(true).SetTitleAlign(tview.AlignLeft)
+	list.SetSelectedBackgroundColor(tcell.ColorBlue)
+	list.SetSelectedTextColor(tcell.ColorWhite)
+
+	filter := tview.NewInputField()
+	filter.SetLabel(" Filter: ")
+	filter.SetPlaceholder("press / to filter, Enter to keep, Esc to clear")
+	filter.SetFieldWidth(0)
+	filter.SetFieldBackgroundColor(tcell.ColorBlack)
+	filter.SetPlaceholderTextColor(tcell.ColorGray)
+
+	col := tview.NewFlex().SetDirection(tview.FlexRow)
+	col.AddItem(list, 0, 1, true)
+	col.AddItem(filter, 1, 0, false)
+	return list, filter, col
+}
+
+// PaneList / PaneFilter expose a specific pane's widgets to the controller.
+func (v *View) PaneList(i int) *tview.List         { return v.lists[i] }
+func (v *View) PaneFilter(i int) *tview.InputField { return v.filters[i] }
+
+// ShowSinglePane lays out the primary pane beside the details panel (the
+// classic layout).
+func (v *View) ShowSinglePane() {
+	v.main.Clear()
+	v.main.AddItem(v.cols[0], 0, 4, true)
+	v.main.AddItem(v.Details, 0, 3, false)
+	v.lists[0].SetBorderColor(tcell.ColorWhite)
+}
+
+// ShowDualPane lays out the two panes side by side (details hidden), MC-style.
+func (v *View) ShowDualPane() {
+	v.main.Clear()
+	v.main.AddItem(v.cols[0], 0, 1, true)
+	v.main.AddItem(v.cols[1], 0, 1, false)
+}
+
+// SetActivePane highlights the active pane's border (dual-pane only).
+func (v *View) SetActivePane(active int) {
+	for i, l := range v.lists {
+		if i == active {
+			l.SetBorderColor(tcell.ColorGreen)
+		} else {
+			l.SetBorderColor(tcell.ColorGray)
+		}
+	}
 }
 
 // NewView ...
 func NewView() *View {
 	app := tview.NewApplication()
-	list := tview.NewList().
-		ShowSecondaryText(false)
-	list.SetBorder(true).
-		SetTitleAlign(tview.AlignLeft)
 
-	// Selection style: mid-blue background with white text to avoid clashes on light/dark terms
-	list.SetSelectedBackgroundColor(tcell.ColorBlue)
-	list.SetSelectedTextColor(tcell.ColorWhite)
+	list0, filter0, col0 := newPaneColumn()
+	list1, filter1, col1 := newPaneColumn()
 
 	tv := tview.NewTextView().
 		SetDynamicColors(true).
@@ -42,8 +98,9 @@ func NewView() *View {
 		})
 	tv.SetBorder(true)
 
+	// Start in single-pane layout: primary pane beside the details panel.
 	main := tview.NewFlex()
-	main.AddItem(list, 0, 4, true)
+	main.AddItem(col0, 0, 4, true)
 	main.AddItem(tv, 0, 3, false)
 
 	pages := tview.NewPages().
@@ -63,12 +120,17 @@ func NewView() *View {
 	app.SetRoot(frame, true)
 
 	v := View{
-		app,
-		frame,
-		pages,
-		list,
-		tv,
-		modal,
+		App:       app,
+		Frame:     frame,
+		Pages:     pages,
+		List:      list0,
+		Filter:    filter0,
+		Details:   tv,
+		ModalEdit: modal,
+		lists:     [2]*tview.List{list0, list1},
+		filters:   [2]*tview.InputField{filter0, filter1},
+		cols:      [2]*tview.Flex{col0, col1},
+		main:      main,
 	}
 	return &v
 }
@@ -106,6 +168,7 @@ func (v *View) NewCreateProfileForm(header string) *tview.Form {
 	form.AddPasswordField("Secret key", "", 52, '*', nil)
 	form.AddInputField("Download dir", "", 52, nil, nil)
 	form.AddCheckbox("Disable ssl check", false, func(bool) {})
+	form.AddInputField("Max bytes/sec (0=unltd)", "", 52, nil, nil)
 	form.SetBorder(true)
 	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
@@ -118,11 +181,74 @@ func (v *View) NewCreateProfileForm(header string) *tview.Form {
 }
 
 // NewInputForm builds a single-field form pre-filled with value, used by
-// rename / copy / move. Esc closes the "modal" page.
+// rename. Esc closes the "modal" page.
 func (v *View) NewInputForm(header, label, value string) *tview.Form {
 	form := tview.NewForm()
 	form.SetTitle(header)
 	form.AddInputField(label, value, 50, nil, nil)
+	form.SetBorder(true)
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEsc {
+			v.Pages.RemovePage("modal")
+		}
+		return event
+	})
+	return form
+}
+
+// NewSearchForm builds the recursive-search form: a query input (item 0) and an
+// "All buckets" checkbox (item 1). Esc closes the "modal" page.
+func (v *View) NewSearchForm(header string) *tview.Form {
+	form := tview.NewForm()
+	form.SetTitle(header)
+	form.AddInputField("Query", "", 50, nil, nil)
+	form.AddCheckbox("All buckets", false, nil)
+	form.SetBorder(true)
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEsc {
+			v.Pages.RemovePage("modal")
+		}
+		return event
+	})
+	return form
+}
+
+// NewBatchRenameForm builds the batch/pattern rename form: a pattern template
+// (item 0) with {name}/{ext}/{n} tokens, and an optional find (item 1) /
+// replacement (item 2) pair applied to the name. Esc closes the "modal" page.
+func (v *View) NewBatchRenameForm(header string) *tview.Form {
+	form := tview.NewForm()
+	form.SetTitle(header)
+	form.AddInputField("Pattern ({name} {ext} {n})", "{name}{ext}", 50, nil, nil)
+	form.AddInputField("Find (optional)", "", 50, nil, nil)
+	form.AddInputField("Replace with", "", 50, nil, nil)
+	form.SetBorder(true)
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEsc {
+			v.Pages.RemovePage("modal")
+		}
+		return event
+	})
+	return form
+}
+
+// NewCopyMoveForm builds the copy/move destination form: a bucket dropdown
+// (item 0, defaulting to currentBucket) plus a destination-prefix input
+// (item 1). Buckets other than the current one make the transfer cross-bucket.
+// Esc closes the "modal" page.
+func (v *View) NewCopyMoveForm(header string, buckets []string, currentBucket, prefix string) *tview.Form {
+	initial := 0
+	for i, b := range buckets {
+		if b == currentBucket {
+			initial = i
+			break
+		}
+	}
+
+	form := tview.NewForm()
+	form.SetTitle(header)
+	form.AddDropDown("Destination bucket", buckets, initial, nil)
+	form.AddInputField("Destination prefix", prefix, 50, nil, nil)
 	form.SetBorder(true)
 	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEsc {
@@ -196,16 +322,29 @@ func (v *View) HotkeysModal(profiles bool) *tview.TextView {
 		  [↓,↑]Down/Up 
 		  Enter         Open folder / select
 		  Backspace     Up ([..])
-          Ctrl+P        Show Profiles
+          [ / ]         History back / forward (also Alt+left/right)
+        Ctrl+O        Toggle dual-pane
+        Tab           Switch active pane (dual-pane)
+        Ctrl+B        Bookmarks (go / add / remove)
+        Ctrl+K        Command palette
+        Ctrl+P        Show Profiles
 
 		[::b]Actions[::-]
 		  Ctrl+N        Create bucket / folder
 		  Ctrl+D        Download file/folder (for files and folders)
-          Ctrl+R        Rename selected object (same folder)
-          Ctrl+Y        Copy selected/marked to a destination prefix
-          Ctrl+T        Move selected/marked to a destination prefix
+          Ctrl+R        Rename (pattern rename when >1 marked)
+          Ctrl+Y        Copy selected/marked to a destination bucket/prefix
+          Ctrl+T        Move selected/marked to a destination bucket/prefix
           Ctrl+G        Bucket/folder summary
+          Ctrl+L        File properties (size, ETag, link)
+          Ctrl+W        Copy presigned (time-limited) share link
           Ctrl+U        Open local file manager (for upload)
+          y / x / p     Clipboard: copy / cut / paste objects
+          u             Undo last move/rename
+          t             Transfers panel (background jobs)
+          /             Filter the current listing (live)
+          Ctrl+F        Recursive search (checkbox: all buckets)
+          Ctrl+K        Palette: abort uploads, bucket config, log…
           Space			Select object for download
           Ctrl+S        Select all objects for download
           Ctrl+X        Unselect all objects for download

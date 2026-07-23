@@ -35,6 +35,18 @@ type Config struct {
 	// DownloadDir is the destination for downloads. Empty -> ~/Downloads.
 	// A leading "~" is expanded to the user's home directory.
 	DownloadDir string `json:"download_dir,omitempty"`
+	// MaxBytesPerSec caps transfer throughput (upload + download) for this
+	// profile. 0 (the default) means unlimited.
+	MaxBytesPerSec int64 `json:"max_bytes_per_sec,omitempty"`
+	// Bookmarks are saved bucket+prefix locations for this profile.
+	Bookmarks []Bookmark `json:"bookmarks,omitempty"`
+}
+
+// Bookmark is a saved location within a profile's storage.
+type Bookmark struct {
+	Name   string `json:"name"`
+	Bucket string `json:"bucket"`
+	Prefix string `json:"prefix"`
 }
 
 func (p *Params) WriteConfig() error {
