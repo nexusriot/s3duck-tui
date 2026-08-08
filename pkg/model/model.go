@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	s3m "github.com/aws/aws-sdk-go-v2/feature/s3/manager"
@@ -28,6 +29,9 @@ import (
 	u "github.com/nexusriot/s3duck-tui/pkg/utils"
 )
 
+// ErrFileExists is returned (wrapped, with the path) when a download would
+// overwrite an existing local file. Callers that want to replace the file —
+// the overwrite prompt, sync — must remove it first; errors.Is identifies it.
 var ErrFileExists = errors.New("file exists")
 
 type optsFunc = func(*config.LoadOptions) error
@@ -47,10 +51,13 @@ type UploadTarget struct {
 }
 
 type Config struct {
-	Url            string
-	Region         *string
-	AccessKey      string
-	SecretKey      string
+	Url       string
+	Region    *string
+	AccessKey string
+	SecretKey string
+	// SessionToken is the STS session token for temporary credentials
+	// (assume-role, SSO, MFA). Empty for long-lived key pairs.
+	SessionToken   string
 	SSl            bool
 	MaxBytesPerSec int64 // 0 = unlimited
 }
@@ -173,6 +180,34 @@ func (pwa *progressWriterAt) WriteAt(p []byte, off int64) (int, error) {
 	return n, err
 }
 
+// uploadMaxAttempts is the total number of tries (1 initial + 2 retries) the
+// uploader makes per part before giving up.
+const uploadMaxAttempts = 3
+
+// uploadRetryer is the retry policy for uploads. Uploads previously ran with
+// aws.NopRetryer{}, so a single transient network error failed the whole
+// transfer — painful for a multi-file upload and worse for a sync run pushing
+// hundreds of objects. The SDK's standard retryer backs off on throttling and
+// transient 5xx/connection errors; retries are safe here because every part is
+// re-read from the file, not from a consumed buffer.
+func uploadRetryer() aws.Retryer {
+	return retry.NewStandard(func(o *retry.StandardOptions) {
+		o.MaxAttempts = uploadMaxAttempts
+	})
+}
+
+// newUploader builds the shared multipart uploader used by both Upload and
+// UploadFile, so the two paths can't drift on part size or retry policy.
+func newUploader(client *s3.Client) *s3m.Uploader {
+	return s3m.NewUploader(client, func(u *s3m.Uploader) {
+		u.PartSize = 5 * 1024 * 1024
+		u.LeavePartsOnError = false
+		u.ClientOptions = append(u.ClientOptions, func(o *s3.Options) {
+			o.Retryer = uploadRetryer()
+		})
+	})
+}
+
 func GetDownloader(client *s3.Client) *s3m.Downloader {
 	d := s3m.NewDownloader(client, func(d *s3m.Downloader) {
 		d.BufferProvider = s3m.NewPooledBufferedWriterReadFromProvider(5 * 1024 * 1024)
@@ -180,12 +215,13 @@ func GetDownloader(client *s3.Client) *s3m.Downloader {
 	return d
 }
 
-func NewConfig(url string, region *string, accKey string, secKey string, ssl bool, maxBytesPerSec int64) Config {
+func NewConfig(url string, region *string, accKey string, secKey string, sessionToken string, ssl bool, maxBytesPerSec int64) Config {
 	return Config{
 		Url:            url,
 		Region:         region,
 		AccessKey:      accKey,
 		SecretKey:      secKey,
+		SessionToken:   sessionToken,
 		SSl:            ssl,
 		MaxBytesPerSec: maxBytesPerSec,
 	}
@@ -210,7 +246,7 @@ func GetConfig(cf Config, update bool) (aws.Config, error) {
 		return endpoint, nil
 	})
 
-	staticProvider := credentials.NewStaticCredentialsProvider(cf.AccessKey, cf.SecretKey, "")
+	staticProvider := credentials.NewStaticCredentialsProvider(cf.AccessKey, cf.SecretKey, cf.SessionToken)
 
 	var opts []optsFunc
 	if update && strings.Contains(cf.Url, "amazon") {
@@ -219,10 +255,21 @@ func GetConfig(cf Config, update bool) (aws.Config, error) {
 		opts = []optsFunc{config.WithEndpointResolverWithOptions(customResolver)}
 	}
 
+	// Timeouts are per phase, NOT http.Client.Timeout: that one spans the whole
+	// exchange including the body, so a 5 MiB part on a link slower than
+	// ~1.4 Mbit/s would be killed mid-transfer (and the bandwidth throttle could
+	// trigger it on any link). Hung connections are still bounded — dial, TLS
+	// and first-response-byte each get their own deadline — while a healthy
+	// transfer may take as long as it takes.
 	timeoutClient := &http.Client{
-		Timeout: 30 * time.Second,
 		Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: !cf.SSl},
+			DialContext: (&net.Dialer{
+				Timeout:   10 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ResponseHeaderTimeout: 30 * time.Second,
 		},
 	}
 	opts = append(opts, config.WithCredentialsProvider(staticProvider), config.WithHTTPClient(timeoutClient))
@@ -247,15 +294,29 @@ func NewModel(cf Config) *Model {
 	return &m
 }
 
-func (m *Model) RefreshClient(bucket *string) {
+// RefreshClient re-pins the client to the bucket's actual region (AWS only —
+// GetConfig ignores the region rebuild for custom endpoints). On any failure it
+// leaves the existing client and region untouched and reports the error:
+// mutating them on a failed lookup used to pin every later call — and even
+// CreateBucket — to a wrong us-east-1 default, turning one denied
+// s3:GetBucketLocation into a stream of baffling redirect errors.
+func (m *Model) RefreshClient(bucket *string) error {
+	region, err := m.GetBucketLocation(bucket)
+	if err != nil {
+		return fmt.Errorf("resolving region of %s: %w", aws.ToString(bucket), err)
+	}
 
-	// TODO: handle err
-	region, _ := m.GetBucketLocation(bucket)
+	cf := *m.Cf
+	cf.Region = region
+	cfg, err := GetConfig(cf, true)
+	if err != nil {
+		return fmt.Errorf("rebuilding client for region %s: %w", aws.ToString(region), err)
+	}
+
 	m.Cf.Region = region
-	cfg, _ := GetConfig(*m.Cf, true)
-
 	m.Client = s3.NewFromConfig(cfg)
 	m.Downloader = GetDownloader(m.Client)
+	return nil
 }
 func (m *Model) ListObjects(key string, bucket *Object) ([]s3t.Object, error) {
 	if bucket == nil || bucket.Key == nil {
@@ -279,84 +340,6 @@ func (m *Model) ListObjects(key string, bucket *Object) ([]s3t.Object, error) {
 	return objects, nil
 }
 
-func (m *Model) Download(
-	ctx context.Context,
-	object s3t.Object,
-	currentPath, destPath string,
-	bucket *string,
-	totalSize int64,
-	progressCb func(written int64, total int64, key string),
-) (int64, error) {
-	if err := os.MkdirAll(destPath, 0700); err != nil {
-		return 0, err
-	}
-
-	key := filepath.ToSlash(*object.Key)
-	prefix := filepath.ToSlash(currentPath)
-
-	if prefix != "" && !strings.HasSuffix(prefix, "/") {
-		prefix += "/"
-	}
-
-	relativeKey := key
-	if strings.HasPrefix(key, prefix) {
-		relativeKey = strings.TrimPrefix(key, prefix)
-	}
-
-	downloadPath := filepath.Join(destPath, relativeKey)
-
-	if strings.HasSuffix(*object.Key, "/") {
-		return 0, os.MkdirAll(downloadPath, 0760)
-	}
-	dir := filepath.Dir(downloadPath)
-	if err := os.MkdirAll(dir, 0760); err != nil {
-		return 0, err
-	}
-
-	if _, err := os.Stat(downloadPath); err == nil {
-		return 0, ErrFileExists
-	}
-
-	fp, err := os.Create(downloadPath)
-	if err != nil {
-		return 0, err
-	}
-	defer func() {
-		if cerr := fp.Close(); cerr != nil && err == nil {
-			err = cerr
-		}
-	}()
-
-	writerAt := &progressWriterAt{
-		w:     fp,
-		total: object.Size,
-		updateFunc: func(written int64, total int64) {
-			if progressCb != nil {
-				progressCb(written, total, *object.Key)
-			}
-		},
-		limiter: m.Limiter,
-	}
-
-	n, err := m.Downloader.Download(ctx, writerAt, &s3.GetObjectInput{
-		Bucket: bucket,
-		Key:    object.Key,
-	})
-
-	if ctx.Err() != nil {
-		os.Remove(downloadPath)
-		return 0, ctx.Err()
-	}
-	if err != nil {
-		// Remove the partial/empty file created by os.Create above; otherwise a
-		// later retry is permanently blocked by the "file exists" stat guard.
-		os.Remove(downloadPath)
-		return n, err
-	}
-
-	return n, err
-}
-
 func (m *Model) GetBucketLocation(name *string) (*string, error) {
 	bl, err := m.Client.GetBucketLocation(
 		context.TODO(),
@@ -364,14 +347,27 @@ func (m *Model) GetBucketLocation(name *string) (*string, error) {
 			Bucket: name,
 		},
 	)
-	loc := "us-east-1"
 	if err != nil || bl == nil {
-		return &loc, err
+		// No plausible default here: guessing us-east-1 on a failed lookup is
+		// what used to poison the client region. Callers decide what to do.
+		return nil, err
 	}
-	if location := string(bl.LocationConstraint); location != "" {
-		loc = location
-	}
+	loc := normalizeBucketLocation(string(bl.LocationConstraint))
 	return &loc, nil
+}
+
+// normalizeBucketLocation maps GetBucketLocation's constraint values onto real
+// region names: an empty constraint is us-east-1, and buckets created before
+// 2009 in Ireland report the legacy alias "EU" rather than eu-west-1.
+func normalizeBucketLocation(constraint string) string {
+	switch constraint {
+	case "":
+		return "us-east-1"
+	case "EU":
+		return "eu-west-1"
+	default:
+		return constraint
+	}
 }
 
 func (m *Model) List(path string, bucket *Object) ([]*Object, error) {
@@ -501,6 +497,12 @@ func (m *Model) Delete(key *string, bucket *Object) error {
 		objectIds = append(objectIds, s3t.ObjectIdentifier{Key: aws.String(*key)})
 	}
 
+	return m.deleteObjectIDs(bucket, objectIds)
+}
+
+// deleteObjectIDs removes the given objects in DeleteObjects batches of 1000
+// (the S3 API maximum), failing on the first per-key error the service reports.
+func (m *Model) deleteObjectIDs(bucket *Object, objectIds []s3t.ObjectIdentifier) error {
 	if len(objectIds) == 0 {
 		return nil
 	}
@@ -533,12 +535,33 @@ func (m *Model) Delete(key *string, bucket *Object) error {
 	return nil
 }
 
+// EmptyBucket removes every current object in the bucket, so DeleteBucket can
+// succeed afterwards — S3 only deletes empty buckets, and the delete confirm
+// has already promised the user exactly this removal. On a versioned bucket
+// this writes delete markers only: old versions survive, and the subsequent
+// DeleteBucket still fails with BucketNotEmpty (see DESIGN.md).
+func (m *Model) EmptyBucket(bucket *Object) error {
+	if bucket == nil || bucket.Key == nil {
+		return fmt.Errorf("bucket is nil")
+	}
+	objs, err := m.ListObjects("", bucket)
+	if err != nil {
+		return err
+	}
+	ids := make([]s3t.ObjectIdentifier, 0, len(objs))
+	for _, o := range objs {
+		if o.Key != nil {
+			ids = append(ids, s3t.ObjectIdentifier{Key: o.Key})
+		}
+	}
+	return m.deleteObjectIDs(bucket, ids)
+}
+
 func (m *Model) DeleteBucket(name *string) error {
+	// No logging here: stdout/stderr writes corrupt the tview display. The
+	// error is returned and surfaced by the controller's delete report.
 	_, err := m.Client.DeleteBucket(context.TODO(), &s3.DeleteBucketInput{
 		Bucket: aws.String(*name)})
-	if err != nil {
-		log.Printf("Couldn't delete bucket %v because of %v\n", *name, err)
-	}
 	return err
 }
 
@@ -691,6 +714,12 @@ func (m *Model) Upload(
 				dirs = append(dirs, p)
 				return nil
 			}
+			// Sockets, FIFOs and devices are skipped: opening a FIFO with no
+			// writer blocks forever and the open syscall ignores ctx cancel,
+			// so one stray pipe would hang the whole upload.
+			if !fi.Mode().IsRegular() {
+				return nil
+			}
 			files = append(files, p)
 			totalSize += fi.Size()
 			return nil
@@ -751,13 +780,7 @@ func (m *Model) Upload(
 		}
 	}
 
-	uploader := s3m.NewUploader(m.Client, func(u *s3m.Uploader) {
-		u.PartSize = 5 * 1024 * 1024
-		u.LeavePartsOnError = false
-		u.ClientOptions = append(u.ClientOptions, func(o *s3.Options) {
-			o.Retryer = aws.NopRetryer{}
-		})
-	})
+	uploader := newUploader(m.Client)
 
 	var uploadedTotal int64
 
@@ -835,11 +858,7 @@ func (m *Model) PrepareUpload(localPath string, currentPath string, bucket *Obje
 	var targets []UploadTarget
 	var totalSize int64
 
-	// Normalize currentPath to S3 prefix style
-	prefix := filepath.ToSlash(currentPath)
-	if prefix != "" && !strings.HasSuffix(prefix, "/") {
-		prefix += "/"
-	}
+	prefix := NormalizePrefix(currentPath)
 
 	if !info.IsDir() {
 		remote := prefix + filepath.ToSlash(filepath.Base(localPath))
@@ -851,15 +870,21 @@ func (m *Model) PrepareUpload(localPath string, currentPath string, bucket *Obje
 		return targets, info.Size(), nil
 	}
 
+	// Keys are relative to the PARENT of localPath, so the uploaded tree keeps
+	// its top-level directory name — this must match Upload's key derivation
+	// exactly, or the preview promises destinations the objects never land on.
+	base := filepath.Dir(localPath)
 	err = filepath.Walk(localPath, func(p string, fi os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		if fi.IsDir() {
+		// Mirror Upload's walk: directories contribute nothing here and
+		// non-regular files would hang the transfer (see Upload).
+		if fi.IsDir() || !fi.Mode().IsRegular() {
 			return nil
 		}
 
-		rel, err := filepath.Rel(localPath, p)
+		rel, err := filepath.Rel(base, p)
 		if err != nil {
 			return err
 		}
@@ -946,10 +971,7 @@ func (m *Model) DownloadTarget(
 	}
 
 	key := filepath.ToSlash(t.Key)
-	prefix := filepath.ToSlash(currentPath)
-	if prefix != "" && !strings.HasSuffix(prefix, "/") {
-		prefix += "/"
-	}
+	prefix := NormalizePrefix(currentPath)
 	relativeKey := key
 	if strings.HasPrefix(key, prefix) {
 		relativeKey = strings.TrimPrefix(key, prefix)
@@ -963,7 +985,7 @@ func (m *Model) DownloadTarget(
 		return 0, err
 	}
 	if _, err := os.Stat(downloadPath); err == nil {
-		return 0, fmt.Errorf("file exists: %s", downloadPath)
+		return 0, fmt.Errorf("%w: %s", ErrFileExists, downloadPath)
 	}
 
 	fp, err := os.Create(downloadPath)
@@ -1036,7 +1058,11 @@ func (m *Model) PresignGetURL(bucket *Object, key string, ttl time.Duration) (st
 // break.
 func copySource(bucket, key string) string {
 	u := &url.URL{Path: "/" + bucket + "/" + key}
-	return strings.TrimPrefix(u.EscapedPath(), "/")
+	src := strings.TrimPrefix(u.EscapedPath(), "/")
+	// EscapedPath leaves "+" literal (legal in an RFC 3986 path), but S3
+	// decodes x-amz-copy-source query-style, where "+" means a space — so a
+	// key like "report+final.pdf" would be looked up as "report final.pdf".
+	return strings.ReplaceAll(src, "+", "%2B")
 }
 
 // planFolderCopy normalizes source/destination folder prefixes (each terminated
@@ -1073,14 +1099,16 @@ func remapKey(src, dst, key string) string {
 // may live in different buckets; the copy is issued against the destination
 // bucket with the source expressed as CopySource. (Both must be reachable
 // through the same endpoint — see CopyKeys.)
-func (m *Model) CopyObject(srcBucket, dstBucket *Object, srcKey, dstKey string) error {
+// CopyObject issues one server-side copy. It takes a context so a cancelled
+// copy/move/sync stops issuing requests instead of running to completion.
+func (m *Model) CopyObject(ctx context.Context, srcBucket, dstBucket *Object, srcKey, dstKey string) error {
 	if srcBucket == nil || srcBucket.Key == nil || dstBucket == nil || dstBucket.Key == nil {
 		return fmt.Errorf("bucket is nil")
 	}
 	if *srcBucket.Key == *dstBucket.Key && srcKey == dstKey {
 		return fmt.Errorf("source and destination are the same")
 	}
-	_, err := m.Client.CopyObject(context.TODO(), &s3.CopyObjectInput{
+	_, err := m.Client.CopyObject(ctx, &s3.CopyObjectInput{
 		Bucket:     aws.String(*dstBucket.Key),
 		CopySource: aws.String(copySource(*srcBucket.Key, srcKey)),
 		Key:        aws.String(dstKey),
@@ -1109,7 +1137,7 @@ func (m *Model) CopyKeys(
 	}
 
 	if !isFolder {
-		if err := m.CopyObject(srcBucket, dstBucket, srcKey, dstKey); err != nil {
+		if err := m.CopyObject(ctx, srcBucket, dstBucket, srcKey, dstKey); err != nil {
 			return 0, err
 		}
 		if progressCb != nil {
@@ -1141,7 +1169,7 @@ func (m *Model) CopyKeys(
 		default:
 		}
 		newKey := remapKey(src, dst, *o.Key)
-		if err := m.CopyObject(srcBucket, dstBucket, *o.Key, newKey); err != nil {
+		if err := m.CopyObject(ctx, srcBucket, dstBucket, *o.Key, newKey); err != nil {
 			return done, fmt.Errorf("copy %s: %w", *o.Key, err)
 		}
 		done++

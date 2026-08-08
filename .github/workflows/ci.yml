@@ -1,0 +1,131 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Lint and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean:"
+            echo "$unformatted"
+            gofmt -d .
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      # Pinned rather than "latest": a staticcheck release that predates the
+      # toolchain refuses to run, so this version moves deliberately alongside
+      # the Go version in go.mod.
+      - name: staticcheck
+        uses: dominikh/staticcheck-action@v1
+        with:
+          version: "2025.1.1"
+          install-go: false
+
+      - name: build
+        run: go build ./...
+
+      - name: test (race)
+        run: go test -race -count=1 ./...
+
+      # The integration tests are tag-gated, so a plain `go test` never compiles
+      # them. Type-check them here so they can't silently rot between the
+      # (slower) integration runs.
+      - name: type-check integration tests
+        run: go vet -tags integration ./...
+
+  integration:
+    name: Integration (MinIO)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Started here rather than as a `services:` container: the official MinIO
+      # image needs the `server /data` argument, which the services block cannot
+      # supply.
+      - name: start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            quay.io/minio/minio server /data
+          for _ in $(seq 1 60); do
+            if curl -sf http://localhost:9000/minio/health/live >/dev/null; then
+              echo "MinIO is up"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "MinIO did not become ready in time" >&2
+          docker logs minio || true
+          exit 1
+
+      - name: integration tests
+        env:
+          S3DUCK_TEST_ENDPOINT: http://localhost:9000
+          S3DUCK_TEST_ACCESS_KEY: minioadmin
+          S3DUCK_TEST_SECRET_KEY: minioadmin
+          S3DUCK_TEST_REGION: us-east-1
+        run: go test -tags integration -count=1 -v ./...
+
+      - name: MinIO logs on failure
+        if: failure()
+        run: docker logs minio
+
+  cross-build:
+    name: Cross-build ${{ matrix.goos }}/${{ matrix.goarch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The platforms the Makefile ships binaries for. CGO is off so these
+          # cross-compile without a per-target toolchain.
+          - { goos: linux, goarch: amd64 }
+          - { goos: linux, goarch: arm64 } # uConsole CM4, Pi Zero 2 W (64-bit)
+          - { goos: linux, goarch: arm, goarm: "7" } # Pi Zero 2 W (32-bit)
+          - { goos: freebsd, goarch: amd64 }
+          - { goos: darwin, goarch: amd64 }
+          - { goos: darwin, goarch: arm64 }
+          - { goos: windows, goarch: amd64 }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+        run: go build -trimpath -ldflags "-s -w" -o /dev/null ./cmd/s3duck-tui

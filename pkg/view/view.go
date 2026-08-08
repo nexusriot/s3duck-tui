@@ -9,7 +9,7 @@ import (
 	"github.com/rivo/tview"
 )
 
-const versionText = "S3Duck 🦆 TUI v.0.1.8"
+const versionText = "S3Duck 🦆 TUI v.0.5.1"
 
 // View ...
 type View struct {
@@ -18,6 +18,7 @@ type View struct {
 	Pages     *tview.Pages
 	List      *tview.List       // the active pane's list (repointed on pane switch)
 	Filter    *tview.InputField // the active pane's filter
+	Header    *tview.TextView   // the active pane's column header
 	Details   *tview.TextView
 	ModalEdit func(p tview.Primitive, width, height int) tview.Primitive
 
@@ -26,13 +27,18 @@ type View struct {
 	// content flex, rebuilt when toggling single/dual layout.
 	lists   [2]*tview.List
 	filters [2]*tview.InputField
+	headers [2]*tview.TextView
 	cols    [2]*tview.Flex
 	main    *tview.Flex
 }
 
-// newPaneColumn builds one browser pane: a bordered list above a one-line
-// filter box.
-func newPaneColumn() (*tview.List, *tview.InputField, *tview.Flex) {
+// newPaneColumn builds one browser pane: a column-header line above a bordered
+// list above a one-line filter box.
+func newPaneColumn() (*tview.List, *tview.InputField, *tview.TextView, *tview.Flex) {
+	header := tview.NewTextView()
+	header.SetDynamicColors(true)
+	header.SetTextColor(tcell.ColorGray)
+
 	list := tview.NewList().ShowSecondaryText(false)
 	list.SetBorder(true).SetTitleAlign(tview.AlignLeft)
 	list.SetSelectedBackgroundColor(tcell.ColorBlue)
@@ -46,14 +52,17 @@ func newPaneColumn() (*tview.List, *tview.InputField, *tview.Flex) {
 	filter.SetPlaceholderTextColor(tcell.ColorGray)
 
 	col := tview.NewFlex().SetDirection(tview.FlexRow)
+	col.AddItem(header, 1, 0, false)
 	col.AddItem(list, 0, 1, true)
 	col.AddItem(filter, 1, 0, false)
-	return list, filter, col
+	return list, filter, header, col
 }
 
-// PaneList / PaneFilter expose a specific pane's widgets to the controller.
+// PaneList / PaneFilter / PaneHeader expose a specific pane's widgets to the
+// controller.
 func (v *View) PaneList(i int) *tview.List         { return v.lists[i] }
 func (v *View) PaneFilter(i int) *tview.InputField { return v.filters[i] }
+func (v *View) PaneHeader(i int) *tview.TextView   { return v.headers[i] }
 
 // ShowSinglePane lays out the primary pane beside the details panel (the
 // classic layout).
@@ -86,8 +95,8 @@ func (v *View) SetActivePane(active int) {
 func NewView() *View {
 	app := tview.NewApplication()
 
-	list0, filter0, col0 := newPaneColumn()
-	list1, filter1, col1 := newPaneColumn()
+	list0, filter0, header0, col0 := newPaneColumn()
+	list1, filter1, header1, col1 := newPaneColumn()
 
 	tv := tview.NewTextView().
 		SetDynamicColors(true).
@@ -125,10 +134,12 @@ func NewView() *View {
 		Pages:     pages,
 		List:      list0,
 		Filter:    filter0,
+		Header:    header0,
 		Details:   tv,
 		ModalEdit: modal,
 		lists:     [2]*tview.List{list0, list1},
 		filters:   [2]*tview.InputField{filter0, filter1},
+		headers:   [2]*tview.TextView{header0, header1},
 		cols:      [2]*tview.Flex{col0, col1},
 		main:      main,
 	}
@@ -150,7 +161,7 @@ func (v *View) SetFrameText(helpText string) {
 }
 
 func (v *View) SetHeaderVersionText(version string) {
-	v.Frame.AddText(fmt.Sprintf(version), true, tview.AlignCenter, tcell.ColorGreen)
+	v.Frame.AddText(version, true, tview.AlignCenter, tcell.ColorGreen)
 }
 
 func (v *View) NewConfirm() *tview.Modal {
@@ -166,6 +177,7 @@ func (v *View) NewCreateProfileForm(header string) *tview.Form {
 	form.AddInputField("Region", "", 52, nil, nil)
 	form.AddInputField("Access key", "", 52, nil, nil)
 	form.AddPasswordField("Secret key", "", 52, '*', nil)
+	form.AddPasswordField("Session token (optional)", "", 52, '*', nil)
 	form.AddInputField("Download dir", "", 52, nil, nil)
 	form.AddCheckbox("Disable ssl check", false, func(bool) {})
 	form.AddInputField("Max bytes/sec (0=unltd)", "", 52, nil, nil)
@@ -259,6 +271,122 @@ func (v *View) NewCopyMoveForm(header string, buckets []string, currentBucket, p
 	return form
 }
 
+// Field labels for the sync form, read back with GetFormItemByLabel.
+const (
+	FieldSyncDirection = "Direction"
+	FieldSyncLocalDir  = "Local directory"
+	FieldSyncDstBucket = "Dest bucket (remote → remote)"
+	FieldSyncDstPrefix = "Dest prefix (remote → remote)"
+	FieldSyncDelete    = "Delete extraneous at destination"
+)
+
+// NewSyncForm builds the sync dialog. The current bucket+prefix shown in the
+// title is always one side of the transfer — the source, except for an upload.
+// The local-directory and destination-bucket rows are both always present:
+// which one applies follows from the direction, and hiding rows on selection
+// would mean rebuilding the form mid-interaction. Esc closes the "modal" page.
+func (v *View) NewSyncForm(current, localDir string, directions, buckets []string, dstBucket, dstPrefix string) *tview.Form {
+	initialBucket := 0
+	for i, b := range buckets {
+		if b == dstBucket {
+			initialBucket = i
+			break
+		}
+	}
+
+	form := tview.NewForm()
+	form.SetTitle(fmt.Sprintf(" Sync — this pane: %s ", current))
+	form.AddDropDown(FieldSyncDirection, directions, 0, nil)
+	form.AddInputField(FieldSyncLocalDir, localDir, 56, nil, nil)
+	form.AddDropDown(FieldSyncDstBucket, buckets, initialBucket, nil)
+	form.AddInputField(FieldSyncDstPrefix, dstPrefix, 56, nil, nil)
+	form.AddCheckbox(FieldSyncDelete, false, nil)
+	form.SetBorder(true)
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEsc {
+			v.Pages.RemovePage("modal")
+		}
+		return event
+	})
+	return form
+}
+
+// Field labels for the metadata and storage-class forms. Both forms are read
+// back with GetFormItemByLabel rather than by index: they mix TextViews with
+// inputs, and a positional read silently returns the wrong widget the moment a
+// row is inserted (a trap the profile form already sprung once).
+const (
+	FieldContentType        = "Content-Type"
+	FieldCacheControl       = "Cache-Control"
+	FieldContentDisposition = "Content-Disposition"
+	FieldContentEncoding    = "Content-Encoding"
+	FieldUserMetadata       = "Metadata (key=value per line)"
+	FieldTags               = "Tags (key=value per line)"
+	FieldStorageClass       = "Storage class"
+	FieldRestoreDays        = "Restore for (days)"
+	FieldRestoreTier        = "Retrieval tier"
+)
+
+// NewObjectMetaForm builds the metadata + tags editor. Read its fields with
+// GetFormItemByLabel and the Field* constants above. tagsUnavailable notes a
+// backend that rejected GetObjectTagging, so the user knows an empty tag box
+// means "not supported" rather than "no tags". Esc closes the "modal" page.
+func (v *View) NewObjectMetaForm(key, summary string, tagsUnavailable bool) *tview.Form {
+	form := tview.NewForm()
+	form.SetTitle(fmt.Sprintf(" Metadata & tags — %s ", key))
+
+	form.AddTextView("", summary, 0, 2, true, false)
+	form.AddInputField(FieldContentType, "", 56, nil, nil)
+	form.AddInputField(FieldCacheControl, "", 56, nil, nil)
+	form.AddInputField(FieldContentDisposition, "", 56, nil, nil)
+	form.AddInputField(FieldContentEncoding, "", 56, nil, nil)
+	form.AddTextArea(FieldUserMetadata, "", 56, 5, 0, nil)
+	form.AddTextArea(FieldTags, "", 56, 5, 0, nil)
+	if tagsUnavailable {
+		form.AddTextView("", "[red]this endpoint reported no tagging support[-]", 0, 1, true, false)
+	}
+	form.SetBorder(true)
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEsc {
+			// The editor lives on its own page (see metaFormPage in the
+			// controller) so error modals can't replace it.
+			v.Pages.RemovePage("modal-meta")
+		}
+		return event
+	})
+	return form
+}
+
+// NewStorageClassForm builds the storage-class / restore dialog: a class
+// dropdown plus, only when the object is archived, restore days and a retrieval
+// tier. Read its fields with GetFormItemByLabel. Esc closes the "modal" page.
+func (v *View) NewStorageClassForm(key, summary string, classes []string, current string, tiers []string, archived bool) *tview.Form {
+	initial := 0
+	for i, cl := range classes {
+		if cl == current {
+			initial = i
+			break
+		}
+	}
+
+	form := tview.NewForm()
+	form.SetTitle(fmt.Sprintf(" Storage class — %s ", key))
+	form.AddTextView("", summary, 0, 2, true, false)
+	form.AddDropDown(FieldStorageClass, classes, initial, nil)
+	if archived {
+		form.AddInputField(FieldRestoreDays, "1", 8, tview.InputFieldInteger, nil)
+		form.AddDropDown(FieldRestoreTier, tiers, 0, nil)
+	}
+	form.SetBorder(true)
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEsc {
+			v.Pages.RemovePage("modal")
+		}
+		return event
+	})
+	return form
+}
+
 func (v *View) NewCreateLocalFileListForm() (tview.Primitive, *tview.List) {
 	localList := tview.NewList().
 		ShowSecondaryText(false)
@@ -304,6 +432,7 @@ func (v *View) HotkeysModal(profiles bool) *tview.TextView {
 
 		[::b]Actions[::-]
 		  Ctrl+N        Create new profile
+          Ctrl+I        Import profile from ~/.aws (incl. session token)
           Ctrl+Y        Copy profile
 		  Ctrl+E        Edit profile
           Ctrl+V        Verify profile (test connection)
@@ -337,18 +466,25 @@ func (v *View) HotkeysModal(profiles bool) *tview.TextView {
           Ctrl+T        Move selected/marked to a destination bucket/prefix
           Ctrl+G        Bucket/folder summary
           Ctrl+L        File properties (size, ETag, link)
+          v             Version history (restore / download / delete)
+          m             Edit metadata & object tags
+          c             Storage class / Glacier restore
           Ctrl+W        Copy presigned (time-limited) share link
           Ctrl+U        Open local file manager (for upload)
+          Ctrl+E        Sync: local ⇄ this prefix, or this prefix → another
+          =             Compare the two panes (dual-pane, read-only)
           y / x / p     Clipboard: copy / cut / paste objects
           u             Undo last move/rename
           t             Transfers panel (background jobs)
           /             Filter the current listing (live)
+          s / S         Sort: cycle name/size/date / reverse direction
+          r / F5        Refresh the current listing
           Ctrl+F        Recursive search (checkbox: all buckets)
           Ctrl+K        Palette: abort uploads, bucket config, log…
           Space			Select object for download
           Ctrl+S        Select all objects for download
           Ctrl+X        Unselect all objects for download
-		  Del           Delete (recursive for dirs)
+		  Del           Delete marked/highlighted (recursive for dirs)
 
 		[::b]Misc[::-]
 		  Ctrl+H        This help
@@ -374,18 +510,19 @@ func (v *View) AboutModal() *tview.TextView {
 	about := `
                          [::b]%s[::-]
 
-			A tiny TUI browser for etcd S3-like storage.
+			A tiny TUI browser for S3-compatible object storage.
 			Github: https://github.com/nexusriot/s3duck-tui
 
 			(C)2023-2026 Vladislav Ananev
-			
+
                     _  [dim](quack)[-]
-				 __( )> 
+				 __( )>
 				 \__\      [::b]Features[::-]
-							• Profiles support
-							• Walking dirs support
-							• Download files/dirs support
-							• Uploads files/dirs support
+							• Profiles, incl. ~/.aws import
+							• Walking dirs, filter, search
+							• Download / upload files & dirs
+							• Copy / move / rename / delete
+							• Directory sync (dry run first)
                             • Summary view support
          [dim]Press any key to close.[-]
 			`
@@ -420,7 +557,6 @@ type SummaryRow struct {
 // SummaryGraph holds primitives of a graphical summary modal.
 type SummaryGraph struct {
 	Root   tview.Primitive
-	Header *tview.TextView
 	Cats   *tview.Table
 	Groups *tview.Table
 }
@@ -512,7 +648,7 @@ func (v *View) NewSummaryGraph(title string, scope string, total int64, categori
 	grid.AddItem(catT, 1, 0, 1, 1, 0, 0, true)
 	grid.AddItem(grpT, 1, 1, 1, 1, 0, 0, false)
 
-	return &SummaryGraph{Root: grid, Header: h, Cats: catT, Groups: grpT}
+	return &SummaryGraph{Root: grid, Cats: catT, Groups: grpT}
 }
 
 func renderColorBar(pct float64, col tcell.Color) string {

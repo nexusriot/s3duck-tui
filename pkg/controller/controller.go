@@ -33,6 +33,35 @@ const (
 	decCancel
 )
 
+// sortKey is the field the listing is ordered by. Folders always sort before
+// files whatever the key is; the key only orders objects within each group.
+type sortKey int
+
+const (
+	sortName sortKey = iota
+	sortSize
+	sortDate
+)
+
+func (s sortKey) String() string {
+	switch s {
+	case sortSize:
+		return "size"
+	case sortDate:
+		return "date"
+	default:
+		return "name"
+	}
+}
+
+// next cycles name → size → date → name.
+func (s sortKey) next() sortKey {
+	if s >= sortDate {
+		return sortName
+	}
+	return s + 1
+}
+
 type downloadSummary struct {
 	totalObjects int
 	downloaded   int
@@ -110,7 +139,6 @@ func (c *Controller) selectedCount() int {
 }
 
 type Controller struct {
-	debug           bool
 	view            *view.View
 	model           *model.Model
 	buckets         []*model.Object
@@ -118,7 +146,6 @@ type Controller struct {
 	currentPath     string
 	currentBucket   *model.Object
 	bucketPos       int
-	position        map[string]int
 	params          *cfg.Params
 	selectedByScope map[string]map[string]bool
 	restoreNext     string
@@ -135,6 +162,29 @@ type Controller struct {
 	// while we reset the field programmatically (navigation, reveal). Only
 	// touched on the UI goroutine, where SetText fires the handler inline.
 	filterSuppress bool
+
+	// sortBy / sortDesc order the listing. Shared by both panes (unlike the
+	// filter, an ordering preference is not location-specific) and guarded by
+	// mu because renderList reads them from background goroutines.
+	sortBy   sortKey
+	sortDesc bool
+
+	// cols is the column layout resolved from the pane width on the last
+	// render. Only touched inside renderList's QueueUpdateDraw closure and by
+	// labelForList, which that closure calls — so it stays on the UI goroutine
+	// and needs no mutex.
+	cols listColumns
+	// lastWidth is the active list's width at the last render, used to detect
+	// that a resize or a layout change invalidated the column layout. UI
+	// goroutine only (set from the after-draw hook and from renderList).
+	lastWidth int
+	// browsing is true while the browser screen owns the shared list widget
+	// and false on the profiles screen. renderList and the resize hook check
+	// it so a stale render can never clobber the profiles list — the two
+	// screens share one tview.List. Written and read on the UI goroutine only
+	// (Profiles, the profile-open callback, QueueUpdateDraw closures, the
+	// after-draw hook).
+	browsing bool
 
 	// hist is the back/forward navigation history for this pane.
 	hist histStack
@@ -211,18 +261,16 @@ func appendCapped(list []activityEntry, e activityEntry, max int) []activityEntr
 	return list
 }
 
-func NewController(debug bool) *Controller {
+func NewController() *Controller {
 
 	v := view.NewView()
 	params := cfg.NewParams()
 
 	c := &Controller{
-		debug:           debug,
 		view:            v,
 		model:           nil,
 		currentPath:     "",
 		bucketPos:       0,
-		position:        make(map[string]int),
 		params:          params,
 		selectedByScope: make(map[string]map[string]bool),
 	}
@@ -435,11 +483,7 @@ func (c *Controller) makeObjectMap() error {
 
 func localDownloadPath(currentPath, destPath, s3Key string) string {
 	key := filepath.ToSlash(s3Key)
-	prefix := filepath.ToSlash(currentPath)
-
-	if prefix != "" && !strings.HasSuffix(prefix, "/") {
-		prefix += "/"
-	}
+	prefix := model.NormalizePrefix(currentPath)
 
 	relativeKey := key
 	if strings.HasPrefix(key, prefix) {
@@ -519,63 +563,219 @@ func (c *Controller) getSelectedObjectName() string {
 }
 
 func (c *Controller) Profiles() {
+	c.browsing = false
 	c.resetPanes() // collapse to single-pane; the filter box is inert here
+	// The browser's column captions have no meaning over the profile list.
+	c.view.Header.SetText("")
 	c.setConfigInput()
 	c.fillConfigData()
 }
 
-func (c *Controller) Delete() error {
-	if c.view.List.GetItemCount() == 0 {
-		return nil
+// deleteTarget is one resolved delete: its display name (the objKey used for
+// selection bookkeeping), the S3 key to remove, and the scan result. For a
+// folder, key is the prefix and objects/bytes are what the recursive listing
+// found; for a file, objects is 1 and bytes its size.
+type deleteTarget struct {
+	name     string
+	key      string
+	isBucket bool
+	isFolder bool
+	objects  int
+	bytes    int64
+	scanErr  error
+}
+
+// deleteConfirmText renders the confirmation for a delete of targets. It names
+// each target when there are few, and always states the total object count and
+// byte size so a recursive folder delete can't be confirmed blind.
+func deleteConfirmText(targets []deleteTarget) string {
+	var objects int
+	var bytes int64
+	var scanFailed int
+	for _, t := range targets {
+		objects += t.objects
+		bytes += t.bytes
+		if t.scanErr != nil {
+			scanFailed++
+		}
 	}
-	cur := c.getSelectedObjectName()
 
-	val, ok := c.lookupObj(cur)
-	if !ok {
-		return nil
-	}
-
-	// op is the S3 key to delete: the bucket name for buckets, otherwise the
-	// full key (FullPath already ends with "/" for folders, which model.Delete
-	// treats as a recursive prefix delete).
-	op := *val.Key
-	if val.Ot != model.Bucket {
-		op = *val.FullPath
-	}
-
-	confirm := c.view.NewConfirm()
-	confirm.SetText(fmt.Sprintf("Do you want to delete %s", op)).
-		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-			c.view.Pages.RemovePage("confirm").SwitchToPage("main")
-
-			if buttonLabel != "OK" {
-				return
+	var b strings.Builder
+	if len(targets) == 1 {
+		fmt.Fprintf(&b, "Delete %s?\n\n", targets[0].key)
+	} else {
+		fmt.Fprintf(&b, "Delete %d item(s)?\n\n", len(targets))
+		const shown = 6
+		for i, t := range targets {
+			if i == shown {
+				fmt.Fprintf(&b, "  ...and %d more\n", len(targets)-shown)
+				break
 			}
-			go func() {
-				var err error
-				if val.Ot == model.Bucket {
-					err = c.model.DeleteBucket(val.Key)
-				} else {
-					err = c.model.Delete(&op, c.currentBucket)
-				}
-				if err != nil {
-					c.error(fmt.Sprintf("Failed to delete %s", *val.Key), err, false)
-					return
-				}
-				// Drop the deleted item from the selection set so the
-				// "Selected: N" count and markers stay accurate.
-				c.mu.Lock()
-				if m := c.selScopeLocked(); m != nil {
-					delete(m, cur)
-				}
-				c.mu.Unlock()
+			fmt.Fprintf(&b, "  - %s\n", t.key)
+		}
+		b.WriteString("\n")
+	}
+	fmt.Fprintf(&b, "This removes %d object(s), %s.", objects, humanize.IBytes(uint64(bytes)))
+	if scanFailed > 0 {
+		fmt.Fprintf(&b, "\n\n[red]%d item(s) could not be sized; the totals above are incomplete.", scanFailed)
+	}
+	return b.String()
+}
 
-				c.updateList()
-				c.clearDetailsIfNoSelection()
-			}()
+// Delete removes the marked objects — or the highlighted one when nothing is
+// marked — after a confirmation that states how many objects and bytes will go.
+// On the buckets screen it deletes the highlighted bucket (buckets can't be
+// marked). Sizing a folder needs a recursive listing, so the scan runs off the
+// UI goroutine behind a "Calculating…" modal.
+func (c *Controller) Delete() {
+	if c.view.List.GetItemCount() == 0 {
+		return
+	}
+
+	names := c.selectedNames()
+	if len(names) == 0 {
+		n := c.getSelectedObjectName()
+		if n == "" || n == ".." {
+			return
+		}
+		names = []string{n}
+	}
+
+	var targets []deleteTarget
+	for _, n := range names {
+		o, ok := c.lookupObj(n)
+		if !ok {
+			continue
+		}
+		switch o.Ot {
+		case model.Bucket:
+			targets = append(targets, deleteTarget{name: n, key: *o.Key, isBucket: true})
+		case model.Folder:
+			targets = append(targets, deleteTarget{name: n, key: *o.FullPath, isFolder: true})
+		case model.File:
+			t := deleteTarget{name: n, key: *o.FullPath, objects: 1}
+			if o.Size != nil {
+				t.bytes = *o.Size
+			}
+			targets = append(targets, t)
+		}
+	}
+	if len(targets) == 0 {
+		return
+	}
+
+	scanning := tview.NewModal().SetText("Calculating delete size...")
+	c.view.Pages.AddPage("progress", scanning, true, true)
+
+	bucket := c.currentBucket
+	go func() {
+		for i := range targets {
+			if !targets[i].isFolder && !targets[i].isBucket {
+				continue
+			}
+			key := targets[i].key
+			if targets[i].isBucket {
+				key = ""
+			}
+			scanBucket := bucket
+			if targets[i].isBucket {
+				b := targets[i].key
+				scanBucket = &model.Object{Key: &b, Ot: model.Bucket}
+			}
+			objs, err := c.model.ListObjects(key, scanBucket)
+			if err != nil {
+				targets[i].scanErr = err
+				continue
+			}
+			for _, o := range objs {
+				targets[i].objects++
+				targets[i].bytes += o.Size
+			}
+		}
+
+		c.view.App.QueueUpdateDraw(func() {
+			c.view.Pages.RemovePage("progress").SwitchToPage("main")
+			confirm := c.view.NewConfirm()
+			confirm.SetText(deleteConfirmText(targets)).
+				SetDoneFunc(func(_ int, buttonLabel string) {
+					c.view.Pages.RemovePage("confirm").SwitchToPage("main")
+					if buttonLabel != "OK" {
+						return
+					}
+					c.runDelete(targets, bucket)
+				})
+			c.view.Pages.AddPage("confirm", confirm, true, true)
 		})
-	c.view.Pages.AddPage("confirm", confirm, true, true)
-	return nil
+	}()
+}
+
+// runDelete executes the confirmed deletes sequentially behind a progress
+// modal, then refreshes the listing and reports any failures.
+func (c *Controller) runDelete(targets []deleteTarget, bucket *model.Object) {
+	progress := tview.NewModal().SetText("Deleting...")
+	c.view.Pages.AddPage("progress", progress, true, true)
+
+	go func() {
+		var failed []string
+		okCount := 0
+
+		for i, t := range targets {
+			c.view.App.QueueUpdateDraw(func() {
+				progress.SetText(fmt.Sprintf("Deleting\n%d/%d\n%s", i+1, len(targets), t.key))
+			})
+
+			var err error
+			if t.isBucket {
+				// The confirm promised the bucket's objects would go, and S3
+				// only deletes empty buckets — so empty it first.
+				name := t.key
+				b := &model.Object{Key: &name, Ot: model.Bucket}
+				if err = c.model.EmptyBucket(b); err == nil {
+					err = c.model.DeleteBucket(&name)
+				}
+			} else {
+				key := t.key
+				err = c.model.Delete(&key, bucket)
+			}
+			if err != nil {
+				failed = append(failed, fmt.Sprintf("%s: %v", t.key, err))
+				continue
+			}
+			okCount++
+
+			// Drop the deleted item from the selection set so the
+			// "Selected: N" count and markers stay accurate.
+			c.mu.Lock()
+			if m := c.selScopeLocked(); m != nil {
+				delete(m, t.name)
+			}
+			c.mu.Unlock()
+		}
+
+		c.logActivity("Delete: %d ok, %d failed", okCount, len(failed))
+
+		c.view.App.QueueUpdateDraw(func() {
+			status := "Delete complete."
+			if len(failed) > 0 {
+				status = "Delete finished with errors."
+			}
+			msg := fmt.Sprintf("%s\n\nDeleted: %d\nFailed: %d", status, okCount, len(failed))
+			for _, f := range failed {
+				msg += "\n  - " + f
+			}
+			msg += "\n\nPress Done to return."
+
+			progress.SetText(msg)
+			progress.AddButtons([]string{"Done"})
+			progress.SetDoneFunc(func(_ int, _ string) {
+				c.view.Pages.RemovePage("progress").SwitchToPage("main")
+			})
+			c.view.App.SetFocus(progress)
+		})
+
+		c.updateList()
+		c.clearDetailsIfNoSelection()
+	}()
 }
 
 // resolveDownloadDir returns the destination directory for downloads,
@@ -606,6 +806,14 @@ func (c *Controller) Download() error {
 		return nil
 	}
 
+	// Capture the source location now, on the UI goroutine. The byte phase can
+	// run long after Background is pressed — reading c.currentBucket there
+	// would panic once the user backs out to the buckets screen, and a pane
+	// swap would silently retarget the remaining objects at the other pane's
+	// bucket.
+	srcBucket := c.currentBucket
+	srcPath := c.currentPath
+
 	names := c.selectedNames()
 	if len(names) == 0 {
 		// current item only
@@ -626,7 +834,7 @@ func (c *Controller) Download() error {
 			key,
 			val.Ot == model.Folder,
 			val.Size,
-			c.currentBucket,
+			srcBucket,
 		)
 		if err != nil {
 			return err
@@ -817,7 +1025,7 @@ func (c *Controller) Download() error {
 
 					// Directory markers: create immediately; don't queue for download.
 					if strings.HasSuffix(keyStr, "/") {
-						dst := localDownloadPath(c.currentPath, cwd, keyStr)
+						dst := localDownloadPath(srcPath, cwd, keyStr)
 						if mkErr := os.MkdirAll(dst, 0760); mkErr != nil {
 							sumMu.Lock()
 							sum.addFailed(keyStr, mkErr)
@@ -830,7 +1038,7 @@ func (c *Controller) Download() error {
 						continue
 					}
 
-					dst := localDownloadPath(c.currentPath, cwd, keyStr)
+					dst := localDownloadPath(srcPath, cwd, keyStr)
 					if _, statErr := os.Stat(dst); statErr == nil {
 						if skipAll {
 							sumMu.Lock()
@@ -968,9 +1176,9 @@ func (c *Controller) Download() error {
 						n, err := c.model.DownloadTarget(
 							ctx,
 							ri.object,
-							c.currentPath,
+							srcPath,
 							cwd,
-							c.currentBucket.Key,
+							srcBucket.Key,
 							func(written, _ int64, _ string) {
 								sumMu.Lock()
 								activeProgress[keyStr] = written
@@ -1025,34 +1233,6 @@ func (c *Controller) Download() error {
 	return nil
 }
 
-// coloredLabelFor returns a colorized icon
-func coloredLabelFor(o *model.Object, selected bool) string {
-	if o.Key == nil {
-		return ""
-	}
-	name := *o.Key
-
-	switch o.Ot {
-	case model.Folder:
-		if selected {
-			return "[green]📁 " + name + "/[-]"
-		}
-		return "[cyan]📁[-] " + name + "/"
-
-	case model.File:
-		if selected {
-			return "[green]📄 " + name + "[-]"
-		}
-		return "📄 " + name
-
-	case model.Bucket:
-		return "[yellow]●[-] " + name
-
-	default:
-		return "  " + name
-	}
-}
-
 func (c *Controller) labelForList(o *model.Object) (primary string, secondary string) {
 	if o == nil || o.Key == nil {
 		return "", ""
@@ -1064,7 +1244,7 @@ func (c *Controller) labelForList(o *model.Object) (primary string, secondary st
 		selected = c.isSelected(key)
 	}
 
-	return coloredLabelFor(o, selected), key
+	return listRow(o, selected, c.cols), key
 }
 
 func (c *Controller) ToggleSelectCurrent() {
@@ -1101,7 +1281,7 @@ func (c *Controller) updateList() error {
 	defer c.refreshMu.Unlock()
 
 	if err := c.makeObjectMap(); err != nil {
-		go c.error("Failed to fetch folder", err, false)
+		go c.error("Failed to fetch folder", err)
 		return err
 	}
 	c.renderList()
@@ -1109,15 +1289,21 @@ func (c *Controller) updateList() error {
 }
 
 // renderList repopulates the list widget from the in-memory object map,
-// applying the active filter and the folders-first/name sort. It performs no
-// network I/O, so it is cheap enough to call on every keystroke (live filter)
-// or selection toggle. All widget access is marshalled onto the UI goroutine,
+// applying the active filter and sort and resolving the column layout for the
+// pane's current width. It performs no network I/O, so it is cheap enough to
+// call on every keystroke (live filter) or selection toggle. All widget access is marshalled onto the UI goroutine,
 // which also fixes the previous race of reading list state off-goroutine.
 func (c *Controller) renderList() {
 	title, fText := c.listChrome()
-	objs := filterSortObjects(c.objsSnapshot(), c.getFilter())
+	sk, sd := c.getSort()
+	objs := filterSortObjects(c.objsSnapshot(), c.getFilter(), sk, sd)
 
 	c.view.App.QueueUpdateDraw(func() {
+		// A refresh that lands after the user returned to the profiles screen
+		// must not rebuild the (shared) list widget from browser state.
+		if !c.browsing {
+			return
+		}
 		// Preserve the cursor across the rebuild. Reading the widget here (on
 		// the UI goroutine) avoids racing tview's event loop.
 		keepCur := ""
@@ -1129,6 +1315,24 @@ func (c *Controller) renderList() {
 		if c.restoreNext != "" {
 			want = c.restoreNext
 		}
+
+		// Column widths follow the pane's current width, so a narrow dual-pane
+		// drops columns instead of truncating names into uselessness. The rect
+		// is zero before the first draw; planColumns falls back for that case.
+		listX, _, listWidth, _ := c.view.List.GetInnerRect()
+		cols := planColumns(listWidth)
+		c.cols = cols
+		c.lastWidth = listWidth
+
+		// Indent the header to wherever the list's content actually begins,
+		// rather than assuming a border width: the offset is then correct
+		// whatever padding or decoration either widget grows later.
+		headerX, _, _, _ := c.view.Header.GetInnerRect()
+		indent := listX - headerX
+		if indent < 0 {
+			indent = 0
+		}
+		c.view.Header.SetText(strings.Repeat(" ", indent) + listHeader(cols))
 
 		c.view.List.Clear()
 		c.view.List.SetTitle(title)
@@ -1207,8 +1411,18 @@ func (c *Controller) listChrome() (title, fText string) {
 	if f := c.getFilter(); f != "" {
 		title = fmt.Sprintf("%s  [yellow]filter:%s", title, f)
 	}
+	title = fmt.Sprintf("%s  [blue]%s", title, sortLabel(c.getSort()))
 	fText = fmt.Sprintf("[::b][↓,↑][::-]D/U [::b][Ent/Bck][::-]L/U %s[::b][/][::-]Filter [::b][Del[][::-]Delete [::b][Ctrl+N][::-]Create [::b][Ctrl+P][::-]Profiles [::b][Ctrl+L][::-]Properties [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit", suff)
 	return title, fText
+}
+
+// sortLabel renders the active ordering for the list title, e.g. "sort:size↓".
+func sortLabel(key sortKey, desc bool) string {
+	arrow := "↑"
+	if desc {
+		arrow = "↓"
+	}
+	return fmt.Sprintf("sort:%s%s", key, arrow)
 }
 
 // getFilter / setFilter guard access to c.filter (see the field comment).
@@ -1224,10 +1438,42 @@ func (c *Controller) setFilter(s string) {
 	c.mu.Unlock()
 }
 
+// getSort returns the active sort key and direction.
+func (c *Controller) getSort() (sortKey, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.sortBy, c.sortDesc
+}
+
+// CycleSort advances the sort key (name → size → date) and re-renders. No
+// network round-trip: the ordering is applied to the in-memory object map.
+func (c *Controller) CycleSort() {
+	c.mu.Lock()
+	c.sortBy = c.sortBy.next()
+	c.mu.Unlock()
+	go c.renderList()
+}
+
+// ToggleSortDir flips between ascending and descending and re-renders.
+func (c *Controller) ToggleSortDir() {
+	c.mu.Lock()
+	c.sortDesc = !c.sortDesc
+	c.mu.Unlock()
+	go c.renderList()
+}
+
+// Refresh re-fetches the current listing from S3. Runs on its own goroutine so
+// a slow endpoint can't block the tview event loop.
+func (c *Controller) Refresh() {
+	go c.updateList()
+}
+
 // filterSortObjects returns the objects whose display name (o.Key) contains
-// filter (case-insensitive), sorted folders/buckets first then by name. An
-// empty filter returns every object. The input slice is not mutated.
-func filterSortObjects(objs []*model.Object, filter string) []*model.Object {
+// filter (case-insensitive), ordered by the given sort key. Folders/buckets
+// always come before files regardless of the key or direction, so the listing
+// keeps its navigable shape. An empty filter returns every object. The input
+// slice is not mutated.
+func filterSortObjects(objs []*model.Object, filter string, key sortKey, desc bool) []*model.Object {
 	f := strings.ToLower(strings.TrimSpace(filter))
 	out := make([]*model.Object, 0, len(objs))
 	for _, o := range objs {
@@ -1239,17 +1485,66 @@ func filterSortObjects(objs []*model.Object, filter string) []*model.Object {
 		}
 		out = append(out, o)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Ot != out[j].Ot {
-			return out[i].Ot > out[j].Ot
+	sort.SliceStable(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.Ot != b.Ot {
+			return a.Ot > b.Ot
 		}
-		return *out[i].Key < *out[j].Key
+		less, tie := lessBySortKey(a, b, key)
+		if tie {
+			// Name is the tiebreaker and is always ascending, so equal sizes or
+			// timestamps produce a stable, predictable order in both directions.
+			return *a.Key < *b.Key
+		}
+		if desc {
+			return !less
+		}
+		return less
 	})
 	return out
 }
 
+// lessBySortKey compares two objects on the active sort key. tie reports that
+// the two are equal on that key (or that the key is unavailable, as for folders
+// which carry no size or timestamp), in which case the caller falls back to
+// name ordering.
+func lessBySortKey(a, b *model.Object, key sortKey) (less, tie bool) {
+	switch key {
+	case sortSize:
+		as, bs := int64(0), int64(0)
+		if a.Size != nil {
+			as = *a.Size
+		}
+		if b.Size != nil {
+			bs = *b.Size
+		}
+		if as == bs {
+			return false, true
+		}
+		return as < bs, false
+	case sortDate:
+		if a.LastModified == nil || b.LastModified == nil || a.LastModified.Equal(*b.LastModified) {
+			return false, true
+		}
+		return a.LastModified.Before(*b.LastModified), false
+	default:
+		if *a.Key == *b.Key {
+			return false, true
+		}
+		return *a.Key < *b.Key, false
+	}
+}
+
+// findBucketByName resolves a bucket for navigation. A listing failure is
+// reported rather than swallowed — silently returning nil made a transient
+// error look like navigation being dead. Both callers run on background
+// goroutines, so c.error is called directly.
 func (c *Controller) findBucketByName(name string) *model.Object {
-	list, _ := c.model.ListBuckets()
+	list, err := c.model.ListBuckets()
+	if err != nil {
+		c.error("Failed to list buckets", err)
+		return nil
+	}
 	c.buckets = list
 	for _, v := range c.buckets {
 		if name == *v.Key {
@@ -1276,7 +1571,9 @@ func (c *Controller) Down(name string) {
 				return
 			}
 			c.currentBucket = bucket
-			c.model.RefreshClient(&name)
+			if err := c.model.RefreshClient(&name); err != nil {
+				c.error("Failed to resolve bucket region", err)
+			}
 			c.restoreNext = ".."
 			c.updateList()
 		}()
@@ -1345,9 +1642,10 @@ func (c *Controller) CreateConfigEntry() {
 		reg := cForm.GetFormItem(2).(*tview.InputField).GetText()
 		accessKey := cForm.GetFormItem(3).(*tview.InputField).GetText()
 		secretKey := cForm.GetFormItem(4).(*tview.InputField).GetText()
-		downloadDir := cForm.GetFormItem(5).(*tview.InputField).GetText()
-		ignoreSsl := cForm.GetFormItem(6).(*tview.Checkbox).IsChecked()
-		maxBps := parseMaxBps(cForm.GetFormItem(7).(*tview.InputField).GetText())
+		sessionToken := cForm.GetFormItem(5).(*tview.InputField).GetText()
+		downloadDir := cForm.GetFormItem(6).(*tview.InputField).GetText()
+		ignoreSsl := cForm.GetFormItem(7).(*tview.Checkbox).IsChecked()
+		maxBps := parseMaxBps(cForm.GetFormItem(8).(*tview.InputField).GetText())
 
 		if reg != "" {
 			region = &reg
@@ -1358,6 +1656,7 @@ func (c *Controller) CreateConfigEntry() {
 			Region:         region,
 			AccessKey:      accessKey,
 			SecretKey:      secretKey,
+			SessionToken:   strings.TrimSpace(sessionToken),
 			IgnoreSsl:      ignoreSsl,
 			DownloadDir:    strings.TrimSpace(downloadDir),
 			MaxBytesPerSec: maxBps,
@@ -1366,7 +1665,7 @@ func (c *Controller) CreateConfigEntry() {
 
 		c.view.Pages.RemovePage("modal")
 		if err != nil {
-			go c.error("Error creating config entry", err, false)
+			go c.error("Error creating config entry", err)
 		}
 		c.fillConfigData()
 		c.view.List.SetCurrentItem(len(c.params.Config) - 1)
@@ -1376,7 +1675,7 @@ func (c *Controller) CreateConfigEntry() {
 		c.view.Pages.RemovePage("modal")
 	})
 
-	c.view.Pages.AddPage("modal", c.view.ModalEdit(cForm, 75, 21), true, true)
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(cForm, 75, 23), true, true)
 }
 
 func (c *Controller) EditConfigEntry() {
@@ -1395,10 +1694,11 @@ func (c *Controller) EditConfigEntry() {
 	}
 	cForm.GetFormItem(3).(*tview.InputField).SetText(entry.AccessKey)
 	cForm.GetFormItem(4).(*tview.InputField).SetText(entry.SecretKey)
-	cForm.GetFormItem(5).(*tview.InputField).SetText(entry.DownloadDir)
-	cForm.GetFormItem(6).(*tview.Checkbox).SetChecked(entry.IgnoreSsl)
+	cForm.GetFormItem(5).(*tview.InputField).SetText(entry.SessionToken)
+	cForm.GetFormItem(6).(*tview.InputField).SetText(entry.DownloadDir)
+	cForm.GetFormItem(7).(*tview.Checkbox).SetChecked(entry.IgnoreSsl)
 	if entry.MaxBytesPerSec > 0 {
-		cForm.GetFormItem(7).(*tview.InputField).SetText(strconv.FormatInt(entry.MaxBytesPerSec, 10))
+		cForm.GetFormItem(8).(*tview.InputField).SetText(strconv.FormatInt(entry.MaxBytesPerSec, 10))
 	}
 
 	cForm.AddButton("Save", func() {
@@ -1407,8 +1707,9 @@ func (c *Controller) EditConfigEntry() {
 		reg := cForm.GetFormItem(2).(*tview.InputField).GetText()
 		accessKey := cForm.GetFormItem(3).(*tview.InputField).GetText()
 		secretKey := cForm.GetFormItem(4).(*tview.InputField).GetText()
-		downloadDir := cForm.GetFormItem(5).(*tview.InputField).GetText()
-		ignoreSsl := cForm.GetFormItem(6).(*tview.Checkbox).IsChecked()
+		sessionToken := cForm.GetFormItem(5).(*tview.InputField).GetText()
+		downloadDir := cForm.GetFormItem(6).(*tview.InputField).GetText()
+		ignoreSsl := cForm.GetFormItem(7).(*tview.Checkbox).IsChecked()
 		var region *string
 		if reg != "" {
 			region = &reg
@@ -1419,14 +1720,15 @@ func (c *Controller) EditConfigEntry() {
 		entry.Region = region
 		entry.AccessKey = accessKey
 		entry.SecretKey = secretKey
+		entry.SessionToken = strings.TrimSpace(sessionToken)
 		entry.IgnoreSsl = ignoreSsl
 		entry.DownloadDir = strings.TrimSpace(downloadDir)
-		entry.MaxBytesPerSec = parseMaxBps(cForm.GetFormItem(7).(*tview.InputField).GetText())
+		entry.MaxBytesPerSec = parseMaxBps(cForm.GetFormItem(8).(*tview.InputField).GetText())
 
 		err := c.params.WriteConfig()
 		c.view.Pages.RemovePage("modal")
 		if err != nil {
-			go c.error("Failed to save config", err, false)
+			go c.error("Failed to save config", err)
 		}
 		c.fillConfigData()
 		c.view.List.SetCurrentItem(i)
@@ -1435,7 +1737,7 @@ func (c *Controller) EditConfigEntry() {
 		c.view.Pages.RemovePage("modal")
 	})
 
-	c.view.Pages.AddPage("modal", c.view.ModalEdit(cForm, 75, 21), true, true)
+	c.view.Pages.AddPage("modal", c.view.ModalEdit(cForm, 75, 23), true, true)
 }
 
 func (c *Controller) CopyProfile() {
@@ -1457,16 +1759,121 @@ func (c *Controller) CopyProfile() {
 					conf := *c.params.Config[i]
 					conf.Name = newName
 					if err := c.params.CopyConfig(conf); err != nil {
-						c.error("Failed to copy config", err, false)
+						c.error("Failed to copy config", err)
 						return
 					}
-					c.fillConfigData()
-					c.view.List.SetCurrentItem(len(c.params.Config) - 1)
+					// Widget rebuilds must run on the UI goroutine.
+					c.view.App.QueueUpdateDraw(func() {
+						c.fillConfigData()
+						c.view.List.SetCurrentItem(len(c.params.Config) - 1)
+					})
 				}()
 
 			}
 		})
 	c.view.Pages.AddAndSwitchToPage("confirm", confirm, true)
+}
+
+// uniqueProfileName returns base, or base-2/base-3/... when a profile of that
+// name already exists, so an import can never silently shadow a saved profile.
+func uniqueProfileName(base string, existing []*cfg.Config) string {
+	taken := make(map[string]bool, len(existing))
+	for _, e := range existing {
+		if e != nil {
+			taken[e.Name] = true
+		}
+	}
+	if !taken[base] {
+		return base
+	}
+	for n := 2; ; n++ {
+		candidate := fmt.Sprintf("%s-%d", base, n)
+		if !taken[candidate] {
+			return candidate
+		}
+	}
+}
+
+// awsProfileConfig converts an AWS shared profile into an s3duck profile
+// pointed at the regional AWS S3 endpoint.
+func awsProfileConfig(p cfg.AWSProfile, existing []*cfg.Config) cfg.Config {
+	conf := cfg.Config{
+		Name:         uniqueProfileName("aws-"+p.Name, existing),
+		BaseUrl:      p.EndpointURL(),
+		AccessKey:    p.AccessKey,
+		SecretKey:    p.SecretKey,
+		SessionToken: p.SessionToken,
+	}
+	if p.Region != "" {
+		region := p.Region
+		conf.Region = &region
+	}
+	return conf
+}
+
+// awsProfileRow renders one AWS profile for the import list: the name plus
+// either its region/credential kind or the reason it can't be imported.
+func awsProfileRow(p cfg.AWSProfile) (primary, secondary string) {
+	if !p.Usable() {
+		return fmt.Sprintf("[gray]%s  (%s)", p.Name, p.Err), p.Name
+	}
+	kind := "long-lived key"
+	if p.SessionToken != "" {
+		kind = "temporary credentials"
+	}
+	region := p.Region
+	if region == "" {
+		region = "no region"
+	}
+	return fmt.Sprintf("%s  [gray](%s, %s)", p.Name, region, kind), p.Name
+}
+
+// ImportAWSProfiles lists the profiles in ~/.aws/credentials and ~/.aws/config
+// and imports the selected one as an s3duck profile. This is the supported path
+// for temporary credentials (assume-role / SSO / MFA), which carry a session
+// token that a hand-typed key pair cannot express.
+func (c *Controller) ImportAWSProfiles() {
+	go func() {
+		profiles, err := cfg.LoadAWSProfiles(c.params.HomeDir)
+		if err != nil {
+			c.error("Import from AWS failed", err)
+			return
+		}
+
+		c.view.App.QueueUpdateDraw(func() {
+			list := tview.NewList()
+			list.SetBorder(true).SetTitle(" Import AWS profile ")
+			for _, p := range profiles {
+				primary, secondary := awsProfileRow(p)
+				list.AddItem(primary, secondary, 0, func() {
+					if !p.Usable() {
+						c.view.Pages.RemovePage("modal")
+						go c.error("Cannot import "+p.Name, fmt.Errorf("%s", p.Err))
+						return
+					}
+					conf := awsProfileConfig(p, c.params.Config)
+					c.view.Pages.RemovePage("modal")
+					if err := c.params.NewConfiguration(&conf); err != nil {
+						go c.error("Failed to save imported profile", err)
+						return
+					}
+					c.fillConfigData()
+					c.view.List.SetCurrentItem(len(c.params.Config) - 1)
+					// success() goes through QueueUpdateDraw; calling it inline
+					// here (we are on the UI goroutine) would deadlock the loop.
+					go c.success(fmt.Sprintf("imported AWS profile %s as %s", p.Name, conf.Name))
+				})
+			}
+			list.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+				if event.Key() == tcell.KeyEsc {
+					c.view.Pages.RemovePage("modal")
+					return nil
+				}
+				return event
+			})
+			c.view.Pages.AddPage("modal", c.view.ModalEdit(list, 76, 20), true, true)
+		})
+	}()
 }
 
 func (c *Controller) create(isBucket bool) {
@@ -1502,7 +1909,7 @@ func (c *Controller) create(isBucket bool) {
 
 		if err != nil {
 			c.view.Pages.RemovePage("modal")
-			go c.error("Error creating object", err, false)
+			go c.error("Error creating object", err)
 			return
 		}
 
@@ -1534,14 +1941,14 @@ func (c *Controller) CheckProfile() {
 
 	cf := c.params.Config[i]
 
-	mCf := model.NewConfig(cf.BaseUrl, cf.Region, cf.AccessKey, cf.SecretKey, !cf.IgnoreSsl, cf.MaxBytesPerSec)
+	mCf := model.NewConfig(cf.BaseUrl, cf.Region, cf.AccessKey, cf.SecretKey, cf.SessionToken, !cf.IgnoreSsl, cf.MaxBytesPerSec)
 	c.model = model.NewModel(mCf)
 
 	// ListBuckets is a network round-trip; run it off the UI goroutine so a
 	// slow or unreachable endpoint can't freeze the TUI.
 	go func() {
 		if _, err := c.model.ListBuckets(); err != nil {
-			c.error(fmt.Sprintf("error checking profile %s", cf.Name), err, false)
+			c.error(fmt.Sprintf("error checking profile %s", cf.Name), err)
 		} else {
 			c.success(fmt.Sprintf("successfully checked profile %s", cf.Name))
 		}
@@ -1563,10 +1970,11 @@ func (c *Controller) DeleteConfigEntry() {
 			if buttonLabel == "OK" {
 				go func() {
 					if err := c.params.DeleteConfig(i); err != nil {
-						c.error("Failed to delete config", err, false)
+						c.error("Failed to delete config", err)
 						return
 					}
-					c.fillConfigData()
+					// Widget rebuilds must run on the UI goroutine.
+					c.view.App.QueueUpdateDraw(c.fillConfigData)
 				}()
 
 			}
@@ -1585,8 +1993,9 @@ func (c *Controller) SelectAllVisible() {
 	if c.currentBucket == nil {
 		return
 	}
+	sk, sd := c.getSort()
 	var names []string
-	for _, obj := range filterSortObjects(c.objsSnapshot(), c.getFilter()) {
+	for _, obj := range filterSortObjects(c.objsSnapshot(), c.getFilter(), sk, sd) {
 		if obj.Ot == model.File || obj.Ot == model.Folder {
 			names = append(names, objKey(obj))
 		}
@@ -1661,7 +2070,7 @@ func (c *Controller) renameSingle() {
 			return
 		}
 		if strings.Contains(newName, "/") {
-			go c.error("Invalid name", fmt.Errorf("name must not contain '/'"), false)
+			go c.error("Invalid name", fmt.Errorf("name must not contain '/'"))
 			return
 		}
 
@@ -1673,7 +2082,7 @@ func (c *Controller) renameSingle() {
 		bucket := c.currentBucket
 		go func() {
 			if _, err := c.model.MoveKeys(context.Background(), bucket, bucket, srcKey, dstKey, isFolder, nil); err != nil {
-				c.error("Rename failed", err, false)
+				c.error("Rename failed", err)
 				return
 			}
 			c.setUndo(&undoOp{
@@ -1802,7 +2211,7 @@ func (c *Controller) batchRename(names []string) {
 
 		ops, err := planBatchRename(items, prefix, pattern, find, replace)
 		if err != nil {
-			go c.error("Batch rename", err, false)
+			go c.error("Batch rename", err)
 			return
 		}
 		c.runBatchRename(ops)
@@ -2021,13 +2430,10 @@ func (c *Controller) copyOrMove(isMove bool) {
 				dstPrefix := strings.TrimSpace(form.GetFormItem(1).(*tview.InputField).GetText())
 				c.view.Pages.RemovePage("modal")
 
-				dstPrefix = filepath.ToSlash(dstPrefix)
-				if dstPrefix != "" && !strings.HasSuffix(dstPrefix, "/") {
-					dstPrefix += "/"
-				}
+				dstPrefix = model.NormalizePrefix(dstPrefix)
 				sameBucket := dstBucketName == srcBucketName
 				if sameBucket && dstPrefix == srcPrefix {
-					go c.error(title+" failed", fmt.Errorf("destination equals source"), false)
+					go c.error(title+" failed", fmt.Errorf("destination equals source"))
 					return
 				}
 
@@ -2306,6 +2712,9 @@ func (c *Controller) setConfigInput() {
 		case tcell.KeyCtrlY:
 			c.CopyProfile()
 			return nil
+		case tcell.KeyCtrlI:
+			c.ImportAWSProfiles()
+			return nil
 		case tcell.KeyCtrlH:
 			help := c.view.HotkeysModal(true)
 
@@ -2315,7 +2724,7 @@ func (c *Controller) setConfigInput() {
 				return nil
 			})
 
-			c.view.Pages.AddPage("modal-help", c.view.ModalEdit(help, 70, 20), true, true)
+			c.view.Pages.AddPage("modal-help", c.view.ModalEdit(help, 70, 22), true, true)
 			return nil
 		case tcell.KeyCtrlV:
 			c.CheckProfile()
@@ -2334,12 +2743,8 @@ func (c *Controller) setConfigInput() {
 	})
 }
 
-// ShowSummary keeps backward compatibility if some places call ShowSummary().
-func (c *Controller) ShowSummary() { c.ShowSummaryModal() }
-
 // ShowSummaryModal opens graphical bucket/folder summary.
 func (c *Controller) ShowSummaryModal() {
-	// Determine scope
 	var bucket *model.Object
 	prefix := c.currentPath
 
@@ -2375,10 +2780,7 @@ func (c *Controller) ShowSummaryModal() {
 }
 
 func (c *Controller) showSummaryModalFor(bucket *model.Object, prefix string) {
-	// Normalize prefix
-	if prefix != "" && !strings.HasSuffix(prefix, "/") {
-		prefix += "/"
-	}
+	prefix = model.NormalizePrefix(prefix)
 
 	scopeLabel := *bucket.Key
 	if prefix != "" {
@@ -2388,7 +2790,7 @@ func (c *Controller) showSummaryModalFor(bucket *model.Object, prefix string) {
 	go func() {
 		objects, err := c.model.ListObjects(prefix, bucket)
 		if err != nil {
-			c.error("Failed to build summary", err, false)
+			c.error("Failed to build summary", err)
 			return
 		}
 
@@ -2406,13 +2808,6 @@ func (c *Controller) showSummaryModalFor(bucket *model.Object, prefix string) {
 				c.view.Pages.RemovePage("modal-summary")
 				c.showSummaryModalFor(bucket, nextPrefix)
 			})
-
-			// Global keys for modal
-			if prim, ok := graph.Root.(interface {
-				SetInputCapture(func(*tcell.EventKey) *tcell.EventKey) *tview.Box
-			}); ok {
-				_ = prim
-			}
 
 			wrapper := tview.NewFlex().SetDirection(tview.FlexRow)
 			wrapper.AddItem(graph.Root, 0, 1, true)
@@ -2539,7 +2934,25 @@ func detectCategory(key string) string {
 	}
 }
 
+// watchResize re-renders the active pane when its width changes, so the column
+// layout follows terminal resizes and dual-pane toggles instead of keeping the
+// widths it was built with. Converges after one extra render: the re-render
+// records the new width, so the next draw sees no change.
+func (c *Controller) watchResize() {
+	c.view.App.SetAfterDrawFunc(func(_ tcell.Screen) {
+		if !c.browsing {
+			return
+		}
+		_, _, w, _ := c.view.List.GetInnerRect()
+		if w > 0 && w != c.lastWidth {
+			c.lastWidth = w
+			go c.renderList()
+		}
+	})
+}
+
 func (c *Controller) setInput() {
+	c.watchResize()
 	c.view.App.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
 		case tcell.KeyCtrlQ:
@@ -2605,6 +3018,27 @@ func (c *Controller) listInputCapture(event *tcell.EventKey) *tcell.EventKey {
 		case 't':
 			c.ShowTransfers()
 			return nil
+		case 's':
+			c.CycleSort()
+			return nil
+		case 'S':
+			c.ToggleSortDir()
+			return nil
+		case 'r':
+			c.Refresh()
+			return nil
+		case 'v':
+			c.ShowVersions()
+			return nil
+		case 'm':
+			c.EditObjectMeta()
+			return nil
+		case 'c':
+			c.ChangeStorageClass()
+			return nil
+		case '=':
+			c.ComparePanes()
+			return nil
 		}
 	case tcell.KeyLeft:
 		if event.Modifiers()&tcell.ModAlt != 0 {
@@ -2616,6 +3050,12 @@ func (c *Controller) listInputCapture(event *tcell.EventKey) *tcell.EventKey {
 			c.HistoryForward()
 			return nil
 		}
+	case tcell.KeyF5:
+		c.Refresh()
+		return nil
+	case tcell.KeyCtrlE:
+		c.Sync()
+		return nil
 	case tcell.KeyCtrlF:
 		c.RecursiveSearch()
 		return nil
@@ -2673,7 +3113,7 @@ func (c *Controller) listInputCapture(event *tcell.EventKey) *tcell.EventKey {
 			c.view.Pages.RemovePage("modal-help")
 			return nil
 		})
-		c.view.Pages.AddPage("modal-help", c.view.ModalEdit(help, 74, 40), true, true)
+		c.view.Pages.AddPage("modal-help", c.view.ModalEdit(help, 76, 44), true, true)
 		return nil
 	case tcell.KeyCtrlA:
 		about := c.view.AboutModal()
@@ -2717,6 +3157,7 @@ func (c *Controller) swapPane() {
 
 	c.view.List = c.view.PaneList(c.active)
 	c.view.Filter = c.view.PaneFilter(c.active)
+	c.view.Header = c.view.PaneHeader(c.active)
 }
 
 // swapAndFocus switches the active pane (Tab), refreshes the border highlight
@@ -2761,6 +3202,7 @@ func (c *Controller) resetPanes() {
 	c.pane1Init = false
 	c.view.List = c.view.PaneList(0)
 	c.view.Filter = c.view.PaneFilter(0)
+	c.view.Header = c.view.PaneHeader(0)
 	c.mu.Lock()
 	c.selectedByScope = make(map[string]map[string]bool)
 	c.filter = ""
@@ -2817,7 +3259,7 @@ func (c *Controller) fillConfigData() {
 			c.Duck(conf.BaseUrl, conf.Region, conf.AccessKey, conf.SecretKey, !conf.IgnoreSsl)
 		})
 	}
-	c.view.SetFrameText("[::b][↓,↑][::-]Down/Up [::b][Enter[][::-]Use [::b][Ctrl+N[][::-]New [::b][Ctrl+Y[][::-]Yank(Copy) [::b][Ctrl+E[][::-]Edit [::b][Ctrl+V[][::-]Verify [::b][Del[][::-]Delete [::b][Ctrl+H[][::-]Hotkeys [::b][Ctrl+Q][::-]Quit")
+	c.view.SetFrameText("[::b][↓,↑][::-]Down/Up [::b][Enter[][::-]Use [::b][Ctrl+N[][::-]New [::b][Ctrl+I[][::-]Import AWS [::b][Ctrl+Y[][::-]Yank(Copy) [::b][Ctrl+E[][::-]Edit [::b][Ctrl+V[][::-]Verify [::b][Del[][::-]Delete [::b][Ctrl+H[][::-]Hotkeys [::b][Ctrl+Q][::-]Quit")
 }
 
 func (c *Controller) fillDetails(key string) {
@@ -2854,22 +3296,24 @@ func (c *Controller) fillDetails(key string) {
 }
 
 func (c *Controller) Duck(url string, region *string, acc string, sec string, ssl bool) {
+	// Throughput cap and session token come from the profile being opened
+	// (activeConfig is set by the caller just before Duck).
 	var maxBps int64
+	var token string
 	if c.activeConfig != nil {
 		maxBps = c.activeConfig.MaxBytesPerSec
+		token = c.activeConfig.SessionToken
 	}
-	mCf := model.NewConfig(url, region, acc, sec, ssl, maxBps)
+	mCf := model.NewConfig(url, region, acc, sec, token, ssl, maxBps)
 	c.model = model.NewModel(mCf)
-	c.resetPanes() // fresh single-pane browser for this profile
+	c.browsing = true // the browser owns the shared list widget from here on
+	c.resetPanes()    // fresh single-pane browser for this profile
 	c.wireListChanged(c.view.PaneList(0))
 	c.currentBucket = nil
 	c.currentPath = ""
 	c.bucketPos = 0
-	go func() {
-		if err := c.updateList(); err == nil {
-			c.setInput()
-		}
-	}()
+	c.setInput()
+	go c.updateList()
 }
 
 func (c *Controller) Run() error {
@@ -2886,7 +3330,10 @@ func (c *Controller) Run() error {
 	return c.view.App.Run()
 }
 
-func (c *Controller) error(header string, err error, fatal bool) {
+// error shows a modal error report. Safe only off the UI goroutine: it goes
+// through QueueUpdateDraw, so calling it inline from an input/button handler
+// deadlocks the event loop (use `go c.error(...)` there).
+func (c *Controller) error(header string, err error) {
 	errMsg := c.view.NewErrorMessageQ(header, err.Error())
 	errMsg.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
 		c.view.Pages.RemovePage("modal")
@@ -2954,7 +3401,7 @@ func (c *Controller) chooseDir(startPath string, onChosen func(dir string)) {
 
 		entries, err := os.ReadDir(curPath)
 		if err != nil {
-			go c.error("Failed to read directory", err, false)
+			go c.error("Failed to read directory", err)
 			return
 		}
 
@@ -3035,10 +3482,7 @@ func (c *Controller) ShowLocalFSModal(startPath string) {
 		fullPath := filepath.Join(currentPath, raw)
 
 		c.view.Pages.RemovePage("modal")
-		err := c.Upload(fullPath)
-		if err != nil {
-			go c.error("Upload failed", err, false)
-		}
+		c.Upload(fullPath)
 	})
 
 	cancelBtn := tview.NewButton("Cancel").SetSelectedFunc(func() {
@@ -3054,7 +3498,6 @@ func (c *Controller) ShowLocalFSModal(startPath string) {
 	flex, _ := layout.(*tview.Flex)
 	flex.AddItem(buttonRow, 1, 0, false)
 
-	// Maintain focusable order
 	focusables := []tview.Primitive{localList, okBtn, cancelBtn}
 	focusIndex := 0
 	setNextFocus := func() {
@@ -3070,7 +3513,7 @@ func (c *Controller) ShowLocalFSModal(startPath string) {
 
 		entries, err := os.ReadDir(curPath)
 		if err != nil {
-			go c.error("Failed to read directory", err, false)
+			go c.error("Failed to read directory", err)
 			return
 		}
 
@@ -3149,10 +3592,26 @@ func (c *Controller) ShowLocalFSModal(startPath string) {
 	renderList(startPath)
 }
 
-func (c *Controller) Upload(localPath string) error {
+func (c *Controller) Upload(localPath string) {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	files, totalSize, err := c.model.PrepareUpload(localPath, c.currentPath, c.currentBucket)
+	// Capture the destination now, on the UI goroutine. The byte phase starts
+	// only after a jobSem slot frees, which can be minutes later — reading
+	// c.currentBucket then would panic on the buckets screen, or silently
+	// upload into whatever bucket the user happens to be viewing.
+	dstBucket := c.currentBucket
+	dstPath := c.currentPath
+
+	files, totalSize, err := c.model.PrepareUpload(localPath, dstPath, dstBucket)
+	if err == nil && len(files) == 0 {
+		// A directory with no files is still uploadable: Upload creates its
+		// folder-marker object. Only a non-directory with nothing to send is
+		// an error.
+		if fi, statErr := os.Stat(localPath); statErr == nil && fi.IsDir() {
+			c.uploadEmptyDir(localPath, dstPath, dstBucket, cancel)
+			return
+		}
+	}
 	if err != nil || len(files) == 0 {
 		// Upload() runs on the tview UI goroutine (invoked from the local-FS
 		// modal's button). c.error() calls QueueUpdateDraw, which blocks until
@@ -3164,12 +3623,12 @@ func (c *Controller) Upload(localPath string) error {
 		if err == nil {
 			err = fmt.Errorf("nothing to upload")
 		}
-		go c.error("Upload failed", err, false)
-		return nil
+		go c.error("Upload failed", err)
+		return
 	}
 
 	first := files[0]
-	job := c.addJob("upload", fmt.Sprintf("%s → %s/%s", filepath.Base(localPath), *c.currentBucket.Key, c.currentPath), totalSize, len(files), cancel)
+	job := c.addJob("upload", fmt.Sprintf("%s → %s/%s", filepath.Base(localPath), *dstBucket.Key, dstPath), totalSize, len(files), cancel)
 
 	progress := tview.NewModal().
 		SetText("Starting upload...\n").
@@ -3206,14 +3665,16 @@ func (c *Controller) Upload(localPath string) error {
 			defer func() { <-c.jobSem }()
 		case <-ctx.Done():
 			c.finalizeJob(job, true, 0)
-			c.view.App.QueueUpdateDraw(func() { c.view.Pages.RemovePage("progress").SwitchToPage("main") })
+			// RemovePage only: SwitchToPage("main") would also hide the
+			// transfers panel the cancel was likely issued from.
+			c.view.App.QueueUpdateDraw(func() { c.view.Pages.RemovePage("progress") })
 			go c.updateList()
 			return
 		}
 		job.setStatus(jobRunning)
 		startTime = time.Now()
 
-		err := c.model.Upload(ctx, localPath, c.currentPath, c.currentBucket, func(n, total int64, i, count int, local, remote string) {
+		err := c.model.Upload(ctx, localPath, dstPath, dstBucket, func(n, total int64, i, count int, local, remote string) {
 			job.setProgress(n, i)
 			select {
 			case <-ctx.Done():
@@ -3261,7 +3722,7 @@ func (c *Controller) Upload(localPath string) error {
 						c.view.Pages.RemovePage("progress").SwitchToPage("main")
 					})
 				}
-				c.error("Upload failed", err, false)
+				c.error("Upload failed", err)
 				return
 			}
 
@@ -3282,8 +3743,22 @@ func (c *Controller) Upload(localPath string) error {
 			})
 		}
 	}()
+}
 
-	return nil
+// uploadEmptyDir uploads a directory that contains no files: Upload creates
+// its folder-marker object. There are no bytes to meter, so this skips the
+// progress modal and the transfer queue entirely.
+func (c *Controller) uploadEmptyDir(localPath, dstPath string, dstBucket *model.Object, cancel context.CancelFunc) {
+	go func() {
+		defer cancel()
+		if err := c.model.Upload(context.Background(), localPath, dstPath, dstBucket, nil); err != nil {
+			c.error("Upload failed", err)
+			return
+		}
+		c.logActivity("Upload: empty folder %s → %s/%s", filepath.Base(localPath), *dstBucket.Key, dstPath)
+		c.success("Empty folder created")
+		c.updateList()
+	}()
 }
 
 func (c *Controller) ShowFileProperties(key string) {
@@ -3337,7 +3812,7 @@ func (c *Controller) PresignLink(key string) {
 		return
 	}
 	if obj.FullPath == nil {
-		go c.error("Presign", fmt.Errorf("object has no path"), false)
+		go c.error("Presign", fmt.Errorf("object has no path"))
 		return
 	}
 	bucket := c.currentBucket
@@ -3378,7 +3853,7 @@ func (c *Controller) PresignLink(key string) {
 			go func() {
 				link, err := c.model.PresignGetURL(bucket, fullPath, ttl)
 				if err != nil {
-					c.error("Presign failed", err, false)
+					c.error("Presign failed", err)
 					return
 				}
 				u.CopyToClipboard(link)
@@ -3502,7 +3977,7 @@ func (c *Controller) runAllBucketsSearch(query string) {
 		buckets, err := c.model.ListBuckets()
 		if err != nil {
 			c.view.App.QueueUpdateDraw(func() { c.view.Pages.RemovePage("searching") })
-			c.error("Search failed", err, false)
+			c.error("Search failed", err)
 			return
 		}
 		var hits []searchHit
@@ -3544,7 +4019,7 @@ func (c *Controller) runRecursiveSearch(bucket *model.Object, prefix, query stri
 		objs, err := c.model.ListObjects(prefix, bucket)
 		if err != nil {
 			c.view.App.QueueUpdateDraw(func() { c.view.Pages.RemovePage("searching") })
-			c.error("Search failed", err, false)
+			c.error("Search failed", err)
 			return
 		}
 		hits, truncated := computeHits(objs, query, searchMaxResults)
@@ -3642,11 +4117,13 @@ func (c *Controller) jumpTo(bucketName, prefix, selectKey string) {
 	go func() {
 		bucket := c.findBucketByName(bucketName)
 		if bucket == nil {
-			c.error("Jump", fmt.Errorf("bucket %q not found", bucketName), false)
+			c.error("Jump", fmt.Errorf("bucket %q not found", bucketName))
 			return
 		}
 		c.currentBucket = bucket
-		c.model.RefreshClient(&bucketName)
+		if err := c.model.RefreshClient(&bucketName); err != nil {
+			c.error("Failed to resolve bucket region", err)
+		}
 		c.currentPath = prefix
 		if selectKey != "" {
 			c.restoreNext = selectKey
@@ -3723,12 +4200,12 @@ func (c *Controller) addCurrentBookmark(list *tview.List) {
 	bm := cfg.Bookmark{Name: name, Bucket: *c.currentBucket.Key, Prefix: c.currentPath}
 	newList, added := addBookmark(c.activeConfig.Bookmarks, bm)
 	if !added {
-		go c.error("Bookmark", fmt.Errorf("this location is already bookmarked"), false)
+		go c.error("Bookmark", fmt.Errorf("this location is already bookmarked"))
 		return
 	}
 	c.activeConfig.Bookmarks = newList
 	if err := c.params.WriteConfig(); err != nil {
-		go c.error("Bookmark", err, false)
+		go c.error("Bookmark", err)
 		return
 	}
 	c.rebuildBookmarkList(list)
@@ -3741,7 +4218,7 @@ func (c *Controller) removeBookmarkAt(list *tview.List) {
 	}
 	c.activeConfig.Bookmarks = append(c.activeConfig.Bookmarks[:idx], c.activeConfig.Bookmarks[idx+1:]...)
 	if err := c.params.WriteConfig(); err != nil {
-		go c.error("Bookmark", err, false)
+		go c.error("Bookmark", err)
 		return
 	}
 	c.rebuildBookmarkList(list)
@@ -3834,7 +4311,9 @@ func (c *Controller) navigateTo(loc location) {
 	go func() {
 		name := *loc.bucket.Key
 		c.currentBucket = loc.bucket
-		c.model.RefreshClient(&name)
+		if err := c.model.RefreshClient(&name); err != nil {
+			c.error("Failed to resolve bucket region", err)
+		}
 		c.currentPath = loc.path
 		c.restoreNext = ".."
 		c.updateList()
@@ -3893,8 +4372,13 @@ func (c *Controller) paletteActions() []paletteAction {
 		{"Clipboard: cut", func() { c.yank("cut") }},
 		{"Clipboard: paste", c.paste},
 		{"Undo last move/rename", c.Undo},
+		{"Sync (local ⇄ remote, or remote → remote)", c.Sync},
+		{"Compare the two panes", c.ComparePanes},
 		{"Transfers", c.ShowTransfers},
 		{"Filter listing", c.focusFilter},
+		{"Refresh listing", c.Refresh},
+		{"Sort: cycle name/size/date", c.CycleSort},
+		{"Sort: reverse direction", c.ToggleSortDir},
 		{"Recursive search", c.RecursiveSearch},
 		{"Bookmarks", c.Bookmarks},
 		{"Toggle dual-pane", c.ToggleDualPane},
@@ -3902,6 +4386,9 @@ func (c *Controller) paletteActions() []paletteAction {
 		{"History forward", c.HistoryForward},
 		{"Size summary", c.ShowSummaryModal},
 		{"Properties", func() { c.ShowFileProperties(c.getSelectedObjectName()) }},
+		{"Versions (history / restore)", c.ShowVersions},
+		{"Metadata & tags", c.EditObjectMeta},
+		{"Storage class / Glacier restore", c.ChangeStorageClass},
 		{"Presign link", func() { c.PresignLink(c.getSelectedObjectName()) }},
 		{"Select all visible", c.SelectAllVisible},
 		{"Clear selection", c.ClearSelection},
@@ -4028,7 +4515,7 @@ func (c *Controller) AbortMultipartUploads() {
 	go func() {
 		ups, err := c.model.ListMultipartUploads(bucket)
 		if err != nil {
-			c.error("Multipart uploads", err, false)
+			c.error("Multipart uploads", err)
 			return
 		}
 		c.view.App.QueueUpdateDraw(func() { c.presentMultipartUploads(bucket, ups) })
@@ -4062,7 +4549,7 @@ func (c *Controller) presentMultipartUploads(bucket *model.Object, ups []model.M
 		up := items[i]
 		go func() {
 			if err := c.model.AbortMultipartUpload(bucket, up.Key, up.UploadID); err != nil {
-				c.error("Abort upload", err, false)
+				c.error("Abort upload", err)
 				return
 			}
 			c.logActivity("aborted incomplete upload %s (%s)", up.Key, *bucket.Key)
@@ -4083,7 +4570,7 @@ func (c *Controller) presentMultipartUploads(bucket *model.Object, ups []model.M
 		go func() {
 			for _, up := range snapshot {
 				if err := c.model.AbortMultipartUpload(bucket, up.Key, up.UploadID); err != nil {
-					c.error("Abort upload", err, false)
+					c.error("Abort upload", err)
 					return
 				}
 				c.logActivity("aborted incomplete upload %s (%s)", up.Key, *bucket.Key)
@@ -4148,7 +4635,7 @@ func (c *Controller) BucketDashboard() {
 	go func() {
 		info, err := c.model.BucketConfig(bucket)
 		if err != nil {
-			c.error("Bucket config", err, false)
+			c.error("Bucket config", err)
 			return
 		}
 		c.view.App.QueueUpdateDraw(func() {

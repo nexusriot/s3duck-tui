@@ -1,6 +1,7 @@
 package model
 
 import (
+	"context"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -14,7 +15,7 @@ import (
 // against a model built from a static config.
 func TestPresignGetURL(t *testing.T) {
 	region := "us-east-1"
-	m := NewModel(NewConfig("https://s3.example.com", &region, "ak", "sk", true, 0))
+	m := NewModel(NewConfig("https://s3.example.com", &region, "ak", "sk", "", true, 0))
 	bucket := &Object{Key: strPtr("my-bucket")}
 
 	link, err := m.PresignGetURL(bucket, "dir/file.txt", time.Hour)
@@ -39,7 +40,7 @@ func TestPresignGetURL(t *testing.T) {
 }
 
 func TestPresignGetURLCapsTTL(t *testing.T) {
-	m := NewModel(NewConfig("https://s3.example.com", nil, "ak", "sk", true, 0))
+	m := NewModel(NewConfig("https://s3.example.com", nil, "ak", "sk", "", true, 0))
 	bucket := &Object{Key: strPtr("b")}
 
 	link, err := m.PresignGetURL(bucket, "k", PresignMaxTTL+time.Hour)
@@ -54,7 +55,7 @@ func TestPresignGetURLCapsTTL(t *testing.T) {
 }
 
 func TestPresignGetURLValidation(t *testing.T) {
-	m := NewModel(NewConfig("https://s3.example.com", nil, "ak", "sk", true, 0))
+	m := NewModel(NewConfig("https://s3.example.com", nil, "ak", "sk", "", true, 0))
 	bucket := &Object{Key: strPtr("b")}
 
 	if _, err := m.PresignGetURL(nil, "k", time.Hour); err == nil {
@@ -72,7 +73,7 @@ func strPtr(s string) *string { return &s }
 
 func TestNewConfig(t *testing.T) {
 	region := "eu-west-1"
-	c := NewConfig("https://example.com", &region, "ak", "sk", true, 1024)
+	c := NewConfig("https://example.com", &region, "ak", "sk", "tok", true, 1024)
 
 	if c.Url != "https://example.com" {
 		t.Errorf("Url = %q", c.Url)
@@ -90,7 +91,7 @@ func TestNewConfig(t *testing.T) {
 		t.Errorf("MaxBytesPerSec = %d, want 1024", c.MaxBytesPerSec)
 	}
 
-	c2 := NewConfig("u", nil, "", "", false, 0)
+	c2 := NewConfig("u", nil, "", "", "", false, 0)
 	if c2.Region != nil {
 		t.Errorf("Region = %v, want nil", c2.Region)
 	}
@@ -169,11 +170,10 @@ func TestRateLimiterWait(t *testing.T) {
 // PrepareUpload does not touch the S3 client or the bucket argument, so it is
 // exercised here purely against the local filesystem.
 //
-// Note: PrepareUpload computes remote keys relative to localPath (the selected
-// directory itself), i.e. WITHOUT the top-level directory name. model.Upload
-// uses a different base (parent of localPath) and DOES include it. This test
-// pins PrepareUpload's current contract; the divergence between the two is a
-// known issue, not something this test endorses.
+// For a directory, keys are relative to the PARENT of localPath — the uploaded
+// tree keeps its top-level directory name, matching model.Upload's derivation
+// exactly (the two used to diverge, which made the preview promise
+// destinations the objects never landed on).
 func TestPrepareUploadSingleFile(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "hello.txt")
@@ -236,10 +236,11 @@ func TestPrepareUploadDirectory(t *testing.T) {
 	for _, tg := range targets {
 		got[tg.RemotePath] = tg.Size
 	}
+	base := filepath.Base(root)
 	want := map[string]int64{
-		"pre/a.txt":          2,
-		"pre/sub/b.txt":      4,
-		"pre/sub/deep/c.txt": 6,
+		"pre/" + base + "/a.txt":          2,
+		"pre/" + base + "/sub/b.txt":      4,
+		"pre/" + base + "/sub/deep/c.txt": 6,
 	}
 	if len(got) != len(want) {
 		t.Fatalf("targets = %v, want keys %v", got, want)
@@ -314,13 +315,13 @@ func TestCopyObjectValidation(t *testing.T) {
 	m := &Model{}
 	b := &Object{Key: strPtr("bucket")}
 
-	if err := m.CopyObject(nil, b, "a", "b"); err == nil {
+	if err := m.CopyObject(context.TODO(), nil, b, "a", "b"); err == nil {
 		t.Error("nil source bucket: want error")
 	}
-	if err := m.CopyObject(b, nil, "a", "b"); err == nil {
+	if err := m.CopyObject(context.TODO(), b, nil, "a", "b"); err == nil {
 		t.Error("nil dest bucket: want error")
 	}
-	if err := m.CopyObject(b, b, "same", "same"); err == nil {
+	if err := m.CopyObject(context.TODO(), b, b, "same", "same"); err == nil {
 		t.Error("same bucket + same key: want error")
 	}
 }
@@ -328,10 +329,42 @@ func TestCopyObjectValidation(t *testing.T) {
 func TestCopyKeysNilBuckets(t *testing.T) {
 	m := &Model{}
 	b := &Object{Key: strPtr("bucket")}
-	if _, err := m.CopyKeys(nil, nil, b, "a", "b", false, nil); err == nil {
+	if _, err := m.CopyKeys(context.TODO(), nil, b, "a", "b", false, nil); err == nil {
 		t.Error("nil source bucket: want error")
 	}
-	if _, err := m.CopyKeys(nil, b, nil, "a", "b", false, nil); err == nil {
+	if _, err := m.CopyKeys(context.TODO(), b, nil, "a", "b", false, nil); err == nil {
 		t.Error("nil dest bucket: want error")
+	}
+}
+
+func TestNormalizeBucketLocation(t *testing.T) {
+	cases := map[string]string{
+		"":           "us-east-1", // S3 reports the classic region as empty
+		"EU":         "eu-west-1", // pre-2009 Ireland buckets use the legacy alias
+		"eu-west-1":  "eu-west-1",
+		"ap-south-1": "ap-south-1",
+	}
+	for in, want := range cases {
+		if got := normalizeBucketLocation(in); got != want {
+			t.Errorf("normalizeBucketLocation(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestCopySourceEscapesPlus(t *testing.T) {
+	// S3 decodes x-amz-copy-source query-style: a literal "+" means a space,
+	// so it must be sent as %2B or "report+final.pdf" is looked up as
+	// "report final.pdf".
+	got := copySource("b", "dir/report+final.pdf")
+	if strings.Contains(got, "+") {
+		t.Errorf("unescaped + in copy source: %q", got)
+	}
+	if !strings.Contains(got, "%2B") {
+		t.Errorf("+ should be %%2B: %q", got)
+	}
+	// Spaces and unicode still escape as before.
+	got = copySource("b", "a b/ü.txt")
+	if strings.Contains(got, " ") {
+		t.Errorf("unescaped space: %q", got)
 	}
 }

@@ -290,7 +290,7 @@ func TestFilterSortObjects(t *testing.T) {
 	}
 
 	t.Run("empty filter returns all, folders first then name", func(t *testing.T) {
-		got := names(filterSortObjects(objs, ""))
+		got := names(filterSortObjects(objs, "", sortName, false))
 		want := []string{"alpha", "gamma", "Beta.txt", "Zeta.txt"}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("got %v, want %v", got, want)
@@ -298,7 +298,7 @@ func TestFilterSortObjects(t *testing.T) {
 	})
 
 	t.Run("case-insensitive substring on the display name", func(t *testing.T) {
-		got := names(filterSortObjects(objs, "ETA")) // Beta.txt, Zeta.txt
+		got := names(filterSortObjects(objs, "ETA", sortName, false)) // Beta.txt, Zeta.txt
 		want := []string{"Beta.txt", "Zeta.txt"}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("got %v, want %v", got, want)
@@ -306,13 +306,13 @@ func TestFilterSortObjects(t *testing.T) {
 	})
 
 	t.Run("no match returns empty", func(t *testing.T) {
-		if got := filterSortObjects(objs, "nomatch"); len(got) != 0 {
+		if got := filterSortObjects(objs, "nomatch", sortName, false); len(got) != 0 {
 			t.Errorf("got %d results, want 0", len(got))
 		}
 	})
 
 	t.Run("does not mutate input order", func(t *testing.T) {
-		_ = filterSortObjects(objs, "")
+		_ = filterSortObjects(objs, "", sortName, false)
 		if objs[0] == nil || *objs[0].Key != "Zeta.txt" {
 			t.Errorf("input slice was reordered")
 		}
@@ -815,5 +815,214 @@ func TestDownloadSummaryCaps(t *testing.T) {
 	out := s.text(0, false)
 	if !strings.Contains(out, "...and 2 more") {
 		t.Errorf("expected overflow note '...and 2 more' in:\n%s", out)
+	}
+}
+
+func TestFilterSortObjectsOrdering(t *testing.T) {
+	ts := func(offset time.Duration) *time.Time {
+		v := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).Add(offset)
+		return &v
+	}
+	size := func(n int64) *int64 { return &n }
+	file := func(name string, n int64, offset time.Duration) *model.Object {
+		return &model.Object{Key: strptr(name), Ot: model.File, Size: size(n), LastModified: ts(offset)}
+	}
+	objs := []*model.Object{
+		file("big.bin", 300, 3*time.Hour),
+		file("small.txt", 100, time.Hour),
+		file("mid.txt", 200, 2*time.Hour),
+		{Key: strptr("zdir"), Ot: model.Folder},
+		{Key: strptr("adir"), Ot: model.Folder},
+	}
+	names := func(in []*model.Object) []string {
+		out := make([]string, 0, len(in))
+		for _, o := range in {
+			out = append(out, *o.Key)
+		}
+		return out
+	}
+
+	t.Run("folders stay first whatever the key or direction", func(t *testing.T) {
+		for _, key := range []sortKey{sortName, sortSize, sortDate} {
+			for _, desc := range []bool{false, true} {
+				got := names(filterSortObjects(objs, "", key, desc))
+				if got[0] != "adir" && got[0] != "zdir" {
+					t.Errorf("key=%v desc=%v: got %v, want a folder first", key, desc, got)
+				}
+				if got[1] != "adir" && got[1] != "zdir" {
+					t.Errorf("key=%v desc=%v: got %v, want both folders first", key, desc, got)
+				}
+			}
+		}
+	})
+
+	t.Run("size ascending and descending", func(t *testing.T) {
+		got := names(filterSortObjects(objs, "", sortSize, false))[2:]
+		if want := []string{"small.txt", "mid.txt", "big.bin"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("asc: got %v, want %v", got, want)
+		}
+		got = names(filterSortObjects(objs, "", sortSize, true))[2:]
+		if want := []string{"big.bin", "mid.txt", "small.txt"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("desc: got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("date ascending and descending", func(t *testing.T) {
+		got := names(filterSortObjects(objs, "", sortDate, false))[2:]
+		if want := []string{"small.txt", "mid.txt", "big.bin"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("asc: got %v, want %v", got, want)
+		}
+		got = names(filterSortObjects(objs, "", sortDate, true))[2:]
+		if want := []string{"big.bin", "mid.txt", "small.txt"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("desc: got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("name descending reverses the files", func(t *testing.T) {
+		got := names(filterSortObjects(objs, "", sortName, true))[2:]
+		if want := []string{"small.txt", "mid.txt", "big.bin"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+
+	t.Run("equal keys tie-break on name ascending in both directions", func(t *testing.T) {
+		// Folders carry no size or timestamp, so every folder pair is a tie.
+		for _, desc := range []bool{false, true} {
+			got := names(filterSortObjects(objs, "dir", sortSize, desc))
+			if want := []string{"adir", "zdir"}; !reflect.DeepEqual(got, want) {
+				t.Errorf("desc=%v: got %v, want %v", desc, got, want)
+			}
+		}
+	})
+
+	t.Run("filter still applies under every key", func(t *testing.T) {
+		got := names(filterSortObjects(objs, ".txt", sortSize, false))
+		if want := []string{"small.txt", "mid.txt"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("got %v, want %v", got, want)
+		}
+	})
+}
+
+func TestSortKeyCycleAndLabel(t *testing.T) {
+	if got := sortName.next(); got != sortSize {
+		t.Errorf("name.next() = %v, want size", got)
+	}
+	if got := sortSize.next(); got != sortDate {
+		t.Errorf("size.next() = %v, want date", got)
+	}
+	if got := sortDate.next(); got != sortName {
+		t.Errorf("date.next() = %v, want name (wraps)", got)
+	}
+	if got := sortLabel(sortSize, true); got != "sort:size↓" {
+		t.Errorf("got %q", got)
+	}
+	if got := sortLabel(sortName, false); got != "sort:name↑" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestDeleteConfirmText(t *testing.T) {
+	t.Run("single target names the key and its cost", func(t *testing.T) {
+		got := deleteConfirmText([]deleteTarget{{key: "photos/a.jpg", objects: 1, bytes: 2048}})
+		if !strings.Contains(got, "Delete photos/a.jpg?") {
+			t.Errorf("got %q", got)
+		}
+		if !strings.Contains(got, "1 object(s), 2.0 KiB") {
+			t.Errorf("got %q", got)
+		}
+	})
+
+	t.Run("multiple targets are counted and totalled", func(t *testing.T) {
+		targets := []deleteTarget{
+			{key: "a/", isFolder: true, objects: 10, bytes: 1024},
+			{key: "b.txt", objects: 1, bytes: 1024},
+		}
+		got := deleteConfirmText(targets)
+		if !strings.Contains(got, "Delete 2 item(s)?") {
+			t.Errorf("got %q", got)
+		}
+		if !strings.Contains(got, "11 object(s), 2.0 KiB") {
+			t.Errorf("got %q", got)
+		}
+	})
+
+	t.Run("long lists are truncated", func(t *testing.T) {
+		var targets []deleteTarget
+		for i := 0; i < 10; i++ {
+			targets = append(targets, deleteTarget{key: fmt.Sprintf("f%d", i), objects: 1})
+		}
+		if got := deleteConfirmText(targets); !strings.Contains(got, "...and 4 more") {
+			t.Errorf("got %q", got)
+		}
+	})
+
+	t.Run("a failed scan is disclosed, not hidden", func(t *testing.T) {
+		targets := []deleteTarget{
+			{key: "ok/", isFolder: true, objects: 3, bytes: 10},
+			{key: "bad/", isFolder: true, scanErr: errors.New("access denied")},
+		}
+		got := deleteConfirmText(targets)
+		if !strings.Contains(got, "could not be sized") {
+			t.Errorf("expected an incomplete-totals warning, got %q", got)
+		}
+	})
+}
+
+func TestUniqueProfileName(t *testing.T) {
+	existing := []*cfg.Config{{Name: "aws-default"}, {Name: "aws-default-2"}, nil}
+	if got := uniqueProfileName("aws-prod", existing); got != "aws-prod" {
+		t.Errorf("got %q, want the base name when free", got)
+	}
+	if got := uniqueProfileName("aws-default", existing); got != "aws-default-3" {
+		t.Errorf("got %q, want aws-default-3 (2 is taken)", got)
+	}
+	if got := uniqueProfileName("x", nil); got != "x" {
+		t.Errorf("got %q", got)
+	}
+}
+
+func TestAwsProfileConfig(t *testing.T) {
+	p := cfg.AWSProfile{Name: "prod", AccessKey: "AK", SecretKey: "SK", SessionToken: "TOK", Region: "eu-west-1"}
+	got := awsProfileConfig(p, []*cfg.Config{{Name: "aws-prod"}})
+
+	if got.Name != "aws-prod-2" {
+		t.Errorf("name = %q, want the de-duplicated aws-prod-2", got.Name)
+	}
+	if got.BaseUrl != "https://s3.eu-west-1.amazonaws.com" {
+		t.Errorf("url = %q", got.BaseUrl)
+	}
+	if got.Region == nil || *got.Region != "eu-west-1" {
+		t.Errorf("region = %v", got.Region)
+	}
+	if got.SessionToken != "TOK" {
+		t.Errorf("session token was dropped: %q", got.SessionToken)
+	}
+
+	noRegion := awsProfileConfig(cfg.AWSProfile{Name: "d", AccessKey: "A", SecretKey: "S"}, nil)
+	if noRegion.Region != nil {
+		t.Errorf("region = %v, want nil when unset", noRegion.Region)
+	}
+	if noRegion.BaseUrl != "https://s3.amazonaws.com" {
+		t.Errorf("url = %q, want the global endpoint", noRegion.BaseUrl)
+	}
+}
+
+func TestAwsProfileRow(t *testing.T) {
+	primary, secondary := awsProfileRow(cfg.AWSProfile{Name: "prod", AccessKey: "A", SecretKey: "S", Region: "us-east-1"})
+	if secondary != "prod" {
+		t.Errorf("secondary = %q", secondary)
+	}
+	if !strings.Contains(primary, "us-east-1") || !strings.Contains(primary, "long-lived key") {
+		t.Errorf("primary = %q", primary)
+	}
+
+	primary, _ = awsProfileRow(cfg.AWSProfile{Name: "tmp", AccessKey: "A", SecretKey: "S", SessionToken: "T"})
+	if !strings.Contains(primary, "temporary credentials") || !strings.Contains(primary, "no region") {
+		t.Errorf("primary = %q", primary)
+	}
+
+	primary, _ = awsProfileRow(cfg.AWSProfile{Name: "sso", Err: "SSO profile: ..."})
+	if !strings.Contains(primary, "SSO profile") {
+		t.Errorf("unusable profiles must show why: %q", primary)
 	}
 }

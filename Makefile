@@ -1,4 +1,3 @@
-# ---------------------------------------------------------------------------
 # s3duck-tui Makefile
 #
 # Cross-build targets + Debian packaging.
@@ -19,12 +18,12 @@
 #   deb-amd64  deb-arm64  deb-armhf   ->  build/<pkg>.deb
 #
 # Override version:   make debs VERSION=0.0.40
-# ---------------------------------------------------------------------------
+# The version is also hard-coded in pkg/view/view.go and build-deb.sh; bump all three.
 
 APP        := s3duck-tui
 PKG        := ./cmd/s3duck-tui
 GO         ?= go
-VERSION    ?= 0.1.8
+VERSION    ?= 0.5.1
 LDFLAGS    ?= -s -w
 BUILD_DIR  := build
 DIST_DIR   := dist
@@ -67,7 +66,8 @@ help:
 	@echo "  make pizero2w-armhf     - linux/arm v7 (Pi Zero 2 W, 32-bit OS)"
 	@echo "  make darwin windows     - macOS / Windows (README-documented)"
 	@echo "  make debs               - deb-amd64 + deb-arm64 + deb-armhf"
-	@echo "  make test | test-race | vet | fmt | tidy | clean"
+	@echo "  make test | test-race | check | staticcheck | vet | fmt | tidy | clean"
+	@echo "  make test-integration   - tagged suite against a throwaway MinIO in Docker"
 
 .PHONY: tidy
 tidy:
@@ -87,6 +87,48 @@ test:
 
 .PHONY: test-race
 test-race:
+	$(GO) test -race -count=1 ./...
+
+# Integration tests need a live S3 endpoint. This target brings MinIO up in
+# Docker, runs the tagged suite against it, and tears it down again. To use an
+# endpoint you already have, set S3DUCK_TEST_ENDPOINT and run test-integration-run.
+MINIO_IMAGE     ?= quay.io/minio/minio
+MINIO_CONTAINER ?= s3duck-test-minio
+MINIO_PORT      ?= 19000
+
+.PHONY: test-integration
+test-integration:
+	@docker rm -f $(MINIO_CONTAINER) >/dev/null 2>&1 || true
+	docker run -d --name $(MINIO_CONTAINER) -p $(MINIO_PORT):9000 \
+		-e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
+		$(MINIO_IMAGE) server /data
+	@echo "waiting for MinIO on :$(MINIO_PORT)..."
+	@for i in $$(seq 1 60); do \
+		curl -sf http://localhost:$(MINIO_PORT)/minio/health/live >/dev/null && break; \
+		sleep 1; \
+	done
+	@S3DUCK_TEST_ENDPOINT=http://localhost:$(MINIO_PORT) \
+		$(GO) test -tags integration -count=1 -v ./... ; \
+		status=$$? ; \
+		docker rm -f $(MINIO_CONTAINER) >/dev/null 2>&1 || true ; \
+		exit $$status
+
+# Run the tagged suite against whatever S3DUCK_TEST_ENDPOINT points at.
+.PHONY: test-integration-run
+test-integration-run:
+	$(GO) test -tags integration -count=1 -v ./...
+
+.PHONY: staticcheck
+staticcheck:
+	staticcheck ./...
+
+# Everything CI enforces, in one target.
+.PHONY: check
+check:
+	@test -z "$$(gofmt -l .)" || { echo "not gofmt-clean:"; gofmt -l .; exit 1; }
+	$(GO) vet ./...
+	$(GO) vet -tags integration ./...
+	$(GO) build ./...
 	$(GO) test -race -count=1 ./...
 
 .PHONY: run

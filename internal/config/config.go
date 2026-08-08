@@ -31,7 +31,10 @@ type Config struct {
 	Region    *string `json:"region"`
 	AccessKey string  `json:"access_key"`
 	SecretKey string  `json:"secret_key"`
-	IgnoreSsl bool    `json:"ignore_ssl"`
+	// SessionToken is the STS session token that accompanies temporary
+	// credentials (assume-role, SSO, MFA). Empty for long-lived key pairs.
+	SessionToken string `json:"session_token,omitempty"`
+	IgnoreSsl    bool   `json:"ignore_ssl"`
 	// DownloadDir is the destination for downloads. Empty -> ~/Downloads.
 	// A leading "~" is expanded to the user's home directory.
 	DownloadDir string `json:"download_dir,omitempty"`
