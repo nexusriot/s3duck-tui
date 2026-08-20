@@ -28,6 +28,14 @@ Known constraints live in [DESIGN.md](DESIGN.md); user-facing docs in [README.md
 
 ## Soon
 
+- **Batch dedupe** `[S–M]` — the duplicate finder (`D`, v0.6.0) deletes one copy at a
+  time; a "keep the oldest, delete the rest" action per group (and one for all groups,
+  with a totals confirm like the delete flow's) is its natural completion.
+  `findDuplicates` already orders members keeper-first, so the plan is `Members[1:]`.
+- **Duplicate scan across all buckets** `[S]` — same checkbox the recursive search
+  already has; stale cross-bucket copies (migrations, abandoned backups) are the
+  common real case.
+- **Export the duplicate report** `[S]` — pairs with the export-listing item below.
 - **Presigned PUT** `[S]` — `PresignGetURL` exists; the upload counterpart is ~15 lines
   and enables "send me a file" workflows.
 - **Copy `s3://` URI** `[S]` — and fix `CopyToClipboard` swallowing errors while there.
@@ -40,6 +48,19 @@ Known constraints live in [DESIGN.md](DESIGN.md); user-facing docs in [README.md
   usable outside the TUI.
 - **Summary by storage class** `[S]` — `buildSummary` groups by category/prefix; a class
   breakdown is the closest thing to a cost view the app can offer.
+- **Post-transfer verify** `[M]` — droid parity: after a download, MD5 the local
+  file and compare against the ETag (single-part only — multipart tags carry a
+  `-N` suffix and are skipped honestly). Also usable as a standalone "verify
+  local file against object" action, upgrading compare/sync from size-match to
+  content-match for single-part objects.
+- **Watch mode** `[S]` — a toggle that re-lists the current prefix every few
+  seconds and highlights new/changed rows; for watching a pipeline drop files
+  into a bucket. The transfers panel's ticker pattern already exists.
+- **Anonymous profiles** `[S]` — a "public bucket (no credentials)" checkbox
+  using `aws.AnonymousCredentials`, for browsing public datasets. Today a
+  profile always signs requests, so public-only access is impossible.
+- **Search filters** `[M]` — extend recursive search beyond name-substring with
+  size/date predicates (`>100M`, `<2025-01-01`).
 - **Saved sync jobs** `[S]` — persist local dir + direction + destination per profile
   (the `Bookmarks` pattern), re-run from the palette.
 - **Per-upload server-side encryption** `[S–M]` — the dashboard reads bucket encryption
@@ -54,15 +75,28 @@ Known constraints live in [DESIGN.md](DESIGN.md); user-facing docs in [README.md
 - **OS keyring for secrets** `[M]` — `secret_key` / `session_token` are plaintext (0600).
 - **Text preview via ranged GET** `[M]`.
 - **Download resume** `[L]`.
+- **Dual panes on different profiles** `[L]` — the cross-profile copy (`>`,
+  v0.7.0) built the two-client substrate; pointing the second pane at another
+  profile is the natural next step.
 
-## Hardening (from the 2026-08 functional review)
+## Hardening (verified, not yet fixed)
 
-Verified findings not yet fixed; the fixed ones are listed in DESIGN.md's history.
+From the 2026-08 functional reviews; the fixed ones are listed in DESIGN.md's history
+(latest round: 2026-08-11, v0.7.1).
 
 - **Navigation race, dual-pane variant** — `Down`/`jumpTo`/`navigateTo` goroutines write
   the live pane fields without synchronization; Tab during a slow bucket-open lands the
   navigation in the other pane. Proper fix: navigation state passed through the refresh
   path instead of mutated in place. (Long documented for the single-pane case.)
+- **`RefreshClient` mutates the shared model mid-transfer** — entering a bucket rebuilds
+  `m.Client`/`m.Downloader` in place, so a running transfer *on the same profile* can
+  see the region swap under it (cross-profile retargeting is fixed — clients are
+  captured at entry — this is the same-profile variant). Wants navigation to build a
+  new Model instead of mutating the shared one.
+- **Download throttle is bursty** — throttling sleeps after each 5 MiB buffer flush, so
+  at low caps the socket sits idle for tens of seconds between full-speed bursts (long
+  enough for some proxies to drop the connection; SDK chunk retries then double-count
+  progress). Wants throttling in smaller quanta on the read side.
 - **Whitespace keys resolve to the wrong object** — every secondary-text reader trims
   the key (`strings.TrimSpace`), so `"dir/report "` is looked up as `"dir/report"`.
   Removing the trims needs care around the `[..]` row and profile names.
@@ -74,3 +108,14 @@ Verified findings not yet fixed; the fixed ones are listed in DESIGN.md's histor
 - **Upload direction ignores the destination fields** — in the sync form the dest
   bucket/prefix apply only to remote → remote (labels say so; the mandatory preview
   shows the real destination). Consider greying the rows out per direction instead.
+- **Profile edit can still create a duplicate name** `[S]` — creation and copy now
+  reject duplicates; renaming an existing profile onto another's name does not.
+- **Undo doesn't check its destination** `[S]` — every other remote write now
+  confirms before replacing an existing object (v0.7.2); undo goes straight
+  through on the grounds that it has its own confirmation and restores objects
+  to where they were moments ago. If something took that key meanwhile, it is
+  overwritten silently.
+- **Sync still writes without an overwrite prompt** `[S]` — by design: its
+  dry-run plan already lists every update before anything moves, so a second
+  confirmation would be redundant. Revisit only if the plan stops being
+  mandatory.

@@ -315,9 +315,10 @@ func (c *Controller) Sync() {
 
 	// The destination-bucket dropdown needs the bucket list, which is a network
 	// call; fetch it off the UI goroutine and fall back to just this bucket.
+	mdl := c.model
 	go func() {
 		bucketNames := []string{*bucket.Key}
-		if list, err := c.model.ListBuckets(); err == nil {
+		if list, err := mdl.ListBuckets(); err == nil {
 			bucketNames = bucketNames[:0]
 			for _, b := range list {
 				if b != nil && b.Key != nil {
@@ -382,13 +383,13 @@ func (c *Controller) showSyncForm(bucket *model.Object, prefix string, bucketNam
 		c.previewSync(spec)
 	})
 	form.AddButton("Browse…", func() {
-		c.view.Pages.RemovePage("modal")
-		// chooseDir invokes onChosen on the UI goroutine, so this must not go
-		// through QueueUpdateDraw — that would block the event loop on itself.
+		// The picker lives on its own page ("modal-dir") and simply overlays
+		// this form; closing it — chosen OR canceled — reveals the form with
+		// everything still typed in. (It used to remove and conditionally
+		// re-add the form, so canceling the picker discarded the whole form.)
 		c.chooseDir(c.params.HomeDir, func(chosen string) {
 			form.GetFormItemByLabel(view.FieldSyncLocalDir).(*tview.InputField).
 				SetText(strings.TrimSuffix(chosen, string(os.PathSeparator)))
-			c.view.Pages.AddPage("modal", c.view.ModalEdit(form, 82, syncFormHeight), true, true)
 		})
 	})
 	form.AddButton("Cancel", func() {
@@ -414,7 +415,7 @@ func syncDirectionLabels() []string {
 // collectSides gathers the entry lists for both sides of a spec. A missing
 // local directory is fatal for an upload (nothing to send) but normal for a
 // download's first run, where the transfer will create it.
-func (c *Controller) collectSides(spec syncSpec) (src, dst []model.SyncEntry, err error) {
+func (c *Controller) collectSides(mdl *model.Model, spec syncSpec) (src, dst []model.SyncEntry, err error) {
 	local := func() ([]model.SyncEntry, error) {
 		entries, err := model.WalkLocal(spec.localDir)
 		if err != nil && spec.dir == syncDownload && os.IsNotExist(err) {
@@ -428,17 +429,17 @@ func (c *Controller) collectSides(spec syncSpec) (src, dst []model.SyncEntry, er
 		if src, err = local(); err != nil {
 			return nil, nil, err
 		}
-		dst, err = c.model.ListRemoteEntries(spec.dstPrefix, spec.dstBucket)
+		dst, err = mdl.ListRemoteEntries(spec.dstPrefix, spec.dstBucket)
 	case syncDownload:
-		if src, err = c.model.ListRemoteEntries(spec.srcPrefix, spec.srcBucket); err != nil {
+		if src, err = mdl.ListRemoteEntries(spec.srcPrefix, spec.srcBucket); err != nil {
 			return nil, nil, err
 		}
 		dst, err = local()
 	default: // syncRemote
-		if src, err = c.model.ListRemoteEntries(spec.srcPrefix, spec.srcBucket); err != nil {
+		if src, err = mdl.ListRemoteEntries(spec.srcPrefix, spec.srcBucket); err != nil {
 			return nil, nil, err
 		}
-		dst, err = c.model.ListRemoteEntries(spec.dstPrefix, spec.dstBucket)
+		dst, err = mdl.ListRemoteEntries(spec.dstPrefix, spec.dstBucket)
 	}
 	if err != nil {
 		return nil, nil, err
@@ -450,11 +451,12 @@ func (c *Controller) collectSides(spec syncSpec) (src, dst []model.SyncEntry, er
 // Apply button. Scanning is a paginated listing (or a filesystem walk), so it
 // runs behind a "Scanning…" modal.
 func (c *Controller) previewSync(spec syncSpec) {
+	mdl := c.model
 	scanning := tview.NewModal().SetText("Scanning both sides...")
 	c.view.Pages.AddPage("progress", scanning, true, true)
 
 	go func() {
-		src, dst, err := c.collectSides(spec)
+		src, dst, err := c.collectSides(mdl, spec)
 		if err != nil {
 			c.view.App.QueueUpdateDraw(func() { c.view.Pages.RemovePage("progress").SwitchToPage("main") })
 			c.error("Sync scan failed", err)
@@ -504,6 +506,9 @@ func (c *Controller) showPlan(title, text string, onApply func(), applicable boo
 // Failures are collected rather than aborting the run, so one unreadable file
 // doesn't strand the rest of the sync.
 func (c *Controller) runSync(spec syncSpec, ops []syncOp) {
+	// Runs on the UI goroutine: capture the client before spawning workers so
+	// a profile switch can't retarget a queued/backgrounded sync.
+	mdl := c.model
 	ctx, cancel := context.WithCancel(context.Background())
 	st := summarizeSync(ops)
 
@@ -614,7 +619,7 @@ func (c *Controller) runSync(spec syncSpec, ops []syncOp) {
 					defer func() { <-sem }()
 
 					draw(it.index, it.op, 0)
-					err := c.applySyncOp(ctx, spec, it.op, func(written int64) {
+					err := c.applySyncOp(ctx, mdl, spec, it.op, func(written int64) {
 						draw(it.index, it.op, written)
 					})
 
@@ -661,6 +666,13 @@ func (c *Controller) runSync(spec syncSpec, ops []syncOp) {
 		}
 
 		c.view.App.QueueUpdateDraw(func() {
+			// Re-check ON the UI goroutine: a Background press racing job
+			// completion may have removed the progress page after the check
+			// above — mutating and focusing a detached modal would route all
+			// input into an invisible widget with no way back.
+			if job.isBackgrounded() || !c.view.Pages.HasPage("progress") {
+				return
+			}
 			status := "Sync complete."
 			if len(failed) > 0 {
 				status = "Sync finished with errors."
@@ -701,15 +713,15 @@ func (c *Controller) refreshAfterSync(spec syncSpec) {
 // from the direction: an upload writes to (and deletes from) S3, a download
 // writes to the local tree, and a remote→remote run copies server-side between
 // the two prefixes.
-func (c *Controller) applySyncOp(ctx context.Context, spec syncSpec, op syncOp, onProgress func(written int64)) error {
+func (c *Controller) applySyncOp(ctx context.Context, mdl *model.Model, spec syncSpec, op syncOp, onProgress func(written int64)) error {
 	switch spec.dir {
 	case syncUpload:
 		key := spec.dstPrefix + op.Rel
 		if op.Kind == syncDelete {
-			return c.model.DeleteKey(ctx, key, spec.dstBucket)
+			return mdl.DeleteKey(ctx, key, spec.dstBucket)
 		}
 		localPath := filepath.Join(spec.localDir, filepath.FromSlash(op.Rel))
-		return c.model.UploadFile(ctx, localPath, key, spec.dstBucket, func(written, _ int64) {
+		return mdl.UploadFile(ctx, localPath, key, spec.dstBucket, func(written, _ int64) {
 			onProgress(written)
 		})
 
@@ -718,17 +730,15 @@ func (c *Controller) applySyncOp(ctx context.Context, spec syncSpec, op syncOp, 
 		if op.Kind == syncDelete {
 			return os.Remove(localPath)
 		}
-		// DownloadTarget refuses to clobber an existing file, which is the right
-		// default for the browser's download flow. Here the plan has already said
-		// this file must be replaced, so drop the stale copy first.
-		if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
-			return err
-		}
 		if err := os.MkdirAll(filepath.Dir(localPath), 0760); err != nil {
 			return err
 		}
-		_, err := c.model.DownloadTarget(ctx, model.DownloadTarget{Key: spec.srcPrefix + op.Rel, Size: op.Bytes},
-			spec.srcPrefix, spec.localDir, spec.srcBucket.Key, func(written, _ int64, _ string) {
+		// The plan already said this file must be replaced. overwrite=true
+		// lets the model swap it atomically once the download succeeded —
+		// pre-removing it here used to destroy the local copy even when the
+		// transfer then failed or was canceled.
+		_, err := mdl.DownloadTarget(ctx, model.DownloadTarget{Key: spec.srcPrefix + op.Rel, Size: op.Bytes},
+			spec.srcPrefix, spec.localDir, spec.srcBucket.Key, true, func(written, _ int64, _ string) {
 				onProgress(written)
 			})
 		return err
@@ -736,11 +746,11 @@ func (c *Controller) applySyncOp(ctx context.Context, spec syncSpec, op syncOp, 
 	default: // syncRemote
 		dstKey := spec.dstPrefix + op.Rel
 		if op.Kind == syncDelete {
-			return c.model.DeleteKey(ctx, dstKey, spec.dstBucket)
+			return mdl.DeleteKey(ctx, dstKey, spec.dstBucket)
 		}
 		// A server-side copy moves no bytes through this process, so there is no
 		// progress to report — the op counter is the only thing that advances.
-		return c.model.CopyObject(ctx, spec.srcBucket, spec.dstBucket, spec.srcPrefix+op.Rel, dstKey)
+		return mdl.CopyObject(ctx, spec.srcBucket, spec.dstBucket, spec.srcPrefix+op.Rel, dstKey)
 	}
 }
 
@@ -810,8 +820,9 @@ func (c *Controller) ComparePanes() {
 	scanning := tview.NewModal().SetText("Comparing both panes...")
 	c.view.Pages.AddPage("progress", scanning, true, true)
 
+	mdl := c.model
 	go func() {
-		src, dst, err := c.collectSides(left)
+		src, dst, err := c.collectSides(mdl, left)
 		if err != nil {
 			c.view.App.QueueUpdateDraw(func() { c.view.Pages.RemovePage("progress").SwitchToPage("main") })
 			c.error("Compare failed", err)

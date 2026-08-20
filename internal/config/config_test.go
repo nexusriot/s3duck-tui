@@ -1,6 +1,7 @@
 package config
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -113,5 +114,73 @@ func TestCreateEmptyConfigCreatesParentDirs(t *testing.T) {
 	}
 	if entries, _ := LoadConfiguration(nested); len(entries) != 0 {
 		t.Errorf("empty config loaded %d entries, want 0", len(entries))
+	}
+}
+
+func TestDuplicateProfileNamesRejected(t *testing.T) {
+	p := newTestParams(t)
+	if err := p.NewConfiguration(&Config{Name: "prod"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Profiles are resolved by name in the UI, so a duplicate would make the
+	// details pane show one profile while opening another.
+	if err := p.NewConfiguration(&Config{Name: "prod"}); err == nil {
+		t.Error("NewConfiguration accepted a duplicate name")
+	}
+	if err := p.CopyConfig(Config{Name: "prod"}); err == nil {
+		t.Error("CopyConfig accepted a duplicate name")
+	}
+	if len(p.Config) != 1 {
+		t.Errorf("len(Config) = %d after rejected duplicates, want 1", len(p.Config))
+	}
+}
+
+func TestWriteConfigIsAtomic(t *testing.T) {
+	p := newTestParams(t)
+	if err := p.NewConfiguration(&Config{Name: "one"}); err != nil {
+		t.Fatal(err)
+	}
+
+	// The write-then-rename must not leave its temp file behind.
+	if ok, _ := FileExist(p.FileName + ".tmp"); ok {
+		t.Error("temp file left behind after WriteConfig")
+	}
+	if loaded, err := LoadConfiguration(p.FileName); err != nil || len(loaded) != 1 {
+		t.Fatalf("persisted state = %v, %v", loaded, err)
+	}
+}
+
+func TestWriteConfigBacksUpUnreadableOriginal(t *testing.T) {
+	p := newTestParams(t)
+
+	// Simulate a corrupt config: the load failed, so the in-memory list does
+	// NOT reflect the file. Saving must preserve the original for manual
+	// recovery instead of silently wiping every stored profile.
+	if err := os.WriteFile(p.FileName, []byte(`[{"name": "prod", "access_`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	_, loadErr := LoadConfiguration(p.FileName)
+	if loadErr == nil {
+		t.Fatal("expected the truncated config to fail loading")
+	}
+	p.LoadErr = loadErr
+
+	if err := p.NewConfiguration(&Config{Name: "fresh"}); err != nil {
+		t.Fatalf("saving after a load error: %v", err)
+	}
+
+	backup, err := os.ReadFile(p.FileName + ".bak")
+	if err != nil {
+		t.Fatalf("no backup of the unreadable original: %v", err)
+	}
+	if string(backup) != `[{"name": "prod", "access_` {
+		t.Errorf("backup content = %q", backup)
+	}
+	if p.LoadErr != nil {
+		t.Error("LoadErr should be cleared once the state is safely persisted")
+	}
+	if loaded, err := LoadConfiguration(p.FileName); err != nil || len(loaded) != 1 || loaded[0].Name != "fresh" {
+		t.Errorf("new state = %+v, %v", loaded, err)
 	}
 }

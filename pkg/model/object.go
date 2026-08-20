@@ -148,7 +148,11 @@ func (m *Model) HeadObject(ctx context.Context, bucket *Object, key string) (Obj
 	if err != nil {
 		return ObjectMeta{}, err
 	}
+	return metaFromHead(out), nil
+}
 
+// metaFromHead lifts a HeadObject response into an ObjectMeta.
+func metaFromHead(out *s3.HeadObjectOutput) ObjectMeta {
 	meta := ObjectMeta{
 		ContentType:        aws.ToString(out.ContentType),
 		CacheControl:       aws.ToString(out.CacheControl),
@@ -168,13 +172,15 @@ func (m *Model) HeadObject(ctx context.Context, bucket *Object, key string) (Obj
 	if meta.StorageClass == "" {
 		meta.StorageClass = "STANDARD"
 	}
-	return meta, nil
+	return meta
 }
 
 // PutObjectMeta rewrites an object's metadata by copying it onto itself with
 // MetadataDirective=REPLACE — S3 has no metadata-update API. The storage class
 // is passed through explicitly because a replace-copy that omits it would
-// silently demote the object to STANDARD.
+// silently demote the object to STANDARD. meta.Size lets the copy skip a
+// HeadObject when deciding whether it must go multipart; it is filled in by
+// the HeadObject the editor already did.
 func (m *Model) PutObjectMeta(ctx context.Context, bucket *Object, key string, meta ObjectMeta) error {
 	if bucket == nil || bucket.Key == nil {
 		return fmt.Errorf("bucket is nil")
@@ -183,36 +189,24 @@ func (m *Model) PutObjectMeta(ctx context.Context, bucket *Object, key string, m
 		return fmt.Errorf("not a file key: %q", key)
 	}
 
-	in := &s3.CopyObjectInput{
-		Bucket:            aws.String(*bucket.Key),
-		Key:               aws.String(key),
-		CopySource:        aws.String(copySource(*bucket.Key, key)),
-		MetadataDirective: s3t.MetadataDirectiveReplace,
-		Metadata:          meta.UserMetadata,
+	size := meta.Size
+	if size <= 0 {
+		size = SizeUnknown
 	}
-	if meta.ContentType != "" {
-		in.ContentType = aws.String(meta.ContentType)
-	}
-	if meta.CacheControl != "" {
-		in.CacheControl = aws.String(meta.CacheControl)
-	}
-	if meta.ContentDisposition != "" {
-		in.ContentDisposition = aws.String(meta.ContentDisposition)
-	}
-	if meta.ContentEncoding != "" {
-		in.ContentEncoding = aws.String(meta.ContentEncoding)
-	}
-	if meta.StorageClass != "" {
-		in.StorageClass = s3t.StorageClass(meta.StorageClass)
-	}
-
-	_, err := m.Client.CopyObject(ctx, in)
-	return err
+	return m.runCopy(ctx, copySpec{
+		srcBucket: *bucket.Key,
+		srcKey:    key,
+		dstBucket: *bucket.Key,
+		dstKey:    key,
+		srcSize:   size,
+		meta:      &meta,
+	})
 }
 
 // SetStorageClass moves an object to another storage class with a copy in
-// place. MetadataDirective defaults to COPY, so the existing metadata rides
-// along untouched.
+// place. The existing metadata rides along untouched (MetadataDirective
+// defaults to COPY on the single-request path, and the multipart path
+// replicates the source's attributes explicitly).
 func (m *Model) SetStorageClass(ctx context.Context, bucket *Object, key, class string) error {
 	if bucket == nil || bucket.Key == nil {
 		return fmt.Errorf("bucket is nil")
@@ -224,13 +218,14 @@ func (m *Model) SetStorageClass(ctx context.Context, bucket *Object, key, class 
 		return fmt.Errorf("storage class is empty")
 	}
 
-	_, err := m.Client.CopyObject(ctx, &s3.CopyObjectInput{
-		Bucket:       aws.String(*bucket.Key),
-		Key:          aws.String(key),
-		CopySource:   aws.String(copySource(*bucket.Key, key)),
-		StorageClass: s3t.StorageClass(class),
+	return m.runCopy(ctx, copySpec{
+		srcBucket:    *bucket.Key,
+		srcKey:       key,
+		dstBucket:    *bucket.Key,
+		dstKey:       key,
+		srcSize:      SizeUnknown,
+		storageClass: class,
 	})
-	return err
 }
 
 // RestoreObject asks S3 to make an archived object temporarily readable for

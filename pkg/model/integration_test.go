@@ -25,6 +25,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -59,7 +60,11 @@ func envOr(key, fallback string) string {
 func testModel(t *testing.T) *model.Model {
 	t.Helper()
 	endpoint, region, access, secret := testCreds(t)
-	return model.NewModel(model.NewConfig(endpoint, &region, access, secret, "", true, 0))
+	m, err := model.NewModel(model.NewConfig(endpoint, &region, access, secret, "", true, 0))
+	if err != nil {
+		t.Fatalf("NewModel: %v", err)
+	}
+	return m
 }
 
 // freshBucket creates an empty bucket for one test, removing anything left by a
@@ -160,7 +165,7 @@ func TestIntegrationTransferRoundTrip(t *testing.T) {
 		for _, e := range remote {
 			if _, err := m.DownloadTarget(ctx,
 				model.DownloadTarget{Key: prefix + e.Rel, Size: e.Size},
-				prefix, dst, bucket.Key, nil); err != nil {
+				prefix, dst, bucket.Key, false, nil); err != nil {
 				t.Fatalf("download %s: %v", e.Rel, err)
 			}
 		}
@@ -175,12 +180,30 @@ func TestIntegrationTransferRoundTrip(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(dst, "a.txt"), []byte("mine"), 0600); err != nil {
 			t.Fatal(err)
 		}
-		_, err := m.DownloadTarget(ctx, model.DownloadTarget{Key: prefix + "a.txt", Size: 5}, prefix, dst, bucket.Key, nil)
+		_, err := m.DownloadTarget(ctx, model.DownloadTarget{Key: prefix + "a.txt", Size: 5}, prefix, dst, bucket.Key, false, nil)
 		if !errors.Is(err, model.ErrFileExists) {
 			t.Fatalf("err = %v, want ErrFileExists", err)
 		}
 		if got, _ := os.ReadFile(filepath.Join(dst, "a.txt")); string(got) != "mine" {
 			t.Errorf("existing file was modified: %q", got)
+		}
+	})
+
+	t.Run("overwrite replaces the file only after a full download", func(t *testing.T) {
+		dst := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dst, "a.txt"), []byte("stale local"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := m.DownloadTarget(ctx, model.DownloadTarget{Key: prefix + "a.txt", Size: 5}, prefix, dst, bucket.Key, true, nil); err != nil {
+			t.Fatalf("overwrite download: %v", err)
+		}
+		got, err := os.ReadFile(filepath.Join(dst, "a.txt"))
+		if err != nil || string(got) != "hello" {
+			t.Errorf("overwritten content = %q, %v", got, err)
+		}
+		// The atomic swap must not leave its temp file behind.
+		if _, err := os.Stat(filepath.Join(dst, "a.txt.s3duck-part")); !os.IsNotExist(err) {
+			t.Errorf("temp part file left behind (stat err = %v)", err)
 		}
 	})
 
@@ -208,12 +231,18 @@ func TestIntegrationSessionTokenReachesTheWire(t *testing.T) {
 	// be rejected while the same credentials without one succeed.
 	endpoint, region, access, secret := testCreds(t)
 
-	good := model.NewModel(model.NewConfig(endpoint, &region, access, secret, "", true, 0))
+	good, err := model.NewModel(model.NewConfig(endpoint, &region, access, secret, "", true, 0))
+	if err != nil {
+		t.Fatalf("NewModel: %v", err)
+	}
 	if _, err := good.ListBuckets(); err != nil {
 		t.Fatalf("baseline ListBuckets failed: %v", err)
 	}
 
-	bad := model.NewModel(model.NewConfig(endpoint, &region, access, secret, "bogus-session-token", true, 0))
+	bad, err := model.NewModel(model.NewConfig(endpoint, &region, access, secret, "bogus-session-token", true, 0))
+	if err != nil {
+		t.Fatalf("NewModel: %v", err)
+	}
 	if _, err := bad.ListBuckets(); err == nil {
 		t.Error("a garbage session token was accepted; the token is not being sent")
 	}
@@ -531,7 +560,7 @@ func TestIntegrationUploadMatchesPreparedKeys(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PrepareUpload: %v", err)
 	}
-	if err := m.Upload(ctx, root, "pre", bucket, nil); err != nil {
+	if err := m.Upload(ctx, root, "pre", bucket, nil, nil); err != nil {
 		t.Fatalf("Upload: %v", err)
 	}
 
@@ -553,7 +582,7 @@ func TestIntegrationEmptyDirUpload(t *testing.T) {
 	if err := os.MkdirAll(empty, 0755); err != nil {
 		t.Fatal(err)
 	}
-	if err := m.Upload(ctx, empty, "", bucket, nil); err != nil {
+	if err := m.Upload(ctx, empty, "", bucket, nil, nil); err != nil {
 		t.Fatalf("Upload of an empty dir: %v", err)
 	}
 	objs, err := m.ListObjects("", bucket)
@@ -563,4 +592,392 @@ func TestIntegrationEmptyDirUpload(t *testing.T) {
 	if got := *objs[0].Key; got != "vacant/" {
 		t.Errorf("marker key = %q, want %q", got, "vacant/")
 	}
+}
+
+func TestIntegrationDuplicateETags(t *testing.T) {
+	// The duplicate finder groups by (size, ETag). Its load-bearing assumption:
+	// identical single-part uploads share an ETag (it is the body MD5), while
+	// different content differs. Assert both against a real endpoint.
+	m := testModel(t)
+	bucket := freshBucket(t, m, "s3duck-it-dups")
+
+	putObject(t, m, bucket, "a/copy1.bin", "identical duplicate content")
+	putObject(t, m, bucket, "b/copy2.bin", "identical duplicate content")
+	putObject(t, m, bucket, "c/other.bin", "completely different content!")
+
+	objs, err := m.ListObjects("", bucket)
+	if err != nil {
+		t.Fatalf("ListObjects: %v", err)
+	}
+
+	etags := map[string]string{}
+	for _, o := range objs {
+		etags[aws.ToString(o.Key)] = aws.ToString(o.ETag)
+	}
+	if etags["a/copy1.bin"] == "" {
+		t.Fatal("endpoint returned no ETags; the duplicate finder cannot work here")
+	}
+	if etags["a/copy1.bin"] != etags["b/copy2.bin"] {
+		t.Errorf("identical uploads have different ETags: %q vs %q — grouping assumption broken",
+			etags["a/copy1.bin"], etags["b/copy2.bin"])
+	}
+	if etags["a/copy1.bin"] == etags["c/other.bin"] {
+		t.Errorf("different content shares an ETag: %q — false-positive risk", etags["a/copy1.bin"])
+	}
+}
+
+func TestIntegrationObjectContent(t *testing.T) {
+	m := testModel(t)
+	ctx := context.Background()
+	bucket := freshBucket(t, m, "s3duck-it-content")
+	putObject(t, m, bucket, "cfg/app.yaml", "key: value\n")
+
+	t.Run("round-trip preserves content-type and metadata", func(t *testing.T) {
+		if err := m.PutObjectMeta(ctx, bucket, "cfg/app.yaml", model.ObjectMeta{
+			ContentType:  "application/yaml",
+			UserMetadata: map[string]string{"owner": "vlad"},
+		}); err != nil {
+			t.Fatalf("PutObjectMeta: %v", err)
+		}
+
+		if err := m.PutObjectTags(ctx, bucket, "cfg/app.yaml", map[string]string{"env": "prod"}); err != nil {
+			t.Fatalf("PutObjectTags: %v", err)
+		}
+
+		content, err := m.GetObjectContent(ctx, bucket, "cfg/app.yaml", 1<<20)
+		if err != nil {
+			t.Fatalf("GetObjectContent: %v", err)
+		}
+		if string(content.Data) != "key: value\n" {
+			t.Errorf("data = %q", content.Data)
+		}
+		if content.ContentType != "application/yaml" || content.UserMetadata["owner"] != "vlad" {
+			t.Errorf("attributes not carried: %+v", content)
+		}
+		if content.ETag == "" {
+			t.Error("no ETag captured — the edit conflict guard cannot work")
+		}
+		if content.Tagging != "env=prod" {
+			t.Errorf("tags not carried: %q", content.Tagging)
+		}
+
+		// The edited write-back must carry every attribute forward.
+		if err := m.PutBytes(ctx, bucket, "cfg/app.yaml", []byte("key: edited\n"), content); err != nil {
+			t.Fatalf("PutBytes: %v", err)
+		}
+		after, err := m.HeadObject(ctx, bucket, "cfg/app.yaml")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if after.ContentType != "application/yaml" || after.UserMetadata["owner"] != "vlad" {
+			t.Errorf("an edit stripped attributes: %+v", after)
+		}
+		afterTags, err := m.ObjectTags(ctx, bucket, "cfg/app.yaml")
+		if err != nil || afterTags["env"] != "prod" {
+			t.Errorf("an edit stripped tags: %v, %v", afterTags, err)
+		}
+		roundTrip, _ := m.GetObjectContent(ctx, bucket, "cfg/app.yaml", 1<<20)
+		if string(roundTrip.Data) != "key: edited\n" {
+			t.Errorf("edited body = %q", roundTrip.Data)
+		}
+
+		// The rewrite changed the body, so the live ETag must differ from the
+		// captured one — this is exactly the signal the lost-update guard uses.
+		cur, err := m.CurrentETag(ctx, bucket, "cfg/app.yaml")
+		if err != nil {
+			t.Fatalf("CurrentETag: %v", err)
+		}
+		if cur == "" || cur == content.ETag {
+			t.Errorf("CurrentETag = %q, want a fresh non-empty ETag different from %q", cur, content.ETag)
+		}
+	})
+
+	t.Run("the size cap refuses oversized objects", func(t *testing.T) {
+		putObject(t, m, bucket, "big.bin", strings.Repeat("x", 4096))
+		if _, err := m.GetObjectContent(ctx, bucket, "big.bin", 1024); err == nil {
+			t.Error("a 4 KiB object must be refused by a 1 KiB cap")
+		}
+	})
+}
+
+func TestIntegrationCrossCopy(t *testing.T) {
+	// Two independent Model instances — exactly the cross-profile code path;
+	// that they happen to share an endpoint here changes nothing in the code
+	// under test, which never lets one client see the other.
+	endpoint, region, access, secret := testCreds(t)
+	src, err := model.NewModel(model.NewConfig(endpoint, &region, access, secret, "", true, 0))
+	if err != nil {
+		t.Fatalf("NewModel: %v", err)
+	}
+	dst, err := model.NewModel(model.NewConfig(endpoint, &region, access, secret, "", true, 0))
+	if err != nil {
+		t.Fatalf("NewModel: %v", err)
+	}
+
+	ctx := context.Background()
+	srcBucket := freshBucket(t, src, "s3duck-it-xsrc")
+	dstBucket := freshBucket(t, dst, "s3duck-it-xdst")
+
+	putObject(t, src, srcBucket, "data/report.pdf", "cross-profile payload")
+	if err := src.PutObjectMeta(ctx, srcBucket, "data/report.pdf", model.ObjectMeta{
+		ContentType:  "application/pdf",
+		UserMetadata: map[string]string{"origin": "src-profile"},
+	}); err != nil {
+		t.Fatalf("seeding metadata: %v", err)
+	}
+	if err := src.PutObjectTags(ctx, srcBucket, "data/report.pdf", map[string]string{"tier": "gold"}); err != nil {
+		t.Fatalf("seeding tags: %v", err)
+	}
+
+	var sawProgress bool
+	err = model.CrossCopy(ctx, src, srcBucket, "data/report.pdf", dst, dstBucket, "restore/report.pdf",
+		func(written, total int64) { sawProgress = written > 0 && total > 0 })
+	if err != nil {
+		t.Fatalf("CrossCopy: %v", err)
+	}
+	if !sawProgress {
+		t.Error("no progress was reported")
+	}
+
+	got, err := dst.GetObjectContent(ctx, dstBucket, "restore/report.pdf", 1<<20)
+	if err != nil {
+		t.Fatalf("reading the copy: %v", err)
+	}
+	if string(got.Data) != "cross-profile payload" {
+		t.Errorf("copied body = %q", got.Data)
+	}
+	if got.ContentType != "application/pdf" || got.UserMetadata["origin"] != "src-profile" {
+		t.Errorf("attributes did not cross: %+v", got)
+	}
+	if crossed, err := dst.ObjectTags(ctx, dstBucket, "restore/report.pdf"); err != nil || crossed["tier"] != "gold" {
+		t.Errorf("tags did not cross: %v, %v", crossed, err)
+	}
+
+	t.Run("the source is untouched", func(t *testing.T) {
+		orig, err := src.GetObjectContent(ctx, srcBucket, "data/report.pdf", 1<<20)
+		if err != nil || string(orig.Data) != "cross-profile payload" {
+			t.Errorf("source changed: %q, %v", orig.Data, err)
+		}
+	})
+
+	t.Run("a prefix-like destination key is refused", func(t *testing.T) {
+		if err := model.CrossCopy(ctx, src, srcBucket, "data/report.pdf", dst, dstBucket, "bad/", nil); err == nil {
+			t.Error("want an error for a prefix-like destination")
+		}
+	})
+}
+
+// TestIntegrationMultipartCopy exercises the >5 GiB copy path without moving
+// 5 GiB: the thresholds are variables precisely so this test can lower them.
+// The proof that the multipart path really ran is the destination's ETag —
+// a multipart object's ETag carries a "-<partcount>" suffix, which a single
+// CopyObject could never produce.
+func TestIntegrationMultipartCopy(t *testing.T) {
+	m := testModel(t)
+	ctx := context.Background()
+	bucket := freshBucket(t, m, "s3duck-it-mpcopy")
+
+	threshold, part := model.MultipartCopyThreshold, model.MultipartCopyPartSize
+	t.Cleanup(func() {
+		model.MultipartCopyThreshold, model.MultipartCopyPartSize = threshold, part
+	})
+	// 5 MiB is the smallest part S3 accepts, so a 6 MiB source splits into
+	// one full part plus a remainder — the smallest real multipart copy.
+	model.MultipartCopyThreshold = 5 << 20
+	model.MultipartCopyPartSize = 5 << 20
+
+	const size = 6 << 20
+	body := strings.Repeat("s3duck!!", size/8)
+	putObject(t, m, bucket, "big/source.bin", body)
+	if err := m.PutObjectMeta(ctx, bucket, "big/source.bin", model.ObjectMeta{
+		ContentType:  "application/octet-stream",
+		CacheControl: "max-age=31536000",
+		UserMetadata: map[string]string{"origin": "multipart-test"},
+		StorageClass: "STANDARD",
+		Size:         size,
+	}); err != nil {
+		t.Fatalf("seeding metadata: %v", err)
+	}
+	if err := m.PutObjectTags(ctx, bucket, "big/source.bin", map[string]string{"tier": "gold"}); err != nil {
+		t.Fatalf("seeding tags: %v", err)
+	}
+
+	dstBucket := freshBucket(t, m, "s3duck-it-mpcopy-dst")
+	if err := m.CopyObjectSized(ctx, bucket, dstBucket, "big/source.bin", "copied.bin", size); err != nil {
+		t.Fatalf("CopyObjectSized over the threshold: %v", err)
+	}
+
+	got, err := m.HeadObject(ctx, dstBucket, "copied.bin")
+	if err != nil {
+		t.Fatalf("HeadObject on the copy: %v", err)
+	}
+	if got.Size != size {
+		t.Errorf("copy is %d bytes, want %d", got.Size, size)
+	}
+	if !strings.HasSuffix(got.ETag, "-2") {
+		t.Errorf("ETag = %q, want a multipart ETag ending in -2; the copy did not go through UploadPartCopy", got.ETag)
+	}
+	// CreateMultipartUpload starts a bare object: everything a single-request
+	// copy would have inherited has to be re-applied, and this is what proves
+	// it was.
+	if got.ContentType != "application/octet-stream" {
+		t.Errorf("content type = %q", got.ContentType)
+	}
+	if got.CacheControl != "max-age=31536000" {
+		t.Errorf("cache control = %q", got.CacheControl)
+	}
+	if got.UserMetadata["origin"] != "multipart-test" {
+		t.Errorf("user metadata = %v", got.UserMetadata)
+	}
+	if tags, err := m.ObjectTags(ctx, dstBucket, "copied.bin"); err != nil || tags["tier"] != "gold" {
+		t.Errorf("tags did not survive the multipart copy: %v, %v", tags, err)
+	}
+
+	t.Run("the bytes are identical", func(t *testing.T) {
+		content, err := m.GetObjectContent(ctx, dstBucket, "copied.bin", 8<<20)
+		if err != nil {
+			t.Fatalf("reading the copy: %v", err)
+		}
+		if string(content.Data) != body {
+			t.Errorf("copied body differs from the source (%d vs %d bytes)", len(content.Data), len(body))
+		}
+	})
+
+	t.Run("a size under the threshold still uses the single-request path", func(t *testing.T) {
+		putObject(t, m, bucket, "small.txt", "tiny")
+		if err := m.CopyObjectSized(ctx, bucket, dstBucket, "small.txt", "small-copy.txt", 4); err != nil {
+			t.Fatalf("small copy: %v", err)
+		}
+		head, err := m.HeadObject(ctx, dstBucket, "small-copy.txt")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(head.ETag, "-") {
+			t.Errorf("ETag = %q, want a single-part ETag", head.ETag)
+		}
+	})
+
+	t.Run("an unknown size is resolved rather than guessed", func(t *testing.T) {
+		// CopyObject has no size to go on, so it must HeadObject and still
+		// pick the multipart path for the 6 MiB source.
+		if err := m.CopyObject(ctx, bucket, dstBucket, "big/source.bin", "unsized.bin"); err != nil {
+			t.Fatalf("CopyObject: %v", err)
+		}
+		head, err := m.HeadObject(ctx, dstBucket, "unsized.bin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasSuffix(head.ETag, "-2") {
+			t.Errorf("ETag = %q, want the multipart path to have been chosen from the resolved size", head.ETag)
+		}
+	})
+}
+
+// TestIntegrationConflicts covers both branches of the conflict scan — the
+// per-key HeadObject probe for a handful of candidates and the single listing
+// for a batch — since the two could easily disagree.
+func TestIntegrationConflicts(t *testing.T) {
+	m := testModel(t)
+	ctx := context.Background()
+	bucket := freshBucket(t, m, "s3duck-it-conflicts")
+
+	putObject(t, m, bucket, "dst/a.txt", "existing a")
+	putObject(t, m, bucket, "dst/c.txt", "existing c")
+	putObject(t, m, bucket, "dst/folder/inner.txt", "existing inner")
+
+	t.Run("few keys are probed directly", func(t *testing.T) {
+		got, err := m.Conflicts(ctx, bucket, []string{"dst/a.txt", "dst/b.txt", "dst/c.txt"})
+		if err != nil {
+			t.Fatalf("Conflicts: %v", err)
+		}
+		if !slices.Equal(got, []string{"dst/a.txt", "dst/c.txt"}) {
+			t.Errorf("conflicts = %v, want the two that exist", got)
+		}
+	})
+
+	t.Run("nothing exists yet", func(t *testing.T) {
+		got, err := m.Conflicts(ctx, bucket, []string{"dst/x.txt", "dst/y.txt"})
+		if err != nil {
+			t.Fatalf("Conflicts: %v", err)
+		}
+		if len(got) != 0 {
+			t.Errorf("conflicts = %v, want none", got)
+		}
+	})
+
+	t.Run("a batch is answered by one listing", func(t *testing.T) {
+		var keys []string
+		for i := 0; i < 12; i++ {
+			keys = append(keys, "dst/gen"+string(rune('a'+i))+".txt")
+		}
+		keys = append(keys, "dst/a.txt", "dst/c.txt")
+		got, err := m.Conflicts(ctx, bucket, keys)
+		if err != nil {
+			t.Fatalf("Conflicts: %v", err)
+		}
+		if !slices.Equal(got, []string{"dst/a.txt", "dst/c.txt"}) {
+			t.Errorf("conflicts = %v, want the two that exist", got)
+		}
+	})
+
+	t.Run("a folder candidate conflicts when anything is under it", func(t *testing.T) {
+		got, err := m.Conflicts(ctx, bucket, []string{"dst/folder/", "dst/empty/"})
+		if err != nil {
+			t.Fatalf("Conflicts: %v", err)
+		}
+		if !slices.Equal(got, []string{"dst/folder/"}) {
+			t.Errorf("conflicts = %v, want only the populated folder", got)
+		}
+	})
+
+	t.Run("planned keys match what a copy would write", func(t *testing.T) {
+		putObject(t, m, bucket, "src/tree/one.txt", "1")
+		putObject(t, m, bucket, "src/tree/sub/two.txt", "2")
+
+		planned, err := m.PlannedCopyKeys(bucket, bucket, "src/tree/", "dst/tree/", true)
+		if err != nil {
+			t.Fatalf("PlannedCopyKeys: %v", err)
+		}
+		sort.Strings(planned)
+		if !slices.Equal(planned, []string{"dst/tree/one.txt", "dst/tree/sub/two.txt"}) {
+			t.Errorf("planned = %v", planned)
+		}
+
+		// Copy for real and check the plan was the truth.
+		if _, err := m.CopyKeys(ctx, bucket, bucket, "src/tree/", "dst/tree/", true, nil, nil); err != nil {
+			t.Fatalf("CopyKeys: %v", err)
+		}
+		after, err := m.Conflicts(ctx, bucket, planned)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(after, planned) {
+			t.Errorf("after the copy, %v exist; planned %v", after, planned)
+		}
+	})
+
+	t.Run("a skipped key is not written and its source survives a move", func(t *testing.T) {
+		putObject(t, m, bucket, "mv/keep.txt", "new content")
+		putObject(t, m, bucket, "target/keep.txt", "old content, must survive")
+
+		skip := map[string]bool{"target/keep.txt": true}
+		n, err := m.MoveKeys(ctx, bucket, bucket, "mv/keep.txt", "target/keep.txt", false, skip, nil)
+		if err != nil {
+			t.Fatalf("MoveKeys with a skip: %v", err)
+		}
+		if n != 0 {
+			t.Errorf("moved %d object(s), want 0", n)
+		}
+
+		dst, err := m.GetObjectContent(ctx, bucket, "target/keep.txt", 1<<20)
+		if err != nil || string(dst.Data) != "old content, must survive" {
+			t.Errorf("destination = %q, %v — a skipped destination was overwritten", dst.Data, err)
+		}
+		// A move that skipped its destination must NOT delete the source:
+		// nothing was written, so deleting would simply destroy the object.
+		src, err := m.GetObjectContent(ctx, bucket, "mv/keep.txt", 1<<20)
+		if err != nil || string(src.Data) != "new content" {
+			t.Errorf("source = %q, %v — a skipped move deleted its source", src.Data, err)
+		}
+	})
 }

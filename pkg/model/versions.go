@@ -13,7 +13,6 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
-	s3t "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 // ObjectVersion is one entry in an object's version history. A delete marker is
@@ -133,16 +132,15 @@ func (m *Model) RestoreVersion(ctx context.Context, bucket *Object, key, version
 		return fmt.Errorf("key and version id are required")
 	}
 
-	in := &s3.CopyObjectInput{
-		Bucket:     aws.String(*bucket.Key),
-		Key:        aws.String(key),
-		CopySource: aws.String(versionCopySource(*bucket.Key, key, versionID)),
-	}
-	if storageClass != "" {
-		in.StorageClass = s3t.StorageClass(storageClass)
-	}
-	_, err := m.Client.CopyObject(ctx, in)
-	return err
+	return m.runCopy(ctx, copySpec{
+		srcBucket:    *bucket.Key,
+		srcKey:       key,
+		srcVersion:   versionID,
+		dstBucket:    *bucket.Key,
+		dstKey:       key,
+		srcSize:      SizeUnknown,
+		storageClass: storageClass,
+	})
 }
 
 // DeleteVersion permanently removes one version. Unlike an ordinary delete this

@@ -293,9 +293,12 @@ func (c *Controller) wireFilter(filter *tview.InputField) {
 			return
 		}
 		c.setFilter(text)
-		// Call renderList directly (not via a goroutine) so re-renders stay in
-		// keystroke order; it only reads the cached map, then queues the draw.
-		c.renderList()
+		// MUST be a goroutine: this handler runs inside tview's event loop, and
+		// renderList blocks on QueueUpdateDraw, which the event loop can only
+		// service after this handler returns — calling it inline deadlocks the
+		// whole app on the first keystroke. Ordering is still safe: renders
+		// serialize through the UI queue and read state under c.mu.
+		go c.renderList()
 	})
 	filter.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
@@ -408,6 +411,19 @@ func (c *Controller) clearSelected() {
 	}
 }
 
+// clearSelectedIn clears the marks recorded under a specific scope key —
+// used when an operation finishes in a different listing than the one its
+// items were marked in (e.g. a paste completes in the destination scope).
+func (c *Controller) clearSelectedIn(scope string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if m, ok := c.selectedByScope[scope]; ok {
+		for k := range m {
+			delete(m, k)
+		}
+	}
+}
+
 func (c *Controller) selectNames(names []string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -481,16 +497,10 @@ func (c *Controller) makeObjectMap() error {
 	return nil
 }
 
-func localDownloadPath(currentPath, destPath, s3Key string) string {
-	key := filepath.ToSlash(s3Key)
-	prefix := model.NormalizePrefix(currentPath)
-
-	relativeKey := key
-	if strings.HasPrefix(key, prefix) {
-		relativeKey = strings.TrimPrefix(key, prefix)
-	}
-
-	return filepath.Join(destPath, relativeKey)
+// localDownloadPath maps an S3 key onto its local destination path. It errors
+// on keys whose cleaned path would escape destPath — see model.SafeLocalPath.
+func localDownloadPath(currentPath, destPath, s3Key string) (string, error) {
+	return model.SafeLocalPath(destPath, currentPath, s3Key)
 }
 
 func getPosition(element string, slice []string) int {
@@ -557,6 +567,12 @@ func objRateETA(done, total int, elapsed time.Duration) string {
 }
 
 func (c *Controller) getSelectedObjectName() string {
+	// GetCurrentItem returns 0 even for an empty list, and GetItemText indexes
+	// unchecked — an empty buckets screen (no buckets, or no list permission)
+	// would panic. Callers all tolerate "".
+	if c.view.List.GetItemCount() == 0 {
+		return ""
+	}
 	i := c.view.List.GetCurrentItem()
 	_, cur := c.view.List.GetItemText(i)
 	return strings.TrimSpace(cur)
@@ -668,6 +684,7 @@ func (c *Controller) Delete() {
 	c.view.Pages.AddPage("progress", scanning, true, true)
 
 	bucket := c.currentBucket
+	mdl := c.model
 	go func() {
 		for i := range targets {
 			if !targets[i].isFolder && !targets[i].isBucket {
@@ -682,7 +699,7 @@ func (c *Controller) Delete() {
 				b := targets[i].key
 				scanBucket = &model.Object{Key: &b, Ot: model.Bucket}
 			}
-			objs, err := c.model.ListObjects(key, scanBucket)
+			objs, err := mdl.ListObjects(key, scanBucket)
 			if err != nil {
 				targets[i].scanErr = err
 				continue
@@ -715,6 +732,7 @@ func (c *Controller) runDelete(targets []deleteTarget, bucket *model.Object) {
 	progress := tview.NewModal().SetText("Deleting...")
 	c.view.Pages.AddPage("progress", progress, true, true)
 
+	mdl := c.model
 	go func() {
 		var failed []string
 		okCount := 0
@@ -730,12 +748,12 @@ func (c *Controller) runDelete(targets []deleteTarget, bucket *model.Object) {
 				// only deletes empty buckets — so empty it first.
 				name := t.key
 				b := &model.Object{Key: &name, Ot: model.Bucket}
-				if err = c.model.EmptyBucket(b); err == nil {
-					err = c.model.DeleteBucket(&name)
+				if err = mdl.EmptyBucket(b); err == nil {
+					err = mdl.DeleteBucket(&name)
 				}
 			} else {
 				key := t.key
-				err = c.model.Delete(&key, bucket)
+				err = mdl.Delete(&key, bucket)
 			}
 			if err != nil {
 				failed = append(failed, fmt.Sprintf("%s: %v", t.key, err))
@@ -800,19 +818,20 @@ func (c *Controller) resolveDownloadDir() string {
 	return dir
 }
 
-func (c *Controller) Download() error {
-
+func (c *Controller) Download() {
 	if c.view.List.GetItemCount() == 0 || c.currentBucket == nil {
-		return nil
+		return
 	}
 
-	// Capture the source location now, on the UI goroutine. The byte phase can
-	// run long after Background is pressed — reading c.currentBucket there
-	// would panic once the user backs out to the buckets screen, and a pane
-	// swap would silently retarget the remaining objects at the other pane's
-	// bucket.
+	// Capture the source location AND the client now, on the UI goroutine.
+	// The byte phase can run long after Background is pressed — reading
+	// c.currentBucket there would panic once the user backs out to the
+	// buckets screen, a pane swap would silently retarget the remaining
+	// objects at the other pane's bucket, and a profile switch would swap
+	// c.model under a queued transfer, pointing it at the wrong endpoint.
 	srcBucket := c.currentBucket
 	srcPath := c.currentPath
+	mdl := c.model
 
 	names := c.selectedNames()
 	if len(names) == 0 {
@@ -820,39 +839,72 @@ func (c *Controller) Download() error {
 		cur := c.getSelectedObjectName()
 		names = []string{cur}
 	}
-	var allObjects []model.DownloadTarget
-	var totalSize int64
-
+	var sel []*model.Object
 	for _, name := range names {
 		val, ok := c.lookupObj(name)
 		if !ok || (val.Ot != model.File && val.Ot != model.Folder) {
 			continue
 		}
+		sel = append(sel, val)
+	}
+	if len(sel) == 0 {
+		return
+	}
 
-		key := *val.FullPath
-		objs, size, err := c.model.ResolveDownloadObjects(
-			key,
-			val.Ot == model.Folder,
-			val.Size,
-			srcBucket,
-		)
-		if err != nil {
-			return err
+	// Folder resolution pages through the whole prefix over the network.
+	// Behind a modal, off the UI goroutine — inline it used to freeze the
+	// entire TUI for the length of the listing, and swallow its errors.
+	resolving := tview.NewModal().SetText("Resolving objects...")
+	c.view.Pages.AddPage("progress", resolving, true, true)
+
+	go func() {
+		var allObjects []model.DownloadTarget
+		var totalSize int64
+		for _, val := range sel {
+			key := *val.FullPath
+			objs, size, err := mdl.ResolveDownloadObjects(
+				key,
+				val.Ot == model.Folder,
+				val.Size,
+				srcBucket,
+			)
+			if err != nil {
+				c.view.App.QueueUpdateDraw(func() { c.view.Pages.RemovePage("progress") })
+				c.error("Download: resolving objects failed", err)
+				return
+			}
+			allObjects = append(allObjects, objs...)
+			totalSize += size
 		}
-		allObjects = append(allObjects, objs...)
-		totalSize += size
-	}
 
-	if len(allObjects) == 0 {
-		return nil
-	}
+		c.view.App.QueueUpdateDraw(func() {
+			c.view.Pages.RemovePage("progress")
+			if len(allObjects) == 0 {
+				return
+			}
+			proceed := func(cwd string) {
+				c.runDownload(mdl, srcBucket, srcPath, len(names), allObjects, totalSize, cwd)
+			}
+			// If the active profile defines a download directory, use it
+			// directly; otherwise let the user pick one.
+			if c.activeConfig != nil && strings.TrimSpace(c.activeConfig.DownloadDir) != "" {
+				proceed(c.resolveDownloadDir())
+			} else {
+				c.chooseDir(c.params.HomeDir, proceed)
+			}
+		})
+	}()
+}
 
-	proceed := func(cwd string) {
+// runDownload confirms and executes the byte phase for already-resolved
+// objects. Runs on the UI goroutine.
+func (c *Controller) runDownload(mdl *model.Model, srcBucket *model.Object, srcPath string, selectedCount int, allObjects []model.DownloadTarget, totalSize int64, cwd string) {
+	{
 		confirm := c.view.NewConfirm()
 		confirm.SetText(fmt.Sprintf(
 			"Download to %s\nSelected: %d item(s)\nResolved: %d object(s)\nTotal size: %s",
 			cwd,
-			len(names),
+			selectedCount,
 			len(allObjects),
 			humanize.IBytes(uint64(totalSize)),
 		)).SetDoneFunc(func(buttonIndex int, buttonLabel string) {
@@ -903,7 +955,14 @@ func (c *Controller) Download() error {
 
 				// toDownload is declared before showProgress so the closure can
 				// reference it (closures capture variables, not values).
-				type resolvedItem struct{ object model.DownloadTarget }
+				type resolvedItem struct {
+					object model.DownloadTarget
+					// overwrite records the user's decision from Phase 1; the
+					// existing file is replaced only when its download has
+					// fully succeeded (temp file + rename in the model), so a
+					// canceled or failed run never destroys local data.
+					overwrite bool
+				}
 				var toDownload []resolvedItem
 
 				showProgress := func() {
@@ -975,8 +1034,16 @@ func (c *Controller) Download() error {
 					if job.isBackgrounded() {
 						return // no modal to update; details live in the panel
 					}
+					// Report against the effective total (skips excluded), so a
+					// fully successful run with skips doesn't read as a
+					// partial transfer. Before Phase 2 it is still zero — fall
+					// back to the resolved total then.
+					reportTotal := effectiveTotalSize
+					if reportTotal == 0 {
+						reportTotal = totalSize
+					}
 					c.view.App.QueueUpdateDraw(func() {
-						report := sum.text(totalSize, isCanceled)
+						report := sum.text(reportTotal, isCanceled)
 
 						progress.ClearButtons()
 						progress.AddButtons([]string{"Done", "Copy report"})
@@ -1025,28 +1092,42 @@ func (c *Controller) Download() error {
 
 					// Directory markers: create immediately; don't queue for download.
 					if strings.HasSuffix(keyStr, "/") {
-						dst := localDownloadPath(srcPath, cwd, keyStr)
-						if mkErr := os.MkdirAll(dst, 0760); mkErr != nil {
-							sumMu.Lock()
-							sum.addFailed(keyStr, mkErr)
-							sumMu.Unlock()
-						} else {
-							sumMu.Lock()
-							sum.downloaded++
-							sumMu.Unlock()
+						dst, pErr := localDownloadPath(srcPath, cwd, keyStr)
+						if pErr == nil {
+							pErr = os.MkdirAll(dst, 0760)
 						}
+						sumMu.Lock()
+						if pErr != nil {
+							sum.addFailed(keyStr, pErr)
+						} else {
+							sum.downloaded++
+						}
+						sumMu.Unlock()
 						continue
 					}
 
-					dst := localDownloadPath(srcPath, cwd, keyStr)
+					dst, pErr := localDownloadPath(srcPath, cwd, keyStr)
+					if pErr != nil {
+						sumMu.Lock()
+						sum.addFailed(keyStr, pErr)
+						sumMu.Unlock()
+						continue
+					}
+					overwrite := false
 					if _, statErr := os.Stat(dst); statErr == nil {
+						// Only record the decision here. Nothing is removed:
+						// the transfer replaces the file atomically on
+						// success, so a cancel while this job is still queued
+						// (or a failed transfer) leaves the original intact.
 						if skipAll {
 							sumMu.Lock()
 							sum.addSkipped(dst)
 							sumMu.Unlock()
 							continue
 						}
-						if !overwriteAll {
+						if overwriteAll {
+							overwrite = true
+						} else {
 							switch c.askOverwrite(dst) {
 							case decSkip:
 								sumMu.Lock()
@@ -1060,26 +1141,10 @@ func (c *Controller) Download() error {
 								sumMu.Unlock()
 								continue
 							case decOverwrite:
-								if err := os.Remove(dst); err != nil {
-									sumMu.Lock()
-									sum.addFailed(dst, err)
-									sumMu.Unlock()
-									continue
-								}
-								sumMu.Lock()
-								sum.overwritten++
-								sumMu.Unlock()
+								overwrite = true
 							case decOverwriteAll:
 								overwriteAll = true
-								if err := os.Remove(dst); err != nil {
-									sumMu.Lock()
-									sum.addFailed(dst, err)
-									sumMu.Unlock()
-									continue
-								}
-								sumMu.Lock()
-								sum.overwritten++
-								sumMu.Unlock()
+								overwrite = true
 							default: // decCancel
 								cancel()
 								sumMu.Lock()
@@ -1088,20 +1153,10 @@ func (c *Controller) Download() error {
 								showSummary()
 								return
 							}
-						} else {
-							if err := os.Remove(dst); err != nil {
-								sumMu.Lock()
-								sum.addFailed(dst, err)
-								sumMu.Unlock()
-								continue
-							}
-							sumMu.Lock()
-							sum.overwritten++
-							sumMu.Unlock()
 						}
 					}
 
-					toDownload = append(toDownload, resolvedItem{object})
+					toDownload = append(toDownload, resolvedItem{object: object, overwrite: overwrite})
 				}
 
 				sumMu.Lock()
@@ -1173,12 +1228,13 @@ func (c *Controller) Download() error {
 						sumMu.Unlock()
 						showProgress()
 
-						n, err := c.model.DownloadTarget(
+						n, err := mdl.DownloadTarget(
 							ctx,
 							ri.object,
 							srcPath,
 							cwd,
 							srcBucket.Key,
+							ri.overwrite,
 							func(written, _ int64, _ string) {
 								sumMu.Lock()
 								activeProgress[keyStr] = written
@@ -1205,6 +1261,11 @@ func (c *Controller) Download() error {
 						}
 						sumMu.Lock()
 						sum.downloaded++
+						if ri.overwrite {
+							// Counted on completion: the file is only actually
+							// replaced once its download succeeded.
+							sum.overwritten++
+						}
 						sum.bytesDone += n
 						completedBytes += n
 						completedCount++
@@ -1220,17 +1281,6 @@ func (c *Controller) Download() error {
 
 		c.view.Pages.AddPage("confirm", confirm, true, true)
 	}
-
-	// If the active profile defines a download directory, use it directly.
-	// Otherwise let the user pick one with the FS browser dialog.
-	if c.activeConfig != nil && strings.TrimSpace(c.activeConfig.DownloadDir) != "" {
-		proceed(c.resolveDownloadDir())
-	} else {
-		c.chooseDir(c.params.HomeDir, func(dir string) {
-			proceed(dir)
-		})
-	}
-	return nil
 }
 
 func (c *Controller) labelForList(o *model.Object) (primary string, secondary string) {
@@ -1604,17 +1654,10 @@ func (c *Controller) Up() {
 	// the full prefix, which equals the current path.
 	c.restoreNext = c.currentPath
 
-	fields := strings.FieldsFunc(strings.TrimSpace(c.currentPath), u.SplitFunc)
-	if len(fields) == 0 {
-		go c.updateList()
-		return
-	}
-
-	newDir := strings.Join(fields[:len(fields)-1], "/")
-	if len(fields) > 1 {
-		newDir += "/"
-	}
-	c.currentPath = newDir
+	// parentPrefix trims exactly one trailing segment. Splitting on "/" and
+	// re-joining would collapse empty segments, so leaving a folder with an
+	// empty-named component ("a//") would jump two levels instead of one.
+	c.currentPath = parentPrefix(c.currentPath)
 	go c.updateList()
 }
 
@@ -1894,6 +1937,15 @@ func (c *Controller) create(isBucket bool) {
 		if name == "" {
 			return
 		}
+		// path.Join would silently retarget "." / ".." / "a/b" (".." creates
+		// the PARENT prefix's marker); reject them like rename does.
+		if !isBucket {
+			if verr := validateEntryName(name); verr != nil {
+				c.view.Pages.RemovePage("modal")
+				go c.error("Create folder", verr)
+				return
+			}
+		}
 
 		// restore is the new object's unique objKey, so the cursor lands on it
 		// after the refresh: the bucket name, or the full folder prefix.
@@ -1941,13 +1993,20 @@ func (c *Controller) CheckProfile() {
 
 	cf := c.params.Config[i]
 
+	// A throwaway client: verifying a profile must never replace c.model —
+	// a queued/backgrounded transfer that reads the model later would run
+	// against the verified profile's endpoint instead of its own.
 	mCf := model.NewConfig(cf.BaseUrl, cf.Region, cf.AccessKey, cf.SecretKey, cf.SessionToken, !cf.IgnoreSsl, cf.MaxBytesPerSec)
-	c.model = model.NewModel(mCf)
+	probe, err := model.NewModel(mCf)
+	if err != nil {
+		go c.error(fmt.Sprintf("error checking profile %s", cf.Name), err)
+		return
+	}
 
 	// ListBuckets is a network round-trip; run it off the UI goroutine so a
 	// slow or unreachable endpoint can't freeze the TUI.
 	go func() {
-		if _, err := c.model.ListBuckets(); err != nil {
+		if _, err := probe.ListBuckets(); err != nil {
 			c.error(fmt.Sprintf("error checking profile %s", cf.Name), err)
 		} else {
 			c.success(fmt.Sprintf("successfully checked profile %s", cf.Name))
@@ -1965,7 +2024,9 @@ func (c *Controller) DeleteConfigEntry() {
 	confirm := c.view.NewConfirm()
 	confirm.SetText(fmt.Sprintf("Do you want to delete %s", cur)).
 		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-			c.view.Pages.RemovePage("confirm").SwitchToPage("main")
+			// No SwitchToPage here: that would hide EVERY other page,
+			// including a profile form the user was in the middle of.
+			c.view.Pages.RemovePage("confirm")
 
 			if buttonLabel == "OK" {
 				go func() {
@@ -2050,6 +2111,19 @@ func (c *Controller) Rename() {
 	c.renameSingle()
 }
 
+// validateEntryName rejects names that key derivation or navigation would
+// reinterpret: separators (they'd nest), and the dot-dirs ("." is the current
+// prefix, ".." — after path.Join's cleaning — its parent).
+func validateEntryName(name string) error {
+	if strings.Contains(name, "/") {
+		return fmt.Errorf("name must not contain '/'")
+	}
+	if name == "." || name == ".." {
+		return fmt.Errorf("%q is not a usable name", name)
+	}
+	return nil
+}
+
 // renameSingle renames the highlighted object (server-side copy + delete;
 // recursive for folders).
 func (c *Controller) renameSingle() {
@@ -2069,8 +2143,8 @@ func (c *Controller) renameSingle() {
 		if newName == "" || newName == short {
 			return
 		}
-		if strings.Contains(newName, "/") {
-			go c.error("Invalid name", fmt.Errorf("name must not contain '/'"))
+		if err := validateEntryName(newName); err != nil {
+			go c.error("Invalid name", err)
 			return
 		}
 
@@ -2080,20 +2154,31 @@ func (c *Controller) renameSingle() {
 		}
 
 		bucket := c.currentBucket
-		go func() {
-			if _, err := c.model.MoveKeys(context.Background(), bucket, bucket, srcKey, dstKey, isFolder, nil); err != nil {
-				c.error("Rename failed", err)
-				return
-			}
-			c.setUndo(&undoOp{
-				items: invertOps([]transferPair{{srcBucket: bucket, dstBucket: bucket, srcKey: srcKey, dstKey: dstKey, isFolder: isFolder}}),
-				desc:  "rename " + short,
+		mdl := c.model
+		item := copyMoveItem{shortName: newName, srcKey: srcKey, isFolder: isFolder}
+		c.confirmOverwrites(mdl, bucket, "Rename",
+			plannedCopyKeys(mdl, bucket, bucket, []copyMoveItem{item}, c.currentPath),
+			func(skip map[string]bool) {
+				go func() {
+					n, err := mdl.MoveKeys(context.Background(), bucket, bucket, srcKey, dstKey, isFolder, skip, nil)
+					if err != nil {
+						c.error("Rename failed", err)
+						return
+					}
+					if n == 0 {
+						c.success("Nothing renamed")
+						return
+					}
+					c.setUndo(&undoOp{
+						items: invertOps([]transferPair{{srcBucket: bucket, dstBucket: bucket, srcKey: srcKey, dstKey: dstKey, isFolder: isFolder}}),
+						desc:  "rename " + short,
+					})
+					c.logActivity("renamed %s → %s", short, newName)
+					c.restoreNext = dstKey // unique objKey of the renamed item
+					c.updateList()
+					c.success("Renamed")
+				}()
 			})
-			c.logActivity("renamed %s → %s", short, newName)
-			c.restoreNext = dstKey // unique objKey of the renamed item
-			c.updateList()
-			go c.success("Renamed")
-		}()
 	})
 	form.AddButton("Cancel", func() {
 		c.view.Pages.RemovePage("modal")
@@ -2155,8 +2240,8 @@ func planBatchRename(items []renameItem, currentPath, pattern, find, replace str
 		if newName == "" {
 			return nil, fmt.Errorf("empty result name for %q", it.shortName)
 		}
-		if strings.Contains(newName, "/") {
-			return nil, fmt.Errorf("name must not contain '/': %q", newName)
+		if err := validateEntryName(newName); err != nil {
+			return nil, fmt.Errorf("%v: %q", err, newName)
 		}
 		if newName == it.shortName {
 			continue // no-op
@@ -2214,15 +2299,60 @@ func (c *Controller) batchRename(names []string) {
 			go c.error("Batch rename", err)
 			return
 		}
-		c.runBatchRename(ops)
+
+		bucket := c.currentBucket
+		mdl := c.model
+		c.confirmOverwrites(mdl, bucket, "Batch rename",
+			plannedCopyKeys(mdl, bucket, bucket, renameItemsToCopyItems(ops), prefix),
+			func(skip map[string]bool) {
+				kept := keepUnskippedRenames(ops, skip)
+				if len(kept) == 0 {
+					go c.success("Nothing to rename")
+					return
+				}
+				c.runBatchRename(kept, skip)
+			})
 	})
 	form.AddButton("Cancel", func() { c.view.Pages.RemovePage("modal") })
 	c.view.Pages.AddPage("modal", c.view.ModalEdit(form, 70, 11), true, true)
 }
 
+// renameItemsToCopyItems views rename operations as copy items, so the
+// overwrite scan can expand their destinations the same way a copy's are.
+// The "short name" is the destination's own last segment, since that is what
+// plannedCopyKeys appends to the prefix.
+func renameItemsToCopyItems(ops []renameOp) []copyMoveItem {
+	items := make([]copyMoveItem, 0, len(ops))
+	for _, op := range ops {
+		items = append(items, copyMoveItem{
+			shortName: path.Base(strings.TrimSuffix(op.dstKey, "/")),
+			srcKey:    op.srcKey,
+			isFolder:  op.isFolder,
+		})
+	}
+	return items
+}
+
+// keepUnskippedRenames drops the operations whose only destination the user
+// chose to keep. A folder rename survives as long as anything under it is
+// still due to move — the per-object skips are applied inside MoveKeys.
+func keepUnskippedRenames(ops []renameOp, skip map[string]bool) []renameOp {
+	if len(skip) == 0 {
+		return ops
+	}
+	kept := make([]renameOp, 0, len(ops))
+	for _, op := range ops {
+		if !op.isFolder && skip[op.dstKey] {
+			continue
+		}
+		kept = append(kept, op)
+	}
+	return kept
+}
+
 // runBatchRename executes the resolved rename operations behind a cancellable
 // progress modal (server-side copy + delete per item).
-func (c *Controller) runBatchRename(ops []renameOp) {
+func (c *Controller) runBatchRename(ops []renameOp, skip map[string]bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	progress := tview.NewModal().
 		SetText("Starting rename...\n").
@@ -2234,6 +2364,7 @@ func (c *Controller) runBatchRename(ops []renameOp) {
 	c.view.Pages.AddPage("progress", progress, true, true)
 
 	bucket := c.currentBucket
+	mdl := c.model
 	go func() {
 		var failed []string
 		var moved []transferPair
@@ -2252,7 +2383,7 @@ func (c *Controller) runBatchRename(ops []renameOp) {
 			c.view.App.QueueUpdateDraw(func() {
 				progress.SetText(fmt.Sprintf("Renaming %d/%d\n%s", n, len(ops), label))
 			})
-			if _, err := c.model.MoveKeys(ctx, bucket, bucket, op.srcKey, op.dstKey, op.isFolder, nil); err != nil {
+			if _, err := mdl.MoveKeys(ctx, bucket, bucket, op.srcKey, op.dstKey, op.isFolder, skip, nil); err != nil {
 				failed = append(failed, fmt.Sprintf("%s: %v", op.label, err))
 				continue
 			}
@@ -2299,12 +2430,18 @@ type copyMoveItem struct {
 	shortName string
 	srcKey    string
 	isFolder  bool
+	// size is captured when the item is built, on the UI goroutine — the
+	// cross-profile copy needs it for progress totals, and the listing it
+	// came from may be long gone by the time the transfer runs.
+	size int64
 }
 
 // clipboard holds objects yanked (copy) or cut (move) for a later paste.
 type clipboard struct {
 	op     string // "copy" or "cut"; "" = empty
 	bucket *model.Object
+	prefix string // path the items were yanked from (same-destination guard)
+	scope  string // selection-scope key at yank time (marks cleared after a cut-paste)
 	items  []copyMoveItem
 }
 
@@ -2442,7 +2579,14 @@ func (c *Controller) copyOrMove(isMove bool) {
 					bn := dstBucketName
 					dstBucket = &model.Object{Key: &bn, Ot: model.Bucket}
 				}
-				c.runCopyOrMove(isMove, title, items, c.currentBucket, dstBucket, dstBucketName, dstPrefix)
+				srcBucket := c.currentBucket
+				scope := c.scopeKey()
+				mdl := c.model
+				c.confirmOverwrites(mdl, dstBucket, title,
+					plannedCopyKeys(mdl, srcBucket, dstBucket, items, dstPrefix),
+					func(skip map[string]bool) {
+						c.runCopyOrMove(isMove, title, items, srcBucket, dstBucket, dstBucketName, dstPrefix, scope, nil, skip)
+					})
 			})
 			form.AddButton("Cancel", func() {
 				c.view.Pages.RemovePage("modal")
@@ -2454,7 +2598,10 @@ func (c *Controller) copyOrMove(isMove bool) {
 
 // runCopyOrMove executes the resolved copy/move against dstBucket, showing a
 // cancellable progress modal with per-item object rate + ETA.
-func (c *Controller) runCopyOrMove(isMove bool, title string, items []copyMoveItem, srcBucket, dstBucket *model.Object, dstBucketName, dstPrefix string) {
+func (c *Controller) runCopyOrMove(isMove bool, title string, items []copyMoveItem, srcBucket, dstBucket *model.Object, dstBucketName, dstPrefix, srcScope string, afterMove func(), skip map[string]bool) {
+	// Runs on the UI goroutine: capture the client before spawning, so a
+	// profile switch can't retarget the transfer mid-run.
+	mdl := c.model
 	ctx, cancel := context.WithCancel(context.Background())
 	progress := tview.NewModal().
 		SetText(fmt.Sprintf("Starting %s...\n", strings.ToLower(title))).
@@ -2469,6 +2616,11 @@ func (c *Controller) runCopyOrMove(isMove bool, title string, items []copyMoveIt
 		var failed []string
 		var moved []transferPair
 		okCount := 0
+		// objCount counts objects actually written, which is not the item
+		// count: a folder item is many objects, and a skipped destination is
+		// none. Reporting items as "OK" made a run that skipped everything
+		// read as a complete success.
+		objCount := 0
 		canceled := false
 
 	loop:
@@ -2495,17 +2647,19 @@ func (c *Controller) runCopyOrMove(isMove bool, title string, items []copyMoveIt
 				})
 			}
 
+			var n int
 			var err error
 			if isMove {
-				_, err = c.model.MoveKeys(ctx, srcBucket, dstBucket, srcKey, dstKey, it.isFolder, cb)
+				n, err = mdl.MoveKeys(ctx, srcBucket, dstBucket, srcKey, dstKey, it.isFolder, skip, cb)
 			} else {
-				_, err = c.model.CopyKeys(ctx, srcBucket, dstBucket, srcKey, dstKey, it.isFolder, cb)
+				n, err = mdl.CopyKeys(ctx, srcBucket, dstBucket, srcKey, dstKey, it.isFolder, skip, cb)
 			}
 			if err != nil {
 				failed = append(failed, fmt.Sprintf("%s: %v", it.shortName, err))
 				continue
 			}
 			okCount++
+			objCount += n
 			if isMove {
 				moved = append(moved, transferPair{srcBucket: srcBucket, dstBucket: dstBucket, srcKey: srcKey, dstKey: dstKey, isFolder: it.isFolder})
 			}
@@ -2514,7 +2668,14 @@ func (c *Controller) runCopyOrMove(isMove bool, title string, items []copyMoveIt
 		if isMove && len(moved) > 0 {
 			c.setUndo(&undoOp{items: invertOps(moved), desc: fmt.Sprintf("%s of %d item(s)", title, len(moved))})
 		}
-		c.logActivity("%s: %d ok, %d failed → %s/%s", title, okCount, len(failed), dstBucketName, dstPrefix)
+		// A cut clipboard is consumed only when something actually moved: a
+		// fully failed (or same-place) paste keeps the cut so it can be
+		// retried. Serialized through the UI queue — c.clip is UI state.
+		if isMove && okCount > 0 && afterMove != nil {
+			c.view.App.QueueUpdateDraw(afterMove)
+		}
+		c.logActivity("%s: %d item(s), %d object(s) written, %d failed → %s/%s",
+			title, okCount, objCount, len(failed), dstBucketName, dstPrefix)
 
 		if canceled {
 			// progress page already removed by the Cancel handler.
@@ -2527,7 +2688,11 @@ func (c *Controller) runCopyOrMove(isMove bool, title string, items []copyMoveIt
 			if len(failed) > 0 {
 				status = title + " finished with errors."
 			}
-			msg := fmt.Sprintf("%s\n\nOK: %d\nFailed: %d", status, okCount, len(failed))
+			msg := fmt.Sprintf("%s\n\nItems: %d\nObjects written: %d\nFailed: %d",
+				status, okCount, objCount, len(failed))
+			if len(skip) > 0 {
+				msg += fmt.Sprintf("\nKept existing: %d", len(skip))
+			}
 			for _, f := range failed {
 				msg += "\n  - " + f
 			}
@@ -2543,7 +2708,11 @@ func (c *Controller) runCopyOrMove(isMove bool, title string, items []copyMoveIt
 		})
 
 		if isMove {
-			c.clearSelected()
+			// Clear the marks in the scope the items were marked in — NOT the
+			// current scope: a paste finishes in the destination listing, and
+			// clearing there left phantom marks in the source folder that
+			// made later commands silently operate on nothing.
+			c.clearSelectedIn(srcScope)
 		}
 		c.updateList()
 	}()
@@ -2589,7 +2758,7 @@ func (c *Controller) yank(op string) {
 	if len(items) == 0 {
 		return
 	}
-	c.clip = clipboard{op: op, bucket: c.currentBucket, items: items}
+	c.clip = clipboard{op: op, bucket: c.currentBucket, prefix: c.currentPath, scope: c.scopeKey(), items: items}
 	verb := "Copied"
 	if op == "cut" {
 		verb = "Cut"
@@ -2603,12 +2772,27 @@ func (c *Controller) paste() {
 	if c.currentBucket == nil || c.clip.bucket == nil || len(c.clip.items) == 0 {
 		return
 	}
-	isMove := c.clip.op == "cut"
 	dstBucketName := *c.currentBucket.Key
-	c.runCopyOrMove(isMove, "Paste", c.clip.items, c.clip.bucket, c.currentBucket, dstBucketName, c.currentPath)
-	if isMove {
-		c.clip = clipboard{} // a cut is consumed by the paste
+	if c.clip.bucket.Key != nil && *c.clip.bucket.Key == dstBucketName &&
+		model.NormalizePrefix(c.clip.prefix) == model.NormalizePrefix(c.currentPath) {
+		go c.error("Paste failed", fmt.Errorf("destination equals source"))
+		return
 	}
+	isMove := c.clip.op == "cut"
+	items := c.clip.items
+	srcBucket := c.clip.bucket
+	dstBucket := c.currentBucket
+	dstPrefix := c.currentPath
+	scope := c.clip.scope
+	mdl := c.model
+	c.confirmOverwrites(mdl, dstBucket, "Paste",
+		plannedCopyKeys(mdl, srcBucket, dstBucket, items, dstPrefix),
+		func(skip map[string]bool) {
+			// The cut is consumed by the runner once something actually moved,
+			// so a failed or canceled paste keeps the clipboard for a retry.
+			c.runCopyOrMove(isMove, "Paste", items, srcBucket, dstBucket, dstBucketName, dstPrefix,
+				scope, func() { c.clip = clipboard{} }, skip)
+		})
 }
 
 // Undo reverses the last move/rename (one step) after a confirmation.
@@ -2632,6 +2816,7 @@ func (c *Controller) Undo() {
 
 // runUndo applies the reverse moves behind a cancellable progress modal.
 func (c *Controller) runUndo(op *undoOp) {
+	mdl := c.model
 	ctx, cancel := context.WithCancel(context.Background())
 	progress := tview.NewModal().
 		SetText("Undoing...\n").
@@ -2657,7 +2842,9 @@ func (c *Controller) runUndo(op *undoOp) {
 			c.view.App.QueueUpdateDraw(func() {
 				progress.SetText(fmt.Sprintf("Undoing %d/%d\n%s", n, len(op.items), line))
 			})
-			if _, err := c.model.MoveKeys(ctx, it.srcBucket, it.dstBucket, it.srcKey, it.dstKey, it.isFolder, nil); err != nil {
+			// No overwrite prompt here: undo has its own confirmation and puts
+			// objects back where they were moments ago.
+			if _, err := mdl.MoveKeys(ctx, it.srcBucket, it.dstBucket, it.srcKey, it.dstKey, it.isFolder, nil, nil); err != nil {
 				failed = append(failed, fmt.Sprintf("%s: %v", it.srcKey, err))
 				continue
 			}
@@ -2694,15 +2881,18 @@ func (c *Controller) setConfigInput() {
 		case tcell.KeyCtrlQ:
 			c.Stop()
 			return nil
-		case tcell.KeyDelete:
-			c.DeleteConfigEntry()
-			return nil
 		}
 		return event
 	})
 
 	c.view.List.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		switch event.Key() {
+		// Delete belongs on the LIST, not the application: an app-level
+		// capture fires before the focused widget, so forward-delete while
+		// editing a profile form would pop the delete-profile confirm.
+		case tcell.KeyDelete:
+			c.DeleteConfigEntry()
+			return nil
 		case tcell.KeyCtrlN:
 			c.CreateConfigEntry()
 			return nil
@@ -3039,6 +3229,15 @@ func (c *Controller) listInputCapture(event *tcell.EventKey) *tcell.EventKey {
 		case '=':
 			c.ComparePanes()
 			return nil
+		case 'D':
+			c.FindDuplicates()
+			return nil
+		case 'e':
+			c.EditObject()
+			return nil
+		case '>':
+			c.CopyToProfile()
+			return nil
 		}
 	case tcell.KeyLeft:
 		if event.Modifiers()&tcell.ModAlt != 0 {
@@ -3305,7 +3504,18 @@ func (c *Controller) Duck(url string, region *string, acc string, sec string, ss
 		token = c.activeConfig.SessionToken
 	}
 	mCf := model.NewConfig(url, region, acc, sec, token, ssl, maxBps)
-	c.model = model.NewModel(mCf)
+	mdl, err := model.NewModel(mCf)
+	if err != nil {
+		go c.error("Cannot open profile", err)
+		return
+	}
+	c.model = mdl
+	// The clipboard and the one-step undo carry bucket/key names from the
+	// profile they were made in; surviving a profile switch, a paste or undo
+	// would copy from — and a cut-paste DELETE from — a same-named bucket on
+	// the new endpoint.
+	c.clip = clipboard{}
+	c.setUndo(nil)
 	c.browsing = true // the browser owns the shared list widget from here on
 	c.resetPanes()    // fresh single-pane browser for this profile
 	c.wireListChanged(c.view.PaneList(0))
@@ -3336,24 +3546,27 @@ func (c *Controller) Run() error {
 func (c *Controller) error(header string, err error) {
 	errMsg := c.view.NewErrorMessageQ(header, err.Error())
 	errMsg.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-		c.view.Pages.RemovePage("modal")
+		c.view.Pages.RemovePage("modal-msg")
 	})
 
-	// Call QueueUpdateDraw ONLY for the update
+	// The toast lives on its own page name: AddPage REPLACES a page of the
+	// same name, so sharing "modal" with the long-lived forms meant any
+	// asynchronous error (a failed background transfer, a late refresh)
+	// silently destroyed whatever form the user was typing into.
 	c.view.App.QueueUpdateDraw(func() {
-		c.view.Pages.AddPage("modal", c.view.ModalEdit(errMsg, 8, 3), true, true)
+		c.view.Pages.AddPage("modal-msg", c.view.ModalEdit(errMsg, 8, 3), true, true)
 	})
 }
 
 func (c *Controller) success(header string) {
 	succMsg := c.view.NewSuccessMessageQ(header)
 	succMsg.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-		c.view.Pages.RemovePage("modal")
+		c.view.Pages.RemovePage("modal-msg")
 	})
 
-	// Same here: just view update
+	// Own page name for the same reason as error's.
 	c.view.App.QueueUpdateDraw(func() {
-		c.view.Pages.AddPage("modal", c.view.ModalEdit(succMsg, 8, 3), true, true)
+		c.view.Pages.AddPage("modal-msg", c.view.ModalEdit(succMsg, 8, 3), true, true)
 	})
 }
 
@@ -3365,16 +3578,19 @@ func (c *Controller) chooseDir(startPath string, onChosen func(dir string)) {
 	layout, localList := c.view.NewCreateLocalFileListForm()
 	app := c.view.App
 
+	// The picker lives on its own page name so it can OVERLAY a form (the
+	// sync dialog's Browse…) instead of replacing it: closing the picker then
+	// reveals the form untouched, and tview refocuses the front page.
 	selectBtn := tview.NewButton("Select here").SetSelectedFunc(func() {
 		dir := currentPath
 		if !strings.HasSuffix(dir, string(os.PathSeparator)) {
 			dir += string(os.PathSeparator)
 		}
-		c.view.Pages.RemovePage("modal")
+		c.view.Pages.RemovePage("modal-dir")
 		onChosen(dir)
 	})
 	cancelBtn := tview.NewButton("Cancel").SetSelectedFunc(func() {
-		c.view.Pages.RemovePage("modal")
+		c.view.Pages.RemovePage("modal-dir")
 	})
 
 	buttonRow := tview.NewFlex().
@@ -3433,7 +3649,7 @@ func (c *Controller) chooseDir(startPath string, onChosen func(dir string)) {
 			setNextFocus()
 			return nil
 		case tcell.KeyEsc:
-			c.view.Pages.RemovePage("modal")
+			c.view.Pages.RemovePage("modal-dir")
 			return nil
 		case tcell.KeyBackspace2:
 			renderList(filepath.Dir(currentPath))
@@ -3457,7 +3673,7 @@ func (c *Controller) chooseDir(startPath string, onChosen func(dir string)) {
 	})
 
 	modal := c.view.ModalEdit(layout, 60, 25)
-	c.view.Pages.AddPage("modal", modal, true, true)
+	c.view.Pages.AddPage("modal-dir", modal, true, true)
 	renderList(startPath)
 }
 
@@ -3593,22 +3809,23 @@ func (c *Controller) ShowLocalFSModal(startPath string) {
 }
 
 func (c *Controller) Upload(localPath string) {
-	ctx, cancel := context.WithCancel(context.Background())
-
 	// Capture the destination now, on the UI goroutine. The byte phase starts
 	// only after a jobSem slot frees, which can be minutes later — reading
 	// c.currentBucket then would panic on the buckets screen, or silently
 	// upload into whatever bucket the user happens to be viewing.
 	dstBucket := c.currentBucket
 	dstPath := c.currentPath
+	// The client too: a profile switch while this job is queued must not
+	// retarget the upload at the new profile's endpoint.
+	mdl := c.model
 
-	files, totalSize, err := c.model.PrepareUpload(localPath, dstPath, dstBucket)
+	files, _, err := mdl.PrepareUpload(localPath, dstPath, dstBucket)
 	if err == nil && len(files) == 0 {
 		// A directory with no files is still uploadable: Upload creates its
 		// folder-marker object. Only a non-directory with nothing to send is
 		// an error.
 		if fi, statErr := os.Stat(localPath); statErr == nil && fi.IsDir() {
-			c.uploadEmptyDir(localPath, dstPath, dstBucket, cancel)
+			c.uploadEmptyDir(localPath, dstPath, dstBucket)
 			return
 		}
 	}
@@ -3617,15 +3834,58 @@ func (c *Controller) Upload(localPath string) {
 		// modal's button). c.error() calls QueueUpdateDraw, which blocks until
 		// the UI goroutine drains the queue — calling it inline here would
 		// deadlock the event loop and freeze the whole app (e.g. when the user
-		// picks an empty directory). Dispatch it on its own goroutine, and
-		// release the unused context created above.
-		cancel()
+		// picks an empty directory). Dispatch it on its own goroutine.
 		if err == nil {
 			err = fmt.Errorf("nothing to upload")
 		}
 		go c.error("Upload failed", err)
 		return
 	}
+
+	// PrepareUpload already knows every key this would write, so the overwrite
+	// scan needs no extra listing of the source.
+	plan := func() ([]string, error) {
+		keys := make([]string, 0, len(files))
+		for _, f := range files {
+			keys = append(keys, f.RemotePath)
+		}
+		return keys, nil
+	}
+	c.confirmOverwrites(mdl, dstBucket, "Upload", plan, func(skip map[string]bool) {
+		kept, keptSize := unskippedUploads(files, skip)
+		if len(kept) == 0 {
+			go c.success("Nothing to upload")
+			return
+		}
+		c.runUpload(mdl, localPath, dstPath, dstBucket, kept, keptSize, skip)
+	})
+}
+
+// unskippedUploads drops the targets the user chose to keep and re-totals the
+// bytes, so the progress gauge measures what is actually being sent.
+func unskippedUploads(files []model.UploadTarget, skip map[string]bool) ([]model.UploadTarget, int64) {
+	if len(skip) == 0 {
+		var total int64
+		for _, f := range files {
+			total += f.Size
+		}
+		return files, total
+	}
+	kept := make([]model.UploadTarget, 0, len(files))
+	var total int64
+	for _, f := range files {
+		if skip[f.RemotePath] {
+			continue
+		}
+		kept = append(kept, f)
+		total += f.Size
+	}
+	return kept, total
+}
+
+// runUpload transfers the approved files as a cancellable, backgroundable job.
+func (c *Controller) runUpload(mdl *model.Model, localPath, dstPath string, dstBucket *model.Object, files []model.UploadTarget, totalSize int64, skip map[string]bool) {
+	ctx, cancel := context.WithCancel(context.Background())
 
 	first := files[0]
 	job := c.addJob("upload", fmt.Sprintf("%s → %s/%s", filepath.Base(localPath), *dstBucket.Key, dstPath), totalSize, len(files), cancel)
@@ -3674,7 +3934,7 @@ func (c *Controller) Upload(localPath string) {
 		job.setStatus(jobRunning)
 		startTime = time.Now()
 
-		err := c.model.Upload(ctx, localPath, dstPath, dstBucket, func(n, total int64, i, count int, local, remote string) {
+		err := mdl.Upload(ctx, localPath, dstPath, dstBucket, skip, func(n, total int64, i, count int, local, remote string) {
 			job.setProgress(n, i)
 			select {
 			case <-ctx.Done():
@@ -3748,10 +4008,10 @@ func (c *Controller) Upload(localPath string) {
 // uploadEmptyDir uploads a directory that contains no files: Upload creates
 // its folder-marker object. There are no bytes to meter, so this skips the
 // progress modal and the transfer queue entirely.
-func (c *Controller) uploadEmptyDir(localPath, dstPath string, dstBucket *model.Object, cancel context.CancelFunc) {
+func (c *Controller) uploadEmptyDir(localPath, dstPath string, dstBucket *model.Object) {
+	mdl := c.model
 	go func() {
-		defer cancel()
-		if err := c.model.Upload(context.Background(), localPath, dstPath, dstBucket, nil); err != nil {
+		if err := mdl.Upload(context.Background(), localPath, dstPath, dstBucket, nil, nil); err != nil {
 			c.error("Upload failed", err)
 			return
 		}
@@ -4374,6 +4634,9 @@ func (c *Controller) paletteActions() []paletteAction {
 		{"Undo last move/rename", c.Undo},
 		{"Sync (local ⇄ remote, or remote → remote)", c.Sync},
 		{"Compare the two panes", c.ComparePanes},
+		{"Find duplicates (size + ETag)", c.FindDuplicates},
+		{"Edit in $EDITOR", c.EditObject},
+		{"Copy to another profile…", c.CopyToProfile},
 		{"Transfers", c.ShowTransfers},
 		{"Filter listing", c.focusFilter},
 		{"Refresh listing", c.Refresh},

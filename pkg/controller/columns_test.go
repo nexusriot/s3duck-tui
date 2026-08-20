@@ -311,3 +311,39 @@ func TestListHeaderMatchesColumns(t *testing.T) {
 		}
 	})
 }
+
+// TestListRowEscapesTagLikeNames pins the escaping of S3 keys that happen to
+// contain valid tview tags: without tview.Escape, "a[red]b.txt" recolours the
+// row and — because truncation counts the tag's cells while padding discounts
+// them — shifts every following column out of alignment.
+func TestListRowEscapesTagLikeNames(t *testing.T) {
+	cols := planColumns(120)
+	when := colTime(t)
+
+	row := listRow(colFile("a[red]b.txt", 10, when, ""), false, cols)
+	if !strings.Contains(row, "[red[]") {
+		t.Fatalf("tag-like name not escaped: %q", row)
+	}
+
+	// The size column must still end where every other row's does.
+	plain := listRow(colFile("plain.txt", 10, when, ""), false, cols)
+	want := fieldEndCell(stripTags(plain), "10 B")
+	// tview renders "[red[]" as the literal "[red]"; mimic that before
+	// measuring, then strip real tags.
+	rendered := strings.ReplaceAll(row, "[red[]", "[red]")
+	if got := fieldEndCell(stripTagsKeepEscaped(rendered), "10 B"); got != want {
+		t.Errorf("size field ends at cell %d, want %d\n  %q", got, want, rendered)
+	}
+}
+
+// stripTagsKeepEscaped strips colour tags but treats "[red]" produced by
+// unescaping as literal text (it contains no style directive the test uses).
+func stripTagsKeepEscaped(s string) string {
+	// The only real tags listRow emits are colour tags like "[gray]"/"[-]"
+	// added AROUND fields; the literal "[red]" from the name survives because
+	// stripTags only recognises balanced tags — which "[red]" also is. So
+	// instead: replace the known literal first, strip, then restore length
+	// with a same-width placeholder.
+	s = strings.ReplaceAll(s, "[red]", "#####")
+	return stripTags(s)
+}

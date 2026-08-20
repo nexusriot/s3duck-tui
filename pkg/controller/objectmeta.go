@@ -122,9 +122,10 @@ func (c *Controller) EditObjectMeta() {
 	loading := tview.NewModal().SetText("Loading metadata...")
 	c.view.Pages.AddPage("progress", loading, true, true)
 
+	mdl := c.model
 	go func() {
 		ctx := context.Background()
-		meta, err := c.model.HeadObject(ctx, bucket, key)
+		meta, err := mdl.HeadObject(ctx, bucket, key)
 		if err != nil {
 			c.view.App.QueueUpdateDraw(func() { c.view.Pages.RemovePage("progress").SwitchToPage("main") })
 			c.error("Failed to read metadata", err)
@@ -132,7 +133,7 @@ func (c *Controller) EditObjectMeta() {
 		}
 		// Tagging is optional on S3-compatible backends; treat a failure as
 		// "no tags" rather than blocking the whole editor.
-		tags, tagErr := c.model.ObjectTags(ctx, bucket, key)
+		tags, tagErr := mdl.ObjectTags(ctx, bucket, key)
 		if tagErr != nil {
 			tags = map[string]string{}
 		}
@@ -213,19 +214,20 @@ func sameMeta(a, b model.ObjectMeta) bool {
 
 // saveObjectMeta writes the changed halves and reports what it did.
 func (c *Controller) saveObjectMeta(bucket *model.Object, key string, meta model.ObjectMeta, tags map[string]string, metaChanged, tagsChanged bool) {
+	mdl := c.model
 	go func() {
 		ctx := context.Background()
 		var done []string
 
 		if metaChanged {
-			if err := c.model.PutObjectMeta(ctx, bucket, key, meta); err != nil {
+			if err := mdl.PutObjectMeta(ctx, bucket, key, meta); err != nil {
 				c.error("Failed to save metadata", err)
 				return
 			}
 			done = append(done, "metadata")
 		}
 		if tagsChanged {
-			if err := c.model.PutObjectTags(ctx, bucket, key, tags); err != nil {
+			if err := mdl.PutObjectTags(ctx, bucket, key, tags); err != nil {
 				c.error("Failed to save tags", err)
 				return
 			}
@@ -252,8 +254,9 @@ func (c *Controller) ChangeStorageClass() {
 	loading := tview.NewModal().SetText("Reading storage class...")
 	c.view.Pages.AddPage("progress", loading, true, true)
 
+	mdl := c.model
 	go func() {
-		meta, err := c.model.HeadObject(context.Background(), bucket, key)
+		meta, err := mdl.HeadObject(context.Background(), bucket, key)
 		if err != nil {
 			c.view.App.QueueUpdateDraw(func() { c.view.Pages.RemovePage("progress").SwitchToPage("main") })
 			c.error("Failed to read storage class", err)
@@ -301,8 +304,9 @@ func (c *Controller) ChangeStorageClass() {
 
 // runStorageClassChange applies a class change (a server-side copy in place).
 func (c *Controller) runStorageClassChange(bucket *model.Object, key, class string) {
+	mdl := c.model
 	go func() {
-		if err := c.model.SetStorageClass(context.Background(), bucket, key, class); err != nil {
+		if err := mdl.SetStorageClass(context.Background(), bucket, key, class); err != nil {
 			c.error("Failed to change storage class", err)
 			return
 		}
@@ -316,8 +320,9 @@ func (c *Controller) runStorageClassChange(bucket *model.Object, key, class stri
 // side — completion can take minutes to hours — so this only reports that the
 // request was accepted; progress shows up in the object's restore status.
 func (c *Controller) runRestore(bucket *model.Object, key string, days int32, tier string) {
+	mdl := c.model
 	go func() {
-		if err := c.model.RestoreObject(context.Background(), bucket, key, days, tier); err != nil {
+		if err := mdl.RestoreObject(context.Background(), bucket, key, days, tier); err != nil {
 			c.error("Restore failed", err)
 			return
 		}

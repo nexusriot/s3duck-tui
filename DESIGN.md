@@ -68,7 +68,9 @@ CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) is three jobs: lint+un
 
 Any code that modifies a tview widget **must** run on the UI goroutine. Background goroutines use `App.QueueUpdateDraw(func() { ... })`. Direct widget calls from a goroutine (without QueueUpdateDraw) are a data race and can corrupt the display.
 
-The mirror-image rule bites more often: **`c.error` and `c.success` are themselves built on `QueueUpdateDraw`, so they must NOT be called inline from the UI goroutine** — from a button handler, a form callback, or a list's selected-func. Doing so blocks the event loop waiting on itself and freezes the app (this is exactly the `Upload()`-on-an-empty-directory bug). From UI-goroutine code call them as `go c.error(...)` / `go c.success(...)`; from a background goroutine call them directly. `c.chooseDir` is the same trap from the other side: it invokes its `onChosen` callback *on* the UI goroutine, so callers must update widgets directly there rather than wrapping them in `QueueUpdateDraw`.
+The mirror-image rule bites more often: **`c.error` and `c.success` are themselves built on `QueueUpdateDraw`, so they must NOT be called inline from the UI goroutine** — from a button handler, a form callback, or a list's selected-func. Doing so blocks the event loop waiting on itself and freezes the app (this is exactly the `Upload()`-on-an-empty-directory bug, and — found in the 2026-08-11 review — the filter box's `SetChangedFunc` calling `renderList` inline, which froze the app on the first keystroke ever typed into the filter). Anything a widget event handler invokes synchronously must not block on `QueueUpdateDraw`. From UI-goroutine code call them as `go c.error(...)` / `go c.success(...)`; from a background goroutine call them directly. `c.chooseDir` is the same trap from the other side: it invokes its `onChosen` callback *on* the UI goroutine, so callers must update widgets directly there rather than wrapping them in `QueueUpdateDraw`.
+
+**Page names.** `Pages.AddPage` with an existing name *replaces* the old page, so the transient toasts live on their own page (`"modal-msg"`) — when they shared `"modal"` with the long-lived forms, any asynchronous error or success (a failed background transfer, a late refresh, a rename completing) silently destroyed whatever form the user was typing into. The directory picker has its own page too (`"modal-dir"`), which lets it *overlay* the sync form instead of replacing it. Two more captured invariants: transfer flows capture `c.model` at entry alongside bucket/path (a profile switch swaps `c.model`, and a queued transfer reading it lazily would run against the wrong account — `CheckProfile` now verifies with a throwaway client for the same reason), and `Duck` clears the clipboard and the one-step undo (both carry bucket/key names that would otherwise be replayed against a same-named bucket on the new endpoint).
 
 ---
 
@@ -78,6 +80,8 @@ The mirror-image rule bites more often: **`c.error` and `c.success` are themselv
 
 Downloads are split into two sequential phases inside a single goroutine:
 
+Before either phase, folder **resolution** (the recursive `ListObjects` behind a folder selection) runs in its own goroutine behind a "Resolving…" modal — inline on the UI goroutine it froze the whole TUI for the length of the listing and swallowed its errors. Local paths are derived through `model.SafeLocalPath`, which rejects any key whose cleaned path escapes the destination directory: S3 keys may legally contain `..` segments, and an unchecked `filepath.Join` is the zip-slip pattern (a hostile shared bucket could plant `docs/../../../.bashrc`).
+
 **Phase 1 — overwrite resolution (sequential)**
 
 Iterates `allObjects` one at a time, handling:
@@ -86,6 +90,8 @@ Iterates `allObjects` one at a time, handling:
 - Building `toDownload []resolvedItem` — the approved list for Phase 2
 
 Overwrite prompts are inherently sequential because `askOverwrite` blocks the goroutine on user input via a channel; parallel prompts would overlap modals and confuse the user.
+
+An Overwrite decision only sets a flag on the item — **nothing is deleted at prompt time**. The transfer downloads into a sibling `*.s3duck-part` temp file and renames it onto the target only after the body is fully on disk, so a cancel while the job is still queued (or a failed transfer) leaves every existing file intact; `sum.overwritten` is likewise counted on completion, when the file was actually replaced. (Phase 1 used to `os.Remove` at decision time: an "Overwrite All" over 200 files followed by a cancel deleted all 200 and downloaded none.)
 
 **Phase 2 — parallel download (semaphore pool)**
 
@@ -108,7 +114,7 @@ showSummary()
 Cancellation flow:
 1. User clicks Cancel → tview `SetDoneFunc` fires → `cancel()` called → ctx cancelled
 2. Next semaphore `select` picks `<-ctx.Done()`, sets `canceled = true`, breaks loop
-3. Running workers see `ctx.Err() != nil` after `DownloadTarget` returns; `DownloadTarget` itself cancels the S3 download and removes the partial file
+3. Running workers see `ctx.Err() != nil` after `DownloadTarget` returns; `DownloadTarget` itself cancels the S3 download and removes its temp file (the target file — old content included — is never touched by a canceled transfer)
 4. `wg.Wait()` drains workers; `showSummary()` shows the final report
 
 ### Progress display (parallel)
@@ -198,6 +204,99 @@ The header line is a `TextView` above each pane's list. Its indent is derived at
 
 Because a folder target is a prefix delete, the confirmation must state its cost: a scan goroutine runs `ListObjects` per folder/bucket target, filling in `objects`/`bytes`, behind a "Calculating…" modal. `deleteConfirmText` (pure) renders the totals and names up to 6 targets. A target whose scan failed is counted separately and disclosed — the totals are never silently short. `runDelete` then deletes sequentially behind a progress modal, collecting failures instead of aborting, and drops each deleted name from the selection set as it goes. A bucket target is emptied first (`EmptyBucket`) — S3 only deletes empty buckets, and the confirm has already promised the objects go; on a *versioned* bucket old versions survive and the bucket delete still fails (see the limitations table).
 
+## Overwrite confirmation for remote writes
+
+Downloads have always prompted before replacing a local file; the remote side
+silently destroyed whatever sat at the destination. Rename onto an existing
+name, copy into a folder holding same-named objects, paste, upload — all of it
+clobbered without a word, and undo only moved the *new* object back, so the
+overwritten content was simply gone. Every remote write now goes through
+`confirmOverwrites` first.
+
+- **What would be written.** `PlannedCopyKeys` expands each item into the exact
+  destination keys, running the same `planFolderCopy`/`remapKey` mapping
+  `CopyKeys` uses — so the list in the dialog is not an approximation of what
+  the transfer would do, it is the same computation. Upload skips the listing
+  entirely: `PrepareUpload` already knows every key.
+- **What already exists.** `model.Conflicts` answers per key, choosing its
+  strategy by batch size: up to `conflictHeadLimit` (8) plain keys are probed
+  with `HeadObject`, so a one-key rename never triggers a recursive listing of
+  a folder that could hold a million objects; anything larger (or containing a
+  folder candidate) lists the candidates' `CommonPrefix` once and intersects.
+  `CommonPrefix` cuts at a "/" so it is always a real prefix — the property
+  every key must remain under it is what makes the single listing sound.
+- **The decision.** Overwrite / Skip existing / Cancel, where "Skip existing"
+  appears only when it would leave something to do (skipping every candidate
+  is Cancel with extra steps). The chosen skip set is a set of *destination
+  keys*, threaded into `CopyKeys`/`MoveKeys`/`Upload`, which is why a partial
+  skip inside a folder copy works per object rather than dropping the folder.
+- **A skipped move keeps its source.** `copyKeysTracked` reports only what it
+  actually copied and `MoveKeys` deletes exactly that, so skipping a
+  destination can never delete the source that was not written anywhere.
+- **A failed check blocks the write.** A destination that cannot be inspected
+  is not one that may be silently overwritten. This is also why `isNotFound`
+  is generous: a HEAD response carries no body for the SDK to parse an error
+  shape from, so MinIO answers a missing key with an *untyped* API error —
+  reading that as a real failure would have made every rename and copy on that
+  backend refuse to run (the integration suite caught exactly this).
+
+Reporting changed with it: the copy/move summary counts objects written, not
+items processed, and names how many existing objects were kept. "OK: 2" for a
+run that wrote one object and skipped another was the kind of lie this whole
+feature exists to remove.
+
+Two paths deliberately stay unprompted: **sync**, whose mandatory dry-run plan
+already lists every update before anything moves, and **undo**, which has its
+own confirmation and restores objects to where they were moments ago.
+Cross-profile copy does prompt, but asks from inside its transfer goroutine
+(`askOverwriteBlocking`) because only there are its folders expanded — the
+same channel-blocking shape the download flow's `askOverwrite` uses. That
+callback is called on *every* exit including Esc: a path that returned without
+deciding would hang the goroutine forever.
+
+## Large copies (over 5 GiB)
+
+A single-request `CopyObject` is capped at 5 GiB by S3, and every server-side
+copy in the app went through one: copy, move, rename, storage-class change,
+metadata save, version restore. Past that size they simply failed, and a folder
+move aborted midway leaving a half-populated destination. `runCopy` now picks
+the path by size, and `copySpec` describes a copy in enough detail to run it
+either way.
+
+The two paths are not interchangeable, which is the whole difficulty:
+`CopyObject` inherits the source's metadata and tags for free (COPY
+directives), while `CreateMultipartUpload` starts a *bare* object. So the
+multipart path HEADs the source and re-applies content type, cache control,
+disposition/encoding, user metadata and tags explicitly. Storage class is
+handled the other way round — set only when explicitly asked — so both paths
+agree: a plain copy lands in the bucket default either way, and a class change
+still lands where it was told.
+
+- **Sizes come from listings, not extra round trips.** `CopyObjectSized` takes
+  the size the caller already has (`ListObjects` for a folder copy, the sync
+  plan for a remote→remote run). Only the single-object `CopyObject` pays one
+  `HeadObject`, and only because there is genuinely nothing to go on.
+- **Part planning is pure.** `planCopyParts` splits the source into contiguous
+  ranges; only the last may fall under S3's 5 MiB minimum, which is exactly
+  what S3 permits. `copyPartSize` grows the part beyond the configured 512 MiB
+  when a source would otherwise need more than 10,000 parts, so a 5 TiB object
+  plans instead of failing.
+- **Parts copy concurrently** (4 workers): the bytes move inside S3, so this
+  costs no local bandwidth and turns a per-512-MiB round-trip series into
+  something bounded. The first error cancels the rest — none of them are worth
+  finishing — and the upload is aborted so orphaned parts do not accrue
+  charges. That abort runs on a fresh context: on a cancelled copy the original
+  is already dead and the cleanup would be dropped.
+- **Tags are best-effort on this path only.** Tagging is optional on
+  S3-compatible backends, and failing a 100 GiB copy because `GetObjectTagging`
+  is unimplemented is the worse trade — the same degradation the metadata
+  editor makes.
+
+`MultipartCopyThreshold` and `MultipartCopyPartSize` are variables rather than
+constants so the integration suite can exercise the path for real on a 6 MiB
+object. The proof it ran is the destination's ETag: a multipart object's ETag
+carries a `-<partcount>` suffix that a single `CopyObject` could never produce.
+
 ## Credentials
 
 `model.Config.SessionToken` feeds `credentials.NewStaticCredentialsProvider`'s third argument, which was previously hard-coded to `""` — that omission made every form of temporary credential (assume-role, SSO, MFA) unusable regardless of what the user pasted into the profile form.
@@ -213,7 +312,7 @@ Because a folder target is a prefix delete, the confirmation must state its cost
 - **Plan.** `planSync(src, dst, del)` is pure. A file transfers when it is missing at the destination, when the sizes differ, or when the sizes match but the source is newer by more than `syncModTolerance` (2s, absorbing clock skew and coarse filesystem/S3 timestamp granularity). A zero timestamp on either side degrades to a size-only comparison rather than forcing a transfer. Deletes are emitted **only** when the flag is set. Output is ordered creates → updates → deletes, each group by path, so the plan is deterministic and reviewable.
 - **Apply.** `runSync` reuses the transfer-job machinery (`addJob`/`jobSem`/`finalizeJob`), so a sync is cancellable and backgroundable like any other transfer and honors the bandwidth limiter. Operations run through a **4-worker pool** (`syncWorkerCount`, never more workers than work), in two phases from the pure `splitSyncPhases`: every write completes before any delete starts, so a run that is cancelled partway leaves the destination having *gained* the new files but not yet *lost* the old ones — the safer intermediate state. Within a phase the operations are independent by construction (a path is either present at the source or not), so they interleave freely. Shared counters and the throttled redraw sit behind one mutex, and per-file byte counts are tracked in an `inFlight` map keyed by plan index so the displayed total stays correct with several transfers in progress. Per-op work goes through `model.UploadFile` (upload to an explicit key — `Model.Upload` derives keys from a directory walk and can't target one), `model.DownloadTarget`, `model.DeleteKey`, or `os.Remove`. Failures are collected, not fatal: one unreadable file doesn't strand the rest.
 - **Remote → remote.** The planner never knew which side was local — it diffs two `[]SyncEntry` — so the third direction needed only a second `ListRemoteEntries` call and one branch in `applySyncOp`, which issues a server-side `CopyObject` instead of an upload. Two consequences worth knowing: a server-side copy moves no bytes through this process, so there is **no byte progress** for a remote→remote run (the op counter is the only thing that advances); and it inherits the same-endpoint constraint documented below, since both sides go through one client.
-- **Safety.** Deletes are skipped entirely when any write failed — a partly-written destination is not the mirror the reviewed plan assumed, so removals are no longer covered by the user's approval. A remote→remote run between overlapping prefixes of the same bucket is rejected up front (`prefixesOverlap`): the source listing would include the destination, so src-inside-dst with delete-extraneous would delete the physical source objects, and dst-inside-src re-nests one level per run (`mirror/mirror/…`). `DeleteKey` refuses any key ending in `/`, so a sync delete can never degrade into `Delete`'s recursive prefix removal. And `DownloadTarget` refuses to clobber an existing file (correct for the browser's download flow), so the download path removes the stale copy first — only for files the reviewed plan already marked as updates.
+- **Safety.** Deletes are skipped entirely when any write failed — a partly-written destination is not the mirror the reviewed plan assumed, so removals are no longer covered by the user's approval. A remote→remote run between overlapping prefixes of the same bucket is rejected up front (`prefixesOverlap`): the source listing would include the destination, so src-inside-dst with delete-extraneous would delete the physical source objects, and dst-inside-src re-nests one level per run (`mirror/mirror/…`). `DeleteKey` refuses any key ending in `/`, so a sync delete can never degrade into `Delete`'s recursive prefix removal. For files the reviewed plan marked as updates, the download op passes `overwrite=true` and `DownloadTarget` swaps the file atomically (temp + rename) once the body is fully on disk — it used to pre-remove the stale copy, which destroyed the local file even when the transfer then failed. `WalkLocal` follows a symlinked root (`walkFollowingRoot`): `filepath.Walk` lstats its root, so a symlinked directory used to produce an *empty listing with a nil error* — precisely the partial-listing-taken-as-truth case the doc comment promises can't happen, and with delete-extraneous set it planned deleting the entire destination.
 
 ## Object metadata, tags and storage class
 
@@ -230,6 +329,22 @@ Both forms are read back with `GetFormItemByLabel` and the exported `view.Field*
 `ListVersions` gives one object's history. `ListObjectVersions` is **prefix**-based, so it also returns every key that merely starts with this one; the exact-key filter is what turns it into a per-object history (verified: a sibling `doc.txt.bak` does not leak into `doc.txt`'s history). Pagination is followed to the end, since a heavily-rewritten object easily exceeds a page. Delete markers are listed alongside real versions rather than filtered out — the marker *is* what makes an object look deleted, and removing it is how you undo that.
 
 `RestoreVersion` copies the chosen version to the top of the history rather than rewinding, which is the only non-destructive way to go back in a versioned bucket; the e2e run confirms the history grows from 3 entries to 4. `DeleteVersion` is the one genuinely destructive action here — it removes the data outright and leaves no delete marker — so it is behind an explicit confirmation that says so. Downloads are saved as `name.<8-char-version>.ext` so several versions can coexist in one directory.
+
+## Duplicate finder
+
+`D` lists the current prefix recursively and groups objects by **(size, ETag)** — the strongest content signal S3 offers without downloading. For single-part uploads the ETag is the body's MD5, so a match means identical content; multipart ETags depend on the part split, so identical files uploaded differently won't group — a missed duplicate, never a false positive (and size is the second factor guarding against multipart-ETag collisions). The help line discloses this. ETag quotes are normalized because some backends omit them.
+
+`findDuplicates` is pure: groups sort by wasted bytes descending (the first group frees the most), members oldest-first — the oldest copy is the likeliest original and is marked `*`, making everything after it a natural deletion candidate. The browser is two `tview.List` views on one page (`modal-dups`): groups → members, with Enter revealing a copy via `revealKey` and `d` deleting it behind a confirm. Deleting updates the group through the pure `dropDupMember`, which also answers the question the view must not get wrong: after a dissolve, the same index denotes the *next* group, so only an explicit "did this group survive" result prevents teleporting the user into an unrelated group's members with the same `d`-to-delete binding. The surgery runs on the UI goroutine (the member list stays live during the network delete, and its handlers read the same slice), only the `DeleteKey` round-trip happens in the goroutine. The scan's bucket, prefix and client are captured at entry, per the transfer-capture rule.
+
+## Edit in $EDITOR
+
+`e` loads a small object into memory (`GetObjectContent`, 1 MiB cap enforced against both the reported length and the actual body — a lying backend must not balloon the process), sniffs for NUL bytes with git's binary heuristic, writes a 0600 temp file, and hands the terminal to `$EDITOR` (→ `$VISUAL` → `vi`) via `Application.Suspend` — which takes the app's own locks and is safe to call from the download goroutine. On a changed file the body is written back with `PutBytes`, which carries **everything replicable**: Content-Type, Cache-Control, Content-Disposition/Encoding/Language, user metadata, the storage class (omitting it would demote to STANDARD — the same trap `PutObjectMeta` guards), and the tag set (fetched only when the GET reported a `TagCount`, so tag-less backends are never asked). An unchanged file uploads nothing.
+
+Saving is guarded against the **lost update**: the ETag captured at download time is compared (HEAD) against the object's current ETag just before the PUT — the editor may sit open for minutes while a backgrounded sync rewrites the key. On a mismatch, and on any upload failure, the save is refused and the temp file is *kept*, with its path in the error, so the user's edit is never destroyed along with the conflict. A HEAD-compare rather than `If-Match`: conditional-PUT support is spotty across S3-compatible backends, and a narrowed race window with universal compatibility beats an atomic guard that only works on AWS.
+
+## Cross-profile copy
+
+`>` copies the marked set to a bucket in a different profile. `model.CrossCopy` streams each object through this process — a GET from the source client feeds a multipart PUT on an independent destination client — which is the only copy that works across *endpoints*; server-side `CopyObject` requires both buckets behind one endpoint. The content headers (Content-Type, Cache-Control, Content-Disposition/Encoding/Language), user metadata and tags ride along from the source; the **storage class deliberately does not** — class names are not portable across providers (STANDARD_IA would fail the whole PUT on a backend that doesn't know it), so the destination's default applies. The source bandwidth limiter throttles the read side (bounding the whole pipe), and the destination uploader carries the standard retryer. The flow is profile → bucket → prefix, then a cancellable, backgroundable transfer job; folders expand to concrete objects with `crossDstKey` keeping the tail relative to the source location, so a copied folder keeps its name and structure. Item sizes are captured at entry on the UI goroutine (the listing they came from may be gone by transfer time), the source client is captured alongside them, and both expansion-error paths tear the progress modal down before reporting. The source is never modified, and the destination's region is resolved fail-safe (`RefreshClient`) before the transfer.
 
 ## Pane comparison
 
@@ -316,12 +431,13 @@ S3 has no real directories. The app follows the S3 convention:
 
 | Area | Description |
 |---|---|
-| **Navigation race** | `c.currentBucket` and `c.restoreNext` are written from the goroutines spawned by `Down()`/`jumpTo`/`navigateTo` without the `mu` mutex. In single-pane use navigation is serial, so races are unlikely — but in dual-pane, a Tab during a slow bucket-open swaps the live fields mid-write and the navigation lands in the other pane. A proper fix passes navigation state through the refresh path instead of mutating it in place. Transfers are no longer affected: Download and Upload capture their bucket/path at entry. |
+| **Navigation race** | `c.currentBucket` and `c.restoreNext` are written from the goroutines spawned by `Down()`/`jumpTo`/`navigateTo` without the `mu` mutex. In single-pane use navigation is serial, so races are unlikely — but in dual-pane, a Tab during a slow bucket-open swaps the live fields mid-write and the navigation lands in the other pane. A proper fix passes navigation state through the refresh path instead of mutating it in place. Transfers are no longer affected: every transfer flow captures its bucket/path *and its client* at entry. |
 | ~~No retries on upload~~ | **Fixed.** Both upload paths share `newUploader`, which installs the SDK's standard retryer (`uploadMaxAttempts` = 3). Retries are safe because every part is re-read from the file rather than from a consumed buffer. |
 | **Sequential per-file overwrite** | Overwrite decisions block Phase 1 completion. For a large selection with many conflicts, the user must click through each dialog before any download starts. |
 | **Remote→remote sync has no byte progress** | The transfer happens inside S3, so the client sees only completed operations. The op counter advances; the byte gauge does not. |
-| **Cross-bucket copy/move is same-endpoint only** | `CopyKeys` / `MoveKeys` take separate source/destination buckets and issue a server-side `CopyObject`, so both buckets must be reachable through the one configured endpoint. This covers any single S3-compatible endpoint (MinIO/Ceph) and same-region AWS. Copying between AWS buckets in *different regions* is not handled (the client stays pinned to the source region). |
-| **No download resume** | Interrupted downloads restart from byte 0; partial files are deleted on cancel. |
+| **Cross-bucket copy/move is same-endpoint only** | `CopyKeys` / `MoveKeys` take separate source/destination buckets and issue a server-side copy, so both buckets must be reachable through the one configured endpoint. This covers any single S3-compatible endpoint (MinIO/Ceph) and same-region AWS. Copying between AWS buckets in *different regions* is not handled (the client stays pinned to the source region); across *profiles*, `>` streams through the client instead. |
+| ~~Copies fail above 5 GiB~~ | **Fixed.** Sources over `MultipartCopyThreshold` are copied part by part with `UploadPartCopy` (see *Large copies*). |
+| **No download resume** | Interrupted downloads restart from byte 0. Transfers write to a sibling `*.s3duck-part` temp file that is removed on cancel/failure; the target file is only ever replaced by a completed download. |
 | **Sync compares size + mtime, not content** | `planSync` never hashes. A file edited in place to exactly the same size, with its mtime preserved, is not detected as changed. Comparing ETags would only help for single-part uploads (a multipart ETag is not the MD5 of the object) and would need a matching local chunking scheme. |
 | **An upload sync straight after a download sync re-uploads** | A downloaded file's local mtime is its download time, which is newer than the object's `LastModified`. Reversing the direction therefore sees "source is newer" for every file and re-sends them once (sizes are equal, so nothing is corrupted, and the second reversal is a no-op). This matches `aws s3 sync` semantics; the dry-run plan shows it before anything moves. |
 | ~~Sync applies one operation at a time~~ | **Fixed.** `runSync` now uses a 4-worker pool with a writes-then-deletes barrier (see *Sync* above). |
@@ -331,6 +447,26 @@ S3 has no real directories. The app follows the S3 convention:
 | **Whitespace keys** | Every secondary-text reader trims the key, so `"dir/report "` resolves to `"dir/report"` in lookups (wrong object if both exist, silent no-op if only the padded one does). |
 | **Versioning needs a versioned bucket** | On an unversioned bucket S3 reports a single `null` version; the browser shows exactly that rather than hiding the feature. Enabling versioning is a bucket-level operation s3duck does not perform. |
 | **Restore is asynchronous** | `RestoreObject` only *requests* a restore; completion takes minutes to hours and s3duck does not poll. Re-open the object (`c` or Ctrl+L) to see the current state. |
-| **Metadata edits rewrite the object** | A metadata save is a server-side copy onto the same key. On a versioned bucket that creates a new version; the ETag may also change for multipart objects. |
+| **Metadata edits rewrite the object** | A metadata save is a server-side copy onto the same key. On a versioned bucket that creates a new version; the ETag may also change for multipart objects (and always does when the object is large enough to take the multipart-copy path, which re-chunks it). |
+| **Undo and sync do not prompt before overwriting** | Every other remote write confirms first (see *Overwrite confirmation*). Sync is exempt because its dry-run plan already lists the updates; undo because it has its own confirmation and restores objects to where they just were. |
 | **The inactive pane keeps its previous column layout** | `renderList` renders the active pane, so right after `Ctrl+O` the other pane still shows columns sized for the previous width. It self-heals the moment you `Tab` to it (`swapAndFocus` re-fetches and re-renders). Fixing it properly needs a render path that can target a pane other than the active one. |
 | **Summary top-10 cap** | `buildSummary` silently truncates the groups table to the top 10 by size. Groups ranked 11+ are not shown and not counted in any "overflow" indicator. |
+
+---
+
+## Fixed in the 2026-08-11 deep review (v0.7.1)
+
+Four parallel review passes over the whole tree; every finding was verified against the code before fixing. The criticals, compressed:
+
+- **Filter deadlock** — the filter's `SetChangedFunc` called `renderList` (→ `QueueUpdateDraw`) inline from the event loop; the first character ever typed into `/` froze the app. Now dispatched on a goroutine.
+- **Download path traversal (zip-slip)** — keys with `..` segments escaped the download directory in both the controller's path derivation and `DownloadTarget`. All local paths now go through `SafeLocalPath`, which rejects escapes loudly.
+- **Overwrite pre-delete** — "Overwrite" removed local files at prompt time, before the transfer (possibly queued for minutes) moved a byte; a cancel lost them all. Downloads now land in a temp file renamed over the target on success only.
+- **Wrong-profile transfers** — queued/backgrounded transfers read `c.model` lazily; opening (or merely Ctrl+V-verifying) another profile swapped the client under them, sending writes to a same-named bucket in the wrong account. Every transfer flow captures the client at entry; `CheckProfile` uses a throwaway client.
+- **Cross-profile clipboard/undo** — `Duck` now clears both; a paste/undo after a profile switch executed against the new endpoint with the old names (a cut-paste even *deleted* from it).
+- **Move deleted uncopied objects** — `MoveKeys`' delete phase re-listed the source prefix after the copy, sweeping up objects written in between (e.g. by a backgrounded upload during a rename). It now deletes exactly the keys it copied.
+- **Symlinked roots walked empty** — `filepath.Walk` lstats its root, so uploads/syncs on a symlinked directory saw zero files with a nil error; with delete-extraneous a sync then planned deleting the whole destination. All walks go through `walkFollowingRoot`.
+- **Empty-list panic** — `getSelectedObjectName` indexed an empty buckets list (Ctrl+L/W/G with no buckets crashed the app).
+- **Config wipe** — `WriteConfig` truncated in place (a crash mid-write corrupted every profile) and, after a failed load, the next save overwrote the corrupt original with the in-memory (empty) list. Now write-temp-then-rename, with the unreadable original preserved as `.bak`.
+- **Edit lost-update** — saving from `$EDITOR` blindly PUT over whatever the object had become; now guarded by an ETag compare, and a refused/failed save keeps the edited temp file.
+
+Also fixed: attribute stripping on edit/cross-copy (Cache-Control & friends, storage class, tags); the dup-finder presenting the *next* group's members after a dissolve (plus its cross-goroutine slice race); async `c.error`/`c.success` destroying open forms (own page name); the profiles screen hijacking the Delete key inside forms; cross-profile copy totals computed from a wrong-keyed lookup and its stranded progress modals; the sync form losing everything when the Browse picker was canceled; downloads resolving folders on the UI goroutine (freeze) and swallowing resolution errors; the summary reporting against the pre-skip total; `Up()` skipping a level on empty path segments; folder create accepting `/`, `.` and `..`; paste with destination == source; phantom marks left in the source scope after a cut-paste; a cut consumed even when the paste failed; tview-tag-like object names recolouring rows; duplicate profile names accepted; `"amazon"` substring matching custom endpoints as AWS; the 5-second `ListBuckets` deadline; and `NewModel` swallowing config errors.

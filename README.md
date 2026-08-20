@@ -14,7 +14,7 @@ Features
 2. Bucket browsing with folder-style navigation (delimiter `/`), a live in-listing name filter (`/`, narrows as you type), and recursive search under the current prefix (Ctrl+F) whose results jump straight to the matching object
 3. Bucket creation (private or public-read) and deletion
 4. Folder creation (zero-byte `prefix/` markers)
-5. Recursive download of files and folders with **4-worker parallel downloads**: overwrite conflicts are resolved sequentially first (Overwrite / Skip / Overwrite All / Skip All / Cancel), then approved objects download concurrently; live progress shows worker count, per-file active names, combined byte progress, and **transfer speed + ETA**; configurable per-profile destination directory (defaults to `~/Downloads`, supports a leading `~`)
+5. Recursive download of files and folders with **4-worker parallel downloads**: overwrite conflicts are resolved sequentially first (Overwrite / Skip / Overwrite All / Skip All / Cancel), then approved objects download concurrently — an existing file is replaced only after its download fully succeeded, so a canceled or failed run never destroys local data; live progress shows worker count, per-file active names, combined byte progress, and **transfer speed + ETA**; configurable per-profile destination directory (defaults to `~/Downloads`, supports a leading `~`)
 6. Multi-select for batch download, copy, move, rename and **delete** (Space, Ctrl+S all, Ctrl+X none)
 7. Upload with a built-in, icon-styled local filesystem browser; preserves directory tree, creates markers for empty folders
 8. Bucket / folder size summary (Ctrl+G)
@@ -40,9 +40,14 @@ Features
 28. **Storage class & Glacier restore** (`c`) — move an object between storage classes in place (metadata preserved) and request a temporary restore of an archived object, with days and retrieval tier; restore state is shown wherever the object is inspected
 29. **Retried uploads** — the multipart uploader now backs off and retries transient failures instead of failing the whole transfer on one blip
 30. **Listing columns** — size, modified date and storage class alongside the name, so the sort keys order by something visible. The layout follows the pane width: columns drop (class → date → size) rather than squeezing names into uselessness, and re-flow on terminal resize
-31. **Pane comparison** (`=`) — read-only diff of the two dual-pane locations (left-only / differs / right-only), answering "are these two prefixes actually the same?" without transferring anything
-32. Custom endpoints and self-signed TLS support (`ignore_ssl`)
-33. Linux, FreeBSD and macOS / Windows builds (statically linkable)
+31. **Edit in `$EDITOR`** (`e`) — open a small text object in your editor (the TUI suspends while it runs) and save straight back to the bucket; Content-Type, Cache-Control and friends, user metadata, storage class and tags are all preserved. If the object changed on the server while you edited, the save is refused and your version is kept in a temp file (the error names it). Guarded by a 1 MiB cap and a binary sniff
+32. **Cross-profile copy** (`>`) — copy the marked objects or folders to a bucket in a *different profile*, streamed through the client (GET here → PUT there), so the two sides can be entirely different endpoints (MinIO → AWS, provider migration). Content headers, metadata and tags ride along (storage class deliberately not — class names aren't portable across providers); runs as a cancellable background transfer
+33. **Duplicate finder** (`D`) — scan the current prefix recursively and browse groups of identical objects (matched by size + ETag), ordered by wasted bytes; reveal any copy in the browser or delete it with a confirmation. The oldest copy is marked as the likely original
+34. **Pane comparison** (`=`) — read-only diff of the two dual-pane locations (left-only / differs / right-only), answering "are these two prefixes actually the same?" without transferring anything
+35. **Overwrite confirmation for remote writes** — rename, batch rename, copy, move, paste, upload and cross-profile copy all check the destination first and name exactly what they would replace, offering **Overwrite**, **Skip existing** (when that still leaves something to do) or **Cancel**. Skipping a destination on a *move* leaves the source in place too, so nothing is ever deleted without having been written somewhere. Sync is exempt: its dry-run plan already lists every update before anything moves
+36. **Copies above 5 GiB** — copy, move, rename, storage-class changes, metadata saves and version restores fall back to a concurrent multipart part-copy past the size where a single-request S3 copy is rejected, carrying content headers, metadata and tags across
+37. Custom endpoints and self-signed TLS support (`ignore_ssl`)
+38. Linux, FreeBSD and macOS / Windows builds (statically linkable)
 
 Screenshots
 -------------
@@ -197,6 +202,9 @@ Hotkeys
 | Ctrl+U | Open local FS browser to upload |
 | Ctrl+E | Sync: local ⇄ this prefix, or this prefix → another bucket/prefix (dry-run plan first) |
 | = | Compare the two panes (dual-pane, read-only) |
+| D | Find duplicates under this prefix (size + ETag); Enter reveals, d deletes a copy |
+| e | Edit the highlighted object in `$EDITOR` (small text objects) |
+| > | Copy marked objects/folders to a bucket in another profile (streams cross-endpoint) |
 | Ctrl+G | Bucket / folder size summary |
 | Space | Toggle selection on item |
 | Ctrl+S | Select all visible |

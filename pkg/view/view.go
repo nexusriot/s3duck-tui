@@ -9,7 +9,7 @@ import (
 	"github.com/rivo/tview"
 )
 
-const versionText = "S3Duck 🦆 TUI v.0.5.1"
+const versionText = "S3Duck 🦆 TUI v.0.7.2"
 
 // View ...
 type View struct {
@@ -473,6 +473,9 @@ func (v *View) HotkeysModal(profiles bool) *tview.TextView {
           Ctrl+U        Open local file manager (for upload)
           Ctrl+E        Sync: local ⇄ this prefix, or this prefix → another
           =             Compare the two panes (dual-pane, read-only)
+          D             Find duplicates under this prefix (size + ETag)
+          e             Edit object in $EDITOR (small text objects)
+          >             Copy marked items to another profile
           y / x / p     Clipboard: copy / cut / paste objects
           u             Undo last move/rename
           t             Transfers panel (background jobs)

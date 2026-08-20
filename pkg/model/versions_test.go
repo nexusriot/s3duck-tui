@@ -89,7 +89,7 @@ func TestVersionFileName(t *testing.T) {
 }
 
 func TestVersionGuards(t *testing.T) {
-	m := NewModel(NewConfig("https://s3.example.com", nil, "ak", "sk", "", true, 0))
+	m := newTestModel(t, NewConfig("https://s3.example.com", nil, "ak", "sk", "", true, 0))
 	ctx := context.Background()
 	b := &Object{Key: strPtr("bucket"), Ot: Bucket}
 

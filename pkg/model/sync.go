@@ -38,7 +38,7 @@ func WalkLocal(root string) ([]SyncEntry, error) {
 	}
 
 	var out []SyncEntry
-	err = filepath.Walk(root, func(p string, fi os.FileInfo, err error) error {
+	err = walkFollowingRoot(root, func(p string, fi os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}

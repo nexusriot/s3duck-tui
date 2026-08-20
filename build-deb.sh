@@ -1,6 +1,6 @@
 #!/bin/env bash
 
-version=0.5.1
+version=0.7.2
 arch="${1:-amd64}"
 
 echo "building deb for s3duck-tui $version ($arch)"

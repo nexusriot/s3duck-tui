@@ -74,8 +74,9 @@ func (c *Controller) ShowVersions() {
 	loading := tview.NewModal().SetText("Loading version history...")
 	c.view.Pages.AddPage("progress", loading, true, true)
 
+	mdl := c.model
 	go func() {
-		versions, err := c.model.ListVersions(context.Background(), bucket, key)
+		versions, err := mdl.ListVersions(context.Background(), bucket, key)
 		if err != nil {
 			c.view.App.QueueUpdateDraw(func() { c.view.Pages.RemovePage("progress").SwitchToPage("main") })
 			c.error("Failed to list versions", err)
@@ -176,8 +177,9 @@ func (c *Controller) confirmRestoreVersion(bucket *model.Object, key, shortName 
 				return
 			}
 			c.view.Pages.RemovePage("modal-versions")
+			mdl := c.model
 			go func() {
-				if err := c.model.RestoreVersion(context.Background(), bucket, key, v.VersionID, v.StorageClass); err != nil {
+				if err := mdl.RestoreVersion(context.Background(), bucket, key, v.VersionID, v.StorageClass); err != nil {
 					c.error("Failed to restore version", err)
 					return
 				}
@@ -209,8 +211,9 @@ func (c *Controller) confirmDeleteVersion(bucket *model.Object, key, shortName s
 				return
 			}
 			c.view.Pages.RemovePage("modal-versions")
+			mdl := c.model
 			go func() {
-				if err := c.model.DeleteVersion(context.Background(), bucket, key, v.VersionID); err != nil {
+				if err := mdl.DeleteVersion(context.Background(), bucket, key, v.VersionID); err != nil {
 					c.error("Failed to delete version", err)
 					return
 				}
@@ -234,8 +237,9 @@ func (c *Controller) downloadVersion(bucket *model.Object, key string, v model.O
 	name := model.VersionFileName(key, v.VersionID)
 	c.view.Pages.RemovePage("modal-versions")
 
+	mdl := c.model
 	go func() {
-		n, err := c.model.DownloadVersion(context.Background(), bucket, key, v.VersionID, dest, name)
+		n, err := mdl.DownloadVersion(context.Background(), bucket, key, v.VersionID, dest, name)
 		if err != nil {
 			c.error("Failed to download version", err)
 			return

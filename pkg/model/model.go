@@ -249,7 +249,7 @@ func GetConfig(cf Config, update bool) (aws.Config, error) {
 	staticProvider := credentials.NewStaticCredentialsProvider(cf.AccessKey, cf.SecretKey, cf.SessionToken)
 
 	var opts []optsFunc
-	if update && strings.Contains(cf.Url, "amazon") {
+	if update && strings.Contains(cf.Url, "amazonaws.com") {
 		opts = []optsFunc{config.WithRegion(*cf.Region)}
 	} else {
 		opts = []optsFunc{config.WithEndpointResolverWithOptions(customResolver)}
@@ -278,9 +278,14 @@ func GetConfig(cf Config, update bool) (aws.Config, error) {
 	return cfg, err
 }
 
-func NewModel(cf Config) *Model {
-
-	cfg, _ := GetConfig(cf, false)
+func NewModel(cf Config) (*Model, error) {
+	cfg, err := GetConfig(cf, false)
+	if err != nil {
+		// Swallowing this used to hand back a zero-value client whose every
+		// call failed with unrelated-looking auth errors; a malformed
+		// ~/.aws/config is enough to get here.
+		return nil, fmt.Errorf("building AWS config: %w", err)
+	}
 
 	client := s3.NewFromConfig(cfg)
 
@@ -291,7 +296,7 @@ func NewModel(cf Config) *Model {
 		Cf:         &cf,
 		Limiter:    newRateLimiter(cf.MaxBytesPerSec),
 	}
-	return &m
+	return &m, nil
 }
 
 // RefreshClient re-pins the client to the bucket's actual region (AWS only —
@@ -445,7 +450,10 @@ func (m *Model) List(path string, bucket *Object) ([]*Object, error) {
 }
 
 func (m *Model) ListBuckets() ([]*Object, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	// A generous whole-call bound only: hung connections are already cut by the
+	// per-phase transport timeouts, and 5s here used to make profiles unusable
+	// over slow links (high-latency VPNs, huge bucket lists).
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
 	objs := make([]*Object, 0)
@@ -689,10 +697,34 @@ func (m *Model) CreateFolder(name *string, bucket *Object) error {
 	return err
 }
 
+// walkFollowingRoot walks localPath like filepath.Walk, but follows localPath
+// itself when it is (or traverses) a symlink. filepath.Walk lstats its root,
+// so a symlinked directory would otherwise "walk" to a single skipped
+// symlink entry and report an empty tree with a nil error — an upload that
+// silently transfers nothing, or a sync listing that plans deleting the whole
+// destination. Visited paths are reported under localPath, not the resolved
+// target, so key derivation keeps the user-visible name.
+func walkFollowingRoot(localPath string, fn filepath.WalkFunc) error {
+	resolved, err := filepath.EvalSymlinks(localPath)
+	if err != nil {
+		return err
+	}
+	if resolved == localPath {
+		return filepath.Walk(localPath, fn)
+	}
+	return filepath.Walk(resolved, func(p string, fi os.FileInfo, err error) error {
+		return fn(localPath+strings.TrimPrefix(p, resolved), fi, err)
+	})
+}
+
+// skip, when non-nil, names remote keys the user chose to keep: those files
+// are walked and counted but never sent. The keys match PrepareUpload's
+// RemotePath exactly — the two key derivations are pinned together by test.
 func (m *Model) Upload(
 	ctx context.Context,
 	localPath, s3Prefix string,
 	bucket *Object,
+	skip map[string]bool,
 	progressCb func(current, total int64, i, count int, local, remote string),
 ) error {
 	info, err := os.Stat(localPath)
@@ -706,7 +738,7 @@ func (m *Model) Upload(
 	var totalSize int64
 
 	if isDir {
-		err := filepath.Walk(localPath, func(p string, fi os.FileInfo, err error) error {
+		err := walkFollowingRoot(localPath, func(p string, fi os.FileInfo, err error) error {
 			if err != nil {
 				return err
 			}
@@ -791,6 +823,18 @@ func (m *Model) Upload(
 		default:
 		}
 
+		var s3Key string
+		if isDir {
+			parent := filepath.Dir(localPath)
+			relPath, _ := filepath.Rel(parent, fpath)
+			s3Key = filepath.ToSlash(path.Join(s3Prefix, relPath))
+		} else {
+			s3Key = path.Join(s3Prefix, filepath.Base(fpath))
+		}
+		if skip[s3Key] {
+			continue
+		}
+
 		stat, err := os.Stat(fpath)
 		if err != nil {
 			return fmt.Errorf("stat failed for %s: %w", fpath, err)
@@ -799,15 +843,6 @@ func (m *Model) Upload(
 		fp, err := os.Open(fpath)
 		if err != nil {
 			return fmt.Errorf("failed to open file %s: %w", fpath, err)
-		}
-
-		var s3Key string
-		if isDir {
-			parent := filepath.Dir(localPath)
-			relPath, _ := filepath.Rel(parent, fpath)
-			s3Key = filepath.ToSlash(path.Join(s3Prefix, relPath))
-		} else {
-			s3Key = path.Join(s3Prefix, filepath.Base(fpath))
 		}
 
 		reader := &progressReader{
@@ -874,7 +909,7 @@ func (m *Model) PrepareUpload(localPath string, currentPath string, bucket *Obje
 	// its top-level directory name — this must match Upload's key derivation
 	// exactly, or the preview promises destinations the objects never land on.
 	base := filepath.Dir(localPath)
-	err = filepath.Walk(localPath, func(p string, fi os.FileInfo, err error) error {
+	err = walkFollowingRoot(localPath, func(p string, fi os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -957,26 +992,45 @@ func (m *Model) ResolveDownloadObjects(key string, isFolder bool, size *int64, b
 	}
 	return []DownloadTarget{{Key: key, Size: *size}}, *size, nil
 }
+
+// SafeLocalPath maps an object key onto a local path under destPath, stripping
+// the currentPath prefix. S3 keys are opaque and may legally contain ".."
+// segments; filepath.Join cleans them, so an unchecked join lets a hostile or
+// accidental key name a file OUTSIDE the chosen download directory (zip-slip).
+// Any key whose cleaned path escapes destPath is rejected loudly.
+func SafeLocalPath(destPath, currentPath, s3Key string) (string, error) {
+	key := filepath.ToSlash(s3Key)
+	prefix := NormalizePrefix(currentPath)
+	relativeKey := key
+	if strings.HasPrefix(key, prefix) {
+		relativeKey = strings.TrimPrefix(key, prefix)
+	}
+
+	p := filepath.Join(destPath, filepath.FromSlash(relativeKey))
+	base := filepath.Clean(destPath)
+	if p != base && !strings.HasPrefix(p, base+string(os.PathSeparator)) {
+		return "", fmt.Errorf("object key %q escapes the download directory", s3Key)
+	}
+	return p, nil
+}
+
 func (m *Model) DownloadTarget(
 	ctx context.Context,
 	t DownloadTarget,
 	currentPath,
 	destPath string,
 	bucket *string,
+	overwrite bool,
 	progressCb func(written int64, total int64, key string),
 ) (int64, error) {
-	// build local path based on key (same logic as your Download)
 	if err := os.MkdirAll(destPath, 0700); err != nil {
 		return 0, err
 	}
 
-	key := filepath.ToSlash(t.Key)
-	prefix := NormalizePrefix(currentPath)
-	relativeKey := key
-	if strings.HasPrefix(key, prefix) {
-		relativeKey = strings.TrimPrefix(key, prefix)
+	downloadPath, err := SafeLocalPath(destPath, currentPath, t.Key)
+	if err != nil {
+		return 0, err
 	}
-	downloadPath := filepath.Join(destPath, relativeKey)
 
 	if strings.HasSuffix(t.Key, "/") {
 		return 0, os.MkdirAll(downloadPath, 0760)
@@ -984,15 +1038,21 @@ func (m *Model) DownloadTarget(
 	if err := os.MkdirAll(filepath.Dir(downloadPath), 0760); err != nil {
 		return 0, err
 	}
-	if _, err := os.Stat(downloadPath); err == nil {
-		return 0, fmt.Errorf("%w: %s", ErrFileExists, downloadPath)
+	if !overwrite {
+		if _, err := os.Stat(downloadPath); err == nil {
+			return 0, fmt.Errorf("%w: %s", ErrFileExists, downloadPath)
+		}
 	}
 
-	fp, err := os.Create(downloadPath)
+	// Download into a sibling temp file and rename onto the target only after
+	// the body is fully on disk: a failed or canceled transfer must never leave
+	// the target missing or truncated, and an overwrite must not destroy the
+	// existing file before its replacement exists.
+	tmpPath := downloadPath + ".s3duck-part"
+	fp, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
 	if err != nil {
 		return 0, err
 	}
-	defer fp.Close()
 
 	writerAt := &progressWriterAt{
 		w:     fp,
@@ -1010,16 +1070,24 @@ func (m *Model) DownloadTarget(
 		Key:    aws.String(t.Key),
 	})
 	if ctx.Err() != nil {
-		_ = os.Remove(downloadPath)
+		fp.Close()
+		_ = os.Remove(tmpPath)
 		return 0, ctx.Err()
 	}
 	if err != nil {
-		// Drop the partial/empty file so a retry isn't blocked by the
-		// "file exists" stat guard above.
-		_ = os.Remove(downloadPath)
+		fp.Close()
+		_ = os.Remove(tmpPath)
 		return n, err
 	}
-	return n, err
+	if err := fp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return n, err
+	}
+	if err := os.Rename(tmpPath, downloadPath); err != nil {
+		_ = os.Remove(tmpPath)
+		return n, err
+	}
+	return n, nil
 }
 
 // PresignMaxTTL is the maximum lifetime AWS SigV4 allows for a presigned URL.
@@ -1101,19 +1169,31 @@ func remapKey(src, dst, key string) string {
 // through the same endpoint — see CopyKeys.)
 // CopyObject issues one server-side copy. It takes a context so a cancelled
 // copy/move/sync stops issuing requests instead of running to completion.
+// CopyObject copies one object server-side. The source size is unknown here,
+// so it costs one HeadObject to decide between a single-request copy and a
+// multipart part-copy; callers that already know the size (a folder listing, a
+// sync plan) should use CopyObjectSized and skip it.
 func (m *Model) CopyObject(ctx context.Context, srcBucket, dstBucket *Object, srcKey, dstKey string) error {
+	return m.CopyObjectSized(ctx, srcBucket, dstBucket, srcKey, dstKey, SizeUnknown)
+}
+
+// CopyObjectSized is CopyObject with the source's size already known. Sizes
+// above MultipartCopyThreshold are copied part by part: a single-request
+// CopyObject is capped at 5 GiB by S3.
+func (m *Model) CopyObjectSized(ctx context.Context, srcBucket, dstBucket *Object, srcKey, dstKey string, size int64) error {
 	if srcBucket == nil || srcBucket.Key == nil || dstBucket == nil || dstBucket.Key == nil {
 		return fmt.Errorf("bucket is nil")
 	}
 	if *srcBucket.Key == *dstBucket.Key && srcKey == dstKey {
 		return fmt.Errorf("source and destination are the same")
 	}
-	_, err := m.Client.CopyObject(ctx, &s3.CopyObjectInput{
-		Bucket:     aws.String(*dstBucket.Key),
-		CopySource: aws.String(copySource(*srcBucket.Key, srcKey)),
-		Key:        aws.String(dstKey),
+	return m.runCopy(ctx, copySpec{
+		srcBucket: *srcBucket.Key,
+		srcKey:    srcKey,
+		dstBucket: *dstBucket.Key,
+		dstKey:    dstKey,
+		srcSize:   size,
 	})
-	return err
 }
 
 // CopyKeys copies srcKey (in srcBucket) to dstKey (in dstBucket). When isFolder
@@ -1125,59 +1205,88 @@ func (m *Model) CopyObject(ctx context.Context, srcBucket, dstBucket *Object, sr
 // for a single S3-compatible endpoint such as MinIO/Ceph, and for same-region
 // AWS buckets). Copying between AWS buckets in different regions is not handled
 // here.
+// skip, when non-nil, names destination keys the user chose to keep: those
+// objects are not written. A skipped destination also leaves its source in
+// place on a move, because copyKeysTracked reports only what it actually
+// copied and MoveKeys deletes exactly that.
 func (m *Model) CopyKeys(
 	ctx context.Context,
 	srcBucket, dstBucket *Object,
 	srcKey, dstKey string,
 	isFolder bool,
+	skip map[string]bool,
 	progressCb func(done, total int, key string),
 ) (int, error) {
+	copied, err := m.copyKeysTracked(ctx, srcBucket, dstBucket, srcKey, dstKey, isFolder, skip, progressCb)
+	return len(copied), err
+}
+
+// copyKeysTracked is CopyKeys returning the exact source keys that were
+// copied. MoveKeys deletes precisely this set — never a fresh listing of the
+// source prefix, which would sweep up objects written after the copy's
+// snapshot and destroy them without a copy existing anywhere.
+func (m *Model) copyKeysTracked(
+	ctx context.Context,
+	srcBucket, dstBucket *Object,
+	srcKey, dstKey string,
+	isFolder bool,
+	skip map[string]bool,
+	progressCb func(done, total int, key string),
+) ([]string, error) {
 	if srcBucket == nil || srcBucket.Key == nil || dstBucket == nil || dstBucket.Key == nil {
-		return 0, fmt.Errorf("bucket is nil")
+		return nil, fmt.Errorf("bucket is nil")
 	}
 
 	if !isFolder {
+		if skip[dstKey] {
+			return nil, nil
+		}
 		if err := m.CopyObject(ctx, srcBucket, dstBucket, srcKey, dstKey); err != nil {
-			return 0, err
+			return nil, err
 		}
 		if progressCb != nil {
 			progressCb(1, 1, dstKey)
 		}
-		return 1, nil
+		return []string{srcKey}, nil
 	}
 
 	sameBucket := *srcBucket.Key == *dstBucket.Key
 	src, dst, err := planFolderCopy(sameBucket, srcKey, dstKey)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	objs, err := m.ListObjects(src, srcBucket)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	total := len(objs)
-	done := 0
+	var copied []string
 	for _, o := range objs {
 		if o.Key == nil {
 			continue
 		}
 		select {
 		case <-ctx.Done():
-			return done, ctx.Err()
+			return copied, ctx.Err()
 		default:
 		}
 		newKey := remapKey(src, dst, *o.Key)
-		if err := m.CopyObject(ctx, srcBucket, dstBucket, *o.Key, newKey); err != nil {
-			return done, fmt.Errorf("copy %s: %w", *o.Key, err)
+		if skip[newKey] {
+			continue
 		}
-		done++
+		// The listing already carries the size, so the copy never has to
+		// HeadObject to find out whether it must go multipart.
+		if err := m.CopyObjectSized(ctx, srcBucket, dstBucket, *o.Key, newKey, o.Size); err != nil {
+			return copied, fmt.Errorf("copy %s: %w", *o.Key, err)
+		}
+		copied = append(copied, *o.Key)
 		if progressCb != nil {
-			progressCb(done, total, newKey)
+			progressCb(len(copied), total, newKey)
 		}
 	}
-	return done, nil
+	return copied, nil
 }
 
 // MoveKeys copies srcKey (in srcBucket) to dstKey (in dstBucket) and then
@@ -1188,19 +1297,24 @@ func (m *Model) MoveKeys(
 	srcBucket, dstBucket *Object,
 	srcKey, dstKey string,
 	isFolder bool,
+	skip map[string]bool,
 	progressCb func(done, total int, key string),
 ) (int, error) {
-	n, err := m.CopyKeys(ctx, srcBucket, dstBucket, srcKey, dstKey, isFolder, progressCb)
+	copied, err := m.copyKeysTracked(ctx, srcBucket, dstBucket, srcKey, dstKey, isFolder, skip, progressCb)
 	if err != nil {
-		return n, err
+		return len(copied), err
 	}
 
-	delKey := srcKey
-	if isFolder && !strings.HasSuffix(delKey, "/") {
-		delKey += "/"
+	// Delete exactly the keys that were copied. Re-listing the source prefix
+	// here would also catch objects written between the copy's snapshot and
+	// now (a backgrounded upload, an external producer) and delete them
+	// without them ever having been copied.
+	ids := make([]s3t.ObjectIdentifier, 0, len(copied))
+	for _, k := range copied {
+		ids = append(ids, s3t.ObjectIdentifier{Key: aws.String(k)})
 	}
-	if err := m.Delete(&delKey, srcBucket); err != nil {
-		return n, fmt.Errorf("copied ok, but failed to delete source: %w", err)
+	if err := m.deleteObjectIDs(srcBucket, ids); err != nil {
+		return len(copied), fmt.Errorf("copied ok, but failed to delete source: %w", err)
 	}
-	return n, nil
+	return len(copied), nil
 }

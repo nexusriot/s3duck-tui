@@ -58,10 +58,60 @@ func TestLocalDownloadPath(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := localDownloadPath(tt.currentPath, tt.destPath, tt.s3Key)
+			got, err := localDownloadPath(tt.currentPath, tt.destPath, tt.s3Key)
+			if err != nil {
+				t.Fatalf("localDownloadPath(%q,%q,%q) unexpected error: %v",
+					tt.currentPath, tt.destPath, tt.s3Key, err)
+			}
 			if got != tt.want {
 				t.Errorf("localDownloadPath(%q,%q,%q) = %q, want %q",
 					tt.currentPath, tt.destPath, tt.s3Key, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestLocalDownloadPathTraversal pins the zip-slip guard: S3 keys may legally
+// contain ".." segments, and an unchecked filepath.Join would resolve them
+// OUTSIDE the chosen download directory.
+func TestLocalDownloadPathTraversal(t *testing.T) {
+	bad := []struct {
+		name        string
+		currentPath string
+		s3Key       string
+	}{
+		{"plain dotdot", "", "../evil.txt"},
+		{"nested dotdot escaping", "photos", "photos/../../../home/user/.bashrc"},
+		{"dotdot after prefix trim", "a/", "a/../../x"},
+		{"marker key escaping", "", "../outside/"},
+	}
+	for _, tt := range bad {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := localDownloadPath(tt.currentPath, "/dl/dest", tt.s3Key)
+			if err == nil {
+				t.Fatalf("localDownloadPath(%q,%q) = %q, want traversal error",
+					tt.currentPath, tt.s3Key, got)
+			}
+		})
+	}
+
+	// Keys that merely CONTAIN dot segments but stay inside are fine.
+	good := []struct {
+		name  string
+		s3Key string
+		want  string
+	}{
+		{"inner dotdot that stays local", "a/../b.txt", filepath.Join("/dl/dest", "b.txt")},
+		{"leading slash is contained", "/etc/passwd", filepath.Join("/dl/dest", "etc/passwd")},
+	}
+	for _, tt := range good {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := localDownloadPath("", "/dl/dest", tt.s3Key)
+			if err != nil {
+				t.Fatalf("localDownloadPath(%q): unexpected error: %v", tt.s3Key, err)
+			}
+			if got != tt.want {
+				t.Errorf("localDownloadPath(%q) = %q, want %q", tt.s3Key, got, tt.want)
 			}
 		})
 	}
@@ -1024,5 +1074,18 @@ func TestAwsProfileRow(t *testing.T) {
 	primary, _ = awsProfileRow(cfg.AWSProfile{Name: "sso", Err: "SSO profile: ..."})
 	if !strings.Contains(primary, "SSO profile") {
 		t.Errorf("unusable profiles must show why: %q", primary)
+	}
+}
+
+func TestValidateEntryName(t *testing.T) {
+	for _, bad := range []string{"a/b", ".", ".."} {
+		if err := validateEntryName(bad); err == nil {
+			t.Errorf("validateEntryName(%q) = nil, want error", bad)
+		}
+	}
+	for _, good := range []string{"notes.txt", "..hidden", "a.b", "...three"} {
+		if err := validateEntryName(good); err != nil {
+			t.Errorf("validateEntryName(%q) = %v, want nil", good, err)
+		}
 	}
 }

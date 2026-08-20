@@ -179,9 +179,12 @@ func listRow(o *model.Object, selected bool, cols listColumns) string {
 	}
 	icon, color := rowIcon(o.Ot, selected)
 
-	// Truncate the bare name, then colour it: colour tags are zero-width but
-	// would confuse a byte- or rune-based truncation.
-	name = truncateDisplay(name, cols.nameWidth)
+	// Truncate the bare name, then escape it, then colour it. Truncation must
+	// see the raw name (colour tags are zero-width but would confuse a byte-
+	// or rune-based cut); escaping must come before colouring, because an S3
+	// key may itself contain a valid tview tag ("a[red]b.txt") that would
+	// otherwise recolour the row and shift the column math.
+	name = tview.Escape(truncateDisplay(name, cols.nameWidth))
 	if color != "" {
 		name = color + name + "[-]"
 	}

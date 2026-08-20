@@ -13,9 +13,19 @@ import (
 
 // PresignGetURL is pure local crypto (no network), so it can be exercised
 // against a model built from a static config.
+// newTestModel builds a Model for tests, failing the test on config errors.
+func newTestModel(t *testing.T, cf Config) *Model {
+	t.Helper()
+	m, err := NewModel(cf)
+	if err != nil {
+		t.Fatalf("NewModel: %v", err)
+	}
+	return m
+}
+
 func TestPresignGetURL(t *testing.T) {
 	region := "us-east-1"
-	m := NewModel(NewConfig("https://s3.example.com", &region, "ak", "sk", "", true, 0))
+	m := newTestModel(t, NewConfig("https://s3.example.com", &region, "ak", "sk", "", true, 0))
 	bucket := &Object{Key: strPtr("my-bucket")}
 
 	link, err := m.PresignGetURL(bucket, "dir/file.txt", time.Hour)
@@ -40,7 +50,7 @@ func TestPresignGetURL(t *testing.T) {
 }
 
 func TestPresignGetURLCapsTTL(t *testing.T) {
-	m := NewModel(NewConfig("https://s3.example.com", nil, "ak", "sk", "", true, 0))
+	m := newTestModel(t, NewConfig("https://s3.example.com", nil, "ak", "sk", "", true, 0))
 	bucket := &Object{Key: strPtr("b")}
 
 	link, err := m.PresignGetURL(bucket, "k", PresignMaxTTL+time.Hour)
@@ -55,7 +65,7 @@ func TestPresignGetURLCapsTTL(t *testing.T) {
 }
 
 func TestPresignGetURLValidation(t *testing.T) {
-	m := NewModel(NewConfig("https://s3.example.com", nil, "ak", "sk", "", true, 0))
+	m := newTestModel(t, NewConfig("https://s3.example.com", nil, "ak", "sk", "", true, 0))
 	bucket := &Object{Key: strPtr("b")}
 
 	if _, err := m.PresignGetURL(nil, "k", time.Hour); err == nil {
@@ -329,10 +339,10 @@ func TestCopyObjectValidation(t *testing.T) {
 func TestCopyKeysNilBuckets(t *testing.T) {
 	m := &Model{}
 	b := &Object{Key: strPtr("bucket")}
-	if _, err := m.CopyKeys(context.TODO(), nil, b, "a", "b", false, nil); err == nil {
+	if _, err := m.CopyKeys(context.TODO(), nil, b, "a", "b", false, nil, nil); err == nil {
 		t.Error("nil source bucket: want error")
 	}
-	if _, err := m.CopyKeys(context.TODO(), b, nil, "a", "b", false, nil); err == nil {
+	if _, err := m.CopyKeys(context.TODO(), b, nil, "a", "b", false, nil, nil); err == nil {
 		t.Error("nil dest bucket: want error")
 	}
 }
@@ -367,4 +377,97 @@ func TestCopySourceEscapesPlus(t *testing.T) {
 	if strings.Contains(got, " ") {
 		t.Errorf("unescaped space: %q", got)
 	}
+}
+
+func TestSafeLocalPath(t *testing.T) {
+	dest := filepath.Join(t.TempDir(), "dl")
+
+	// Keys whose cleaned path escapes the destination are rejected — S3 keys
+	// may legally contain ".." segments (zip-slip).
+	for _, key := range []string{
+		"../evil.txt",
+		"photos/../../../etc/cron.d/x",
+		"a/../..",
+		"../outside/",
+	} {
+		if got, err := SafeLocalPath(dest, "", key); err == nil {
+			t.Errorf("SafeLocalPath(%q) = %q, want traversal error", key, got)
+		}
+	}
+
+	// Prefix stripping and containment for honest keys.
+	got, err := SafeLocalPath(dest, "docs/", "docs/sub/a.txt")
+	if err != nil {
+		t.Fatalf("SafeLocalPath: %v", err)
+	}
+	if want := filepath.Join(dest, "sub", "a.txt"); got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+
+	// Inner dot segments that stay local are allowed.
+	if _, err := SafeLocalPath(dest, "", "a/../b.txt"); err != nil {
+		t.Errorf("contained dot segments should pass: %v", err)
+	}
+
+	// A key equal to the prefix maps to the destination itself (folder marker).
+	got, err = SafeLocalPath(dest, "docs/", "docs/")
+	if err != nil || got != filepath.Clean(dest) {
+		t.Errorf("marker at prefix: got %q, %v", got, err)
+	}
+}
+
+// TestWalkFollowingRootSymlink pins the symlinked-root behavior: filepath.Walk
+// lstats its root, so a symlinked directory used to "walk" to one skipped
+// symlink entry — an upload that transfers nothing, or a sync listing that
+// plans deleting the whole destination.
+func TestWalkFollowingRootSymlink(t *testing.T) {
+	real := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(real, "sub"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	for rel, body := range map[string]string{"a.txt": "one", "sub/b.txt": "two"} {
+		if err := os.WriteFile(filepath.Join(real, filepath.FromSlash(rel)), []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	link := filepath.Join(t.TempDir(), "proj")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skipf("cannot create symlinks here: %v", err)
+	}
+
+	t.Run("WalkLocal sees the files through the link", func(t *testing.T) {
+		entries, err := WalkLocal(link)
+		if err != nil {
+			t.Fatalf("WalkLocal: %v", err)
+		}
+		if len(entries) != 2 {
+			t.Fatalf("walked %d entries through a symlinked root, want 2", len(entries))
+		}
+	})
+
+	t.Run("PrepareUpload keys keep the link's own name", func(t *testing.T) {
+		m := newTestModel(t, NewConfig("https://s3.example.com", nil, "ak", "sk", "", true, 0))
+		targets, total, err := m.PrepareUpload(link, "up/", &Object{Key: strPtr("b"), Ot: Bucket})
+		if err != nil {
+			t.Fatalf("PrepareUpload: %v", err)
+		}
+		if len(targets) != 2 || total != int64(len("one")+len("two")) {
+			t.Fatalf("targets = %d (total %d), want 2 files through the symlinked root", len(targets), total)
+		}
+		for _, tg := range targets {
+			if !strings.HasPrefix(tg.RemotePath, "up/proj/") {
+				t.Errorf("remote key %q, want it under up/proj/ (the symlink's name, not the target's)", tg.RemotePath)
+			}
+		}
+	})
+
+	t.Run("a broken symlink root errors instead of walking empty", func(t *testing.T) {
+		dangling := filepath.Join(t.TempDir(), "gone")
+		if err := os.Symlink(filepath.Join(t.TempDir(), "never"), dangling); err != nil {
+			t.Skipf("cannot create symlinks here: %v", err)
+		}
+		if _, err := WalkLocal(dangling); err == nil {
+			t.Error("want an error for a dangling symlink root")
+		}
+	})
 }

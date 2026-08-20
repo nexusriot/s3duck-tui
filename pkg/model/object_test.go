@@ -82,7 +82,7 @@ func TestStorageClassesIncludeTheArchivedOnes(t *testing.T) {
 }
 
 func TestObjectWriteGuards(t *testing.T) {
-	m := NewModel(NewConfig("https://s3.example.com", nil, "ak", "sk", "", true, 0))
+	m := newTestModel(t, NewConfig("https://s3.example.com", nil, "ak", "sk", "", true, 0))
 	ctx := context.Background()
 	b := &Object{Key: strPtr("bucket"), Ot: Bucket}
 
@@ -114,7 +114,7 @@ func TestObjectWriteGuards(t *testing.T) {
 }
 
 func TestHeadObjectErrorMentionsBucket(t *testing.T) {
-	m := NewModel(NewConfig("https://s3.example.com", nil, "ak", "sk", "", true, 0))
+	m := newTestModel(t, NewConfig("https://s3.example.com", nil, "ak", "sk", "", true, 0))
 	_, err := m.HeadObject(context.Background(), nil, "k")
 	if err == nil || !strings.Contains(err.Error(), "bucket") {
 		t.Errorf("err = %v, want it to mention the bucket", err)

@@ -97,7 +97,7 @@ func TestWalkLocal(t *testing.T) {
 }
 
 func TestDeleteKeyRefusesPrefixes(t *testing.T) {
-	m := NewModel(NewConfig("https://s3.example.com", nil, "ak", "sk", "", true, 0))
+	m := newTestModel(t, NewConfig("https://s3.example.com", nil, "ak", "sk", "", true, 0))
 	bucket := &Object{Key: strPtr("b"), Ot: Bucket}
 
 	// These must fail before any network call: a trailing slash would be a
@@ -114,7 +114,7 @@ func TestDeleteKeyRefusesPrefixes(t *testing.T) {
 }
 
 func TestUploadFileRejectsBadInput(t *testing.T) {
-	m := NewModel(NewConfig("https://s3.example.com", nil, "ak", "sk", "", true, 0))
+	m := newTestModel(t, NewConfig("https://s3.example.com", nil, "ak", "sk", "", true, 0))
 
 	if err := m.UploadFile(context.Background(), "/nonexistent/file", "k", &Object{Key: strPtr("b")}, nil); err == nil {
 		t.Error("want an error for a missing local file")
@@ -128,14 +128,14 @@ func TestUploadFileRejectsBadInput(t *testing.T) {
 // network call, so this is offline-testable — and sync relies on the sentinel
 // being identifiable to tell "already there" apart from a real transfer error.
 func TestDownloadTargetReportsExistingFile(t *testing.T) {
-	m := NewModel(NewConfig("https://s3.example.com", nil, "ak", "sk", "", true, 0))
+	m := newTestModel(t, NewConfig("https://s3.example.com", nil, "ak", "sk", "", true, 0))
 	dst := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dst, "a.txt"), []byte("existing"), 0644); err != nil {
 		t.Fatal(err)
 	}
 
 	_, err := m.DownloadTarget(context.Background(),
-		DownloadTarget{Key: "pre/a.txt", Size: 8}, "pre/", dst, strPtr("b"), nil)
+		DownloadTarget{Key: "pre/a.txt", Size: 8}, "pre/", dst, strPtr("b"), false, nil)
 
 	if !errors.Is(err, ErrFileExists) {
 		t.Fatalf("err = %v, want it to wrap ErrFileExists", err)

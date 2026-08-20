@@ -53,19 +53,55 @@ type Bookmark struct {
 }
 
 func (p *Params) WriteConfig() error {
+	// If the last load failed, the in-memory list does NOT reflect what the
+	// file held — saving would overwrite every previously stored profile with
+	// the (empty + new) list. Preserve the unreadable original first so it
+	// stays recoverable by hand.
+	if p.LoadErr != nil {
+		if _, err := os.Stat(p.FileName); err == nil {
+			if err := os.Rename(p.FileName, p.FileName+".bak"); err != nil {
+				return fmt.Errorf("failed to back up unreadable config before overwriting: %w", err)
+			}
+		}
+		p.LoadErr = nil
+	}
+
 	file, err := json.Marshal(p.Config)
 	if err != nil {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
-	if err := os.WriteFile(p.FileName, file, 0600); err != nil {
-		return fmt.Errorf("failed to write config file %s: %w", p.FileName, err)
+	// Write-then-rename, never truncate-in-place: a crash or full disk midway
+	// through os.WriteFile would leave a partial config.json holding every
+	// profile's credentials, and the next save would wipe them all.
+	tmp := p.FileName + ".tmp"
+	if err := os.WriteFile(tmp, file, 0600); err != nil {
+		return fmt.Errorf("failed to write config file %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, p.FileName); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("failed to replace config file %s: %w", p.FileName, err)
 	}
 	return nil
+}
+
+// NameExists reports whether a profile with the given name is already stored.
+// Profiles are looked up by name in the UI, so duplicates would make the
+// details pane (and anything else name-keyed) resolve to the wrong profile.
+func (p *Params) NameExists(name string) bool {
+	for _, c := range p.Config {
+		if c != nil && c.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 func (p *Params) NewConfiguration(config *Config) error {
 	if config.Name == "" {
 		return errors.New("empty name not allowed")
+	}
+	if p.NameExists(config.Name) {
+		return fmt.Errorf("a profile named %q already exists", config.Name)
 	}
 
 	p.Config = append(p.Config, config)
@@ -96,6 +132,9 @@ func FileExist(fileName string) (bool, error) {
 }
 
 func (p *Params) CopyConfig(conf Config) error {
+	if p.NameExists(conf.Name) {
+		return fmt.Errorf("a profile named %q already exists", conf.Name)
+	}
 	p.Config = append(p.Config, &conf)
 	return p.WriteConfig()
 }
