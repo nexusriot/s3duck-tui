@@ -21,6 +21,7 @@ package model_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -843,6 +844,34 @@ func TestIntegrationMultipartCopy(t *testing.T) {
 		}
 	})
 
+	t.Run("a metadata save over the threshold keeps the tags", func(t *testing.T) {
+		// The single-request path preserves tags for free (TaggingDirective
+		// defaults to COPY even under MetadataDirective=REPLACE); a fresh
+		// multipart upload starts with none, so they must be re-applied.
+		if err := m.PutObjectMeta(ctx, bucket, "big/source.bin", model.ObjectMeta{
+			ContentType:  "text/plain",
+			UserMetadata: map[string]string{"origin": "meta-save"},
+			StorageClass: "STANDARD",
+			Size:         size,
+		}); err != nil {
+			t.Fatalf("PutObjectMeta over the threshold: %v", err)
+		}
+		head, err := m.HeadObject(ctx, bucket, "big/source.bin")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.HasSuffix(head.ETag, "-2") {
+			t.Errorf("ETag = %q, want the metadata save to have taken the multipart path", head.ETag)
+		}
+		if head.ContentType != "text/plain" || head.UserMetadata["origin"] != "meta-save" {
+			t.Errorf("metadata not applied: %+v", head)
+		}
+		tags, err := m.ObjectTags(ctx, bucket, "big/source.bin")
+		if err != nil || tags["tier"] != "gold" {
+			t.Errorf("a large metadata save dropped the tags: %v, %v", tags, err)
+		}
+	})
+
 	t.Run("a size under the threshold still uses the single-request path", func(t *testing.T) {
 		putObject(t, m, bucket, "small.txt", "tiny")
 		if err := m.CopyObjectSized(ctx, bucket, dstBucket, "small.txt", "small-copy.txt", 4); err != nil {
@@ -876,6 +905,57 @@ func TestIntegrationMultipartCopy(t *testing.T) {
 // TestIntegrationConflicts covers both branches of the conflict scan — the
 // per-key HeadObject probe for a handful of candidates and the single listing
 // for a batch — since the two could easily disagree.
+// TestIntegrationUploadSkip proves the skip set reaches the wire: the kept
+// object must be untouched, and the progress accounting must measure only what
+// was actually sent (the walk counts every file, so the totals have to be
+// recomputed after filtering or a skipped upload finishes below 100%).
+func TestIntegrationUploadSkip(t *testing.T) {
+	m := testModel(t)
+	ctx := context.Background()
+	bucket := freshBucket(t, m, "s3duck-it-upskip")
+
+	root := t.TempDir()
+	tree := filepath.Join(root, "proj")
+	if err := os.MkdirAll(tree, 0755); err != nil {
+		t.Fatal(err)
+	}
+	for rel, body := range map[string]string{"keep.txt": "LOCAL new", "send.txt": "LOCAL send"} {
+		if err := os.WriteFile(filepath.Join(tree, rel), []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	putObject(t, m, bucket, "proj/keep.txt", "REMOTE original, must survive")
+
+	var lastSent, lastTotal int64
+	var lastCount int
+	skip := map[string]bool{"proj/keep.txt": true}
+	if err := m.Upload(ctx, tree, "", bucket, skip, func(n, total int64, i, count int, _, _ string) {
+		lastSent, lastTotal, lastCount = n, total, count
+	}); err != nil {
+		t.Fatalf("Upload with a skip: %v", err)
+	}
+
+	kept, err := m.GetObjectContent(ctx, bucket, "proj/keep.txt", 1<<20)
+	if err != nil || string(kept.Data) != "REMOTE original, must survive" {
+		t.Errorf("skipped object = %q, %v — it was overwritten", kept.Data, err)
+	}
+	sent, err := m.GetObjectContent(ctx, bucket, "proj/send.txt", 1<<20)
+	if err != nil || string(sent.Data) != "LOCAL send" {
+		t.Errorf("unskipped object = %q, %v", sent.Data, err)
+	}
+
+	if lastCount != 1 {
+		t.Errorf("progress counted %d file(s), want only the 1 actually sent", lastCount)
+	}
+	if lastTotal != int64(len("LOCAL send")) {
+		t.Errorf("progress total = %d bytes, want %d — skipped bytes are still in the total",
+			lastTotal, len("LOCAL send"))
+	}
+	if lastSent != lastTotal {
+		t.Errorf("progress finished at %d/%d, want a completed transfer", lastSent, lastTotal)
+	}
+}
+
 func TestIntegrationConflicts(t *testing.T) {
 	m := testModel(t)
 	ctx := context.Background()
@@ -905,10 +985,12 @@ func TestIntegrationConflicts(t *testing.T) {
 		}
 	})
 
-	t.Run("a batch is answered by one listing", func(t *testing.T) {
+	t.Run("a batch past the probe limit is answered by one listing", func(t *testing.T) {
+		// Deliberately over conflictHeadLimit so this takes the listing
+		// branch rather than the per-key probes; both must agree.
 		var keys []string
-		for i := 0; i < 12; i++ {
-			keys = append(keys, "dst/gen"+string(rune('a'+i))+".txt")
+		for i := 0; i < 40; i++ {
+			keys = append(keys, fmt.Sprintf("dst/gen%02d.txt", i))
 		}
 		keys = append(keys, "dst/a.txt", "dst/c.txt")
 		got, err := m.Conflicts(ctx, bucket, keys)

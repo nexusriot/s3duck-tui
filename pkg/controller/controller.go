@@ -2383,8 +2383,15 @@ func (c *Controller) runBatchRename(ops []renameOp, skip map[string]bool) {
 			c.view.App.QueueUpdateDraw(func() {
 				progress.SetText(fmt.Sprintf("Renaming %d/%d\n%s", n, len(ops), label))
 			})
-			if _, err := mdl.MoveKeys(ctx, bucket, bucket, op.srcKey, op.dstKey, op.isFolder, skip, nil); err != nil {
+			n, err := mdl.MoveKeys(ctx, bucket, bucket, op.srcKey, op.dstKey, op.isFolder, skip, nil)
+			if err != nil {
 				failed = append(failed, fmt.Sprintf("%s: %v", op.label, err))
+				continue
+			}
+			if n == 0 {
+				// Every object under this op was kept, so nothing moved.
+				// Recording it would put an undo entry on the stack whose
+				// destination does not exist.
 				continue
 			}
 			okCount++

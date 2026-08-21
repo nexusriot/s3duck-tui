@@ -54,32 +54,40 @@ func (c *Controller) confirmOverwrites(
 	scanning := tview.NewModal().SetText("Checking the destination...")
 	c.view.Pages.AddPage("progress", scanning, true, true)
 
+	// fail reports and stops. A destination that can't be checked is not a
+	// destination that may be silently overwritten, so there is no fallthrough
+	// to the write.
+	fail := func(err error) {
+		c.view.App.QueueUpdateDraw(func() { c.view.Pages.RemovePage("progress") })
+		c.error(title, err)
+	}
+
 	go func() {
 		keys, err := plan()
-		if err == nil {
-			var conflicts []string
-			conflicts, err = mdl.Conflicts(context.Background(), bucket, keys)
-			if err == nil {
-				c.view.App.QueueUpdateDraw(func() {
-					c.view.Pages.RemovePage("progress")
-					if len(conflicts) == 0 {
-						proceed(nil)
-						return
-					}
-					c.askOverwriteRemote(title, conflicts, len(keys), func(skip map[string]bool, ok bool) {
-						if ok {
-							proceed(skip)
-						}
-					})
-				})
+		if err != nil {
+			// A planning failure is about the operation itself (an impossible
+			// folder copy, an unreadable source), not about the destination.
+			fail(err)
+			return
+		}
+		conflicts, err := mdl.Conflicts(context.Background(), bucket, keys)
+		if err != nil {
+			fail(fmt.Errorf("checking the destination: %w", err))
+			return
+		}
+
+		c.view.App.QueueUpdateDraw(func() {
+			c.view.Pages.RemovePage("progress")
+			if len(conflicts) == 0 {
+				proceed(nil)
 				return
 			}
-		}
-		// A destination that can't be checked is not a destination that may be
-		// silently overwritten: report and stop rather than fall through to
-		// the write.
-		c.view.App.QueueUpdateDraw(func() { c.view.Pages.RemovePage("progress") })
-		c.error(title, fmt.Errorf("checking the destination: %w", err))
+			c.askOverwriteRemote(title, conflicts, len(keys), func(skip map[string]bool, ok bool) {
+				if ok {
+					proceed(skip)
+				}
+			})
+		})
 	}()
 }
 

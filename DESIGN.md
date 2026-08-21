@@ -218,13 +218,19 @@ overwritten content was simply gone. Every remote write now goes through
   `CopyKeys` uses — so the list in the dialog is not an approximation of what
   the transfer would do, it is the same computation. Upload skips the listing
   entirely: `PrepareUpload` already knows every key.
-- **What already exists.** `model.Conflicts` answers per key, choosing its
-  strategy by batch size: up to `conflictHeadLimit` (8) plain keys are probed
-  with `HeadObject`, so a one-key rename never triggers a recursive listing of
-  a folder that could hold a million objects; anything larger (or containing a
-  folder candidate) lists the candidates' `CommonPrefix` once and intersects.
-  `CommonPrefix` cuts at a "/" so it is always a real prefix — the property
-  every key must remain under it is what makes the single listing sound.
+- **What already exists.** `model.Conflicts` answers per key, and picks the
+  cheaper question. Folder candidates get a `MaxKeys=1` listing each — "is
+  anything under this prefix" is the whole question, and enumerating the prefix
+  would be the same answer at arbitrary cost. Plain keys up to
+  `conflictHeadLimit` (32) are probed with concurrent `HeadObject`s, so a
+  one-key rename never triggers a recursive listing of a folder that could hold
+  a million objects. Only a larger batch falls back to listing the candidates'
+  `CommonPrefix` once and intersecting. That order matters: the common prefix
+  of keys sitting at the bucket *root* is empty, so a naive
+  listing-for-everything would have enumerated an entire bucket to check a
+  handful of names. `CommonPrefix` cuts at a "/" so it is always a real prefix —
+  the property that every key stays under it is what makes the single listing
+  sound.
 - **The decision.** Overwrite / Skip existing / Cancel, where "Skip existing"
   appears only when it would leave something to do (skipping every candidate
   is Cancel with extra steps). The chosen skip set is a set of *destination
@@ -243,7 +249,17 @@ overwritten content was simply gone. Every remote write now goes through
 Reporting changed with it: the copy/move summary counts objects written, not
 items processed, and names how many existing objects were kept. "OK: 2" for a
 run that wrote one object and skipped another was the kind of lie this whole
-feature exists to remove.
+feature exists to remove. The same care applies inside `Upload`, which filters
+the walked file list *before* the totals are taken — the walk counts every
+file, so leaving the skipped ones in made a skipped upload finish at 60% with
+an index counting files it never sent. And a rename or batch-rename operation
+whose objects were all kept records no undo entry: its destination does not
+exist, so undoing it could only fail.
+
+The check is a snapshot, not a lock. An object that appears at the destination
+between the scan and the write is still overwritten silently — S3 offers no
+transaction to close that window, and the download flow has always had the same
+gap.
 
 Two paths deliberately stay unprompted: **sync**, whose mandatory dry-run plan
 already lists every update before anything moves, and **undo**, which has its
@@ -287,10 +303,18 @@ still lands where it was told.
   finishing — and the upload is aborted so orphaned parts do not accrue
   charges. That abort runs on a fresh context: on a cancelled copy the original
   is already dead and the cleanup would be dropped.
-- **Tags are best-effort on this path only.** Tagging is optional on
-  S3-compatible backends, and failing a 100 GiB copy because `GetObjectTagging`
-  is unimplemented is the worse trade — the same degradation the metadata
-  editor makes.
+- **Tags are re-applied on every multipart copy**, including a metadata save:
+  `CopyObject` carries them along whatever else it does (TaggingDirective
+  defaults to COPY even under MetadataDirective=REPLACE), so anything less
+  would make a large metadata save silently drop an object's tags. They are
+  read from the source *version* being copied, which matters for a version
+  restore. Fetching them is best-effort — tagging is optional on S3-compatible
+  backends, and failing a 100 GiB copy because `GetObjectTagging` is
+  unimplemented is the worse trade, the same degradation the metadata editor
+  makes.
+- **A failed upload is always aborted**, whether a part failed or the
+  completion did. Either way the upload stays open and its parts keep accruing
+  storage charges until a lifecycle rule reaps them.
 
 `MultipartCopyThreshold` and `MultipartCopyPartSize` are variables rather than
 constants so the integration suite can exercise the path for real on a 6 MiB
@@ -454,7 +478,35 @@ S3 has no real directories. The app follows the S3 convention:
 
 ---
 
-## Fixed in the 2026-08-11 deep review (v0.7.1)
+## Fixed in the 0.8.0 follow-up review
+
+A second review pass, this one over the 0.8.0 work itself — the deep-review
+fixes below plus the two features. All found by reading the new code and by the
+integration suite:
+
+- **A large metadata save dropped the object's tags.** `CopyObject` carries
+  tags along even under `MetadataDirective=REPLACE`, but the multipart path
+  only re-applied them for plain copies — so a metadata edit on an object over
+  the threshold silently lost them. Tags are now re-applied on every multipart
+  copy, and read from the source *version* (a version restore was reading the
+  current object's tags).
+- **A failed completion leaked the upload.** Only a failed *part* aborted the
+  multipart upload; a failed `CompleteMultipartUpload` left it open with its
+  parts accruing storage charges.
+- **A skipped upload reported the wrong progress.** `Upload` filtered skipped
+  files inside its send loop but had already totalled every walked file, so the
+  gauge counted bytes that were never sent and the per-file index counted files
+  it skipped. The filter now runs before the totals, through a shared
+  `uploadKey` helper so it cannot drift from `PrepareUpload`'s keys.
+- **A conflict scan could enumerate a whole bucket.** Keys at the bucket root
+  share no common prefix, so a paste of more than a handful of loose files
+  listed everything. Folder candidates now use a `MaxKeys=1` probe, plain keys
+  are probed concurrently up to a higher limit, and only genuinely large
+  batches fall back to a (scoped) listing.
+- **A fully-skipped batch rename recorded an undo entry** pointing at a
+  destination that was never written.
+
+## Fixed in the 2026-08-11 deep review (0.8.0)
 
 Four parallel review passes over the whole tree; every finding was verified against the code before fixing. The criticals, compressed:
 

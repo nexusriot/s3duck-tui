@@ -471,3 +471,46 @@ func TestWalkFollowingRootSymlink(t *testing.T) {
 		}
 	})
 }
+
+// TestUploadKeyMatchesPrepareUpload pins the two key derivations together.
+// Upload re-derives keys during its walk while PrepareUpload produced them
+// earlier; the skip set is keyed by PrepareUpload's RemotePath, so any drift
+// would make "skip existing" silently skip nothing (or the wrong file).
+func TestUploadKeyMatchesPrepareUpload(t *testing.T) {
+	m := newTestModel(t, NewConfig("https://s3.example.com", nil, "ak", "sk", "", true, 0))
+	bucket := &Object{Key: strPtr("b"), Ot: Bucket}
+
+	root := t.TempDir()
+	tree := filepath.Join(root, "proj")
+	if err := os.MkdirAll(filepath.Join(tree, "sub"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	for rel, body := range map[string]string{"a.txt": "one", "sub/b.txt": "two"} {
+		if err := os.WriteFile(filepath.Join(tree, filepath.FromSlash(rel)), []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	targets, _, err := m.PrepareUpload(tree, "dest", bucket)
+	if err != nil {
+		t.Fatalf("PrepareUpload: %v", err)
+	}
+	if len(targets) != 2 {
+		t.Fatalf("got %d targets, want 2", len(targets))
+	}
+	for _, tg := range targets {
+		if got := uploadKey(tree, NormalizePrefix("dest"), tg.LocalPath, true); got != tg.RemotePath {
+			t.Errorf("uploadKey = %q, PrepareUpload said %q", got, tg.RemotePath)
+		}
+	}
+
+	// The single-file form must agree too.
+	single := filepath.Join(tree, "a.txt")
+	targets, _, err = m.PrepareUpload(single, "dest", bucket)
+	if err != nil {
+		t.Fatalf("PrepareUpload(file): %v", err)
+	}
+	if got := uploadKey(single, NormalizePrefix("dest"), single, false); got != targets[0].RemotePath {
+		t.Errorf("uploadKey = %q, PrepareUpload said %q", got, targets[0].RemotePath)
+	}
+}

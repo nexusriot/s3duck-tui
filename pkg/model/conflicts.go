@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
@@ -14,12 +15,17 @@ import (
 	"github.com/aws/smithy-go"
 )
 
-// conflictHeadLimit is how many candidates are probed individually with
-// HeadObject before it becomes cheaper to list the destination prefix once.
-// A rename checks one key and must not pay for a recursive listing of the
-// whole folder; a folder copy checks thousands and must not pay for thousands
-// of round trips.
-const conflictHeadLimit = 8
+const (
+	// conflictHeadLimit is how many candidates are probed individually with
+	// HeadObject before it becomes cheaper to list the destination prefix
+	// once. A rename checks one key and must not pay for a recursive listing
+	// of the whole folder; a folder copy checks thousands and must not pay for
+	// thousands of round trips. The probes run concurrently, so this many is
+	// a few round trips rather than a few dozen.
+	conflictHeadLimit = 32
+	// conflictHeadWorkers bounds those concurrent probes.
+	conflictHeadWorkers = 8
+)
 
 // CommonPrefix is the longest S3 prefix shared by every key, cut at a "/" so
 // it is a real prefix and not half a name. Listing it is what lets one request
@@ -92,46 +98,124 @@ func (m *Model) Conflicts(ctx context.Context, bucket *Object, keys []string) ([
 		return nil, nil
 	}
 
-	folders := false
+	var files, folders []string
 	for _, k := range keys {
-		if strings.HasSuffix(k, "/") {
-			folders = true
-			break
+		switch {
+		case k == "":
+		case strings.HasSuffix(k, "/"):
+			folders = append(folders, k)
+		default:
+			files = append(files, k)
 		}
 	}
 
-	if len(keys) <= conflictHeadLimit && !folders {
-		return m.conflictsByHead(ctx, bucket, keys)
+	found, err := m.conflictingFolders(ctx, bucket, folders)
+	if err != nil {
+		return nil, err
 	}
-	return m.conflictsByListing(ctx, bucket, keys)
+
+	// Probe a handful of keys directly; fall back to one listing only for a
+	// batch large enough to be worth it. The listing is scoped to the keys'
+	// CommonPrefix — which is empty when they sit at the bucket root, and
+	// listing a whole bucket to check a few names would be far worse than the
+	// round trips it saves.
+	var fileHits []string
+	switch {
+	case len(files) == 0:
+	case len(files) <= conflictHeadLimit:
+		fileHits, err = m.conflictsByHead(ctx, bucket, files)
+	default:
+		fileHits, err = m.conflictsByListing(ctx, bucket, files)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	found = append(found, fileHits...)
+	sort.Strings(found)
+	return found, nil
+}
+
+// conflictingFolders reports which destination prefixes already hold anything.
+// One MaxKeys=1 listing answers that per folder — enumerating the prefix in
+// full would be the same answer at arbitrary cost.
+func (m *Model) conflictingFolders(ctx context.Context, bucket *Object, folders []string) ([]string, error) {
+	var found []string
+	for _, prefix := range folders {
+		out, err := m.Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:  aws.String(*bucket.Key),
+			Prefix:  aws.String(prefix),
+			MaxKeys: 1,
+		})
+		if err != nil {
+			return nil, err
+		}
+		if out.KeyCount > 0 || len(out.Contents) > 0 {
+			found = append(found, prefix)
+		}
+	}
+	return found, nil
 }
 
 // conflictsByHead probes each key directly. Cheap and exact for a handful of
-// keys, and it never lists a prefix that could hold a million objects.
+// keys, and it never lists a prefix that could hold a million objects. The
+// probes run concurrently because they are pure latency: the user is waiting
+// behind a modal for the answer.
 func (m *Model) conflictsByHead(ctx context.Context, bucket *Object, keys []string) ([]string, error) {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	exists := make([]bool, len(keys))
+	var (
+		mu       sync.Mutex
+		firstErr error
+		wg       sync.WaitGroup
+	)
+	sem := make(chan struct{}, conflictHeadWorkers)
+
+	for i, k := range keys {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, k string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			_, err := m.Client.HeadObject(ctx, &s3.HeadObjectInput{
+				Bucket: aws.String(*bucket.Key),
+				Key:    aws.String(k),
+			})
+			switch {
+			case err == nil:
+				exists[i] = true
+			case isNotFound(err):
+			default:
+				mu.Lock()
+				if firstErr == nil {
+					firstErr = err
+					cancel()
+				}
+				mu.Unlock()
+			}
+		}(i, k)
+	}
+	wg.Wait()
+
+	if firstErr != nil {
+		return nil, firstErr
+	}
 	var found []string
-	for _, k := range keys {
-		if k == "" {
-			continue
+	for i, ok := range exists {
+		if ok {
+			found = append(found, keys[i])
 		}
-		_, err := m.Client.HeadObject(ctx, &s3.HeadObjectInput{
-			Bucket: aws.String(*bucket.Key),
-			Key:    aws.String(k),
-		})
-		if err == nil {
-			found = append(found, k)
-			continue
-		}
-		if isNotFound(err) {
-			continue
-		}
-		return nil, err
 	}
 	sort.Strings(found)
 	return found, nil
 }
 
 // conflictsByListing lists the candidates' common prefix once and intersects.
+// It is given plain object keys only; folder candidates are answered by
+// conflictingFolders.
 func (m *Model) conflictsByListing(ctx context.Context, bucket *Object, keys []string) ([]string, error) {
 	objs, err := m.ListObjects(CommonPrefix(keys), bucket)
 	if err != nil {
@@ -147,23 +231,8 @@ func (m *Model) conflictsByListing(ctx context.Context, bucket *Object, keys []s
 
 	var found []string
 	for _, k := range keys {
-		if k == "" {
-			continue
-		}
-		if !strings.HasSuffix(k, "/") {
-			if existing[k] {
-				found = append(found, k)
-			}
-			continue
-		}
-		// A folder candidate conflicts when the destination prefix already
-		// holds anything: those objects are what a recursive copy would
-		// overwrite name by name.
-		for e := range existing {
-			if strings.HasPrefix(e, k) {
-				found = append(found, k)
-				break
-			}
+		if existing[k] {
+			found = append(found, k)
 		}
 	}
 	sort.Strings(found)

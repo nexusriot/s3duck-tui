@@ -82,7 +82,7 @@ Known constraints live in [DESIGN.md](DESIGN.md); user-facing docs in [README.md
 ## Hardening (verified, not yet fixed)
 
 From the 2026-08 functional reviews; the fixed ones are listed in DESIGN.md's history
-(latest round: 2026-08-11, v0.7.1).
+(latest round: 2026-08-11, released as 0.8.0).
 
 - **Navigation race, dual-pane variant** — `Down`/`jumpTo`/`navigateTo` goroutines write
   the live pane fields without synchronization; Tab during a slow bucket-open lands the
@@ -111,10 +111,16 @@ From the 2026-08 functional reviews; the fixed ones are listed in DESIGN.md's hi
 - **Profile edit can still create a duplicate name** `[S]` — creation and copy now
   reject duplicates; renaming an existing profile onto another's name does not.
 - **Undo doesn't check its destination** `[S]` — every other remote write now
-  confirms before replacing an existing object (v0.7.2); undo goes straight
+  confirms before replacing an existing object (0.8.0); undo goes straight
   through on the grounds that it has its own confirmation and restores objects
   to where they were moments ago. If something took that key meanwhile, it is
   overwritten silently.
+- **Same-named items from different folders collide on copy** `[S]` — copying
+  `a/report.txt` and `b/report.txt` into one destination writes both to the
+  same key, so only the last survives, and the overwrite scan cannot see it
+  (neither key exists at the destination yet). `planBatchRename` already
+  rejects this class for renames; copy/move wants the same intra-batch
+  duplicate-target check.
 - **Sync still writes without an overwrite prompt** `[S]` — by design: its
   dry-run plan already lists every update before anything moves, so a second
   confirmation would be redundant. Revisit only if the plan stops being

@@ -244,15 +244,16 @@ func (m *Model) copyMultipart(ctx context.Context, sp copySpec, size int64, attr
 	if class := sp.destinationClass(); class != "" {
 		create.StorageClass = s3t.StorageClass(class)
 	}
-	// A single-request copy carries the source's tags along (TaggingDirective
-	// defaults to COPY); a fresh multipart upload does not, so they are
-	// re-applied here. Tagging is optional on S3-compatible backends, so a
-	// failure degrades to "no tags" rather than failing a multi-gigabyte copy
-	// outright — the same trade the metadata editor makes.
-	if sp.meta == nil {
-		if tagging, err := getObjectTagging(ctx, m.Client, sp.srcBucket, sp.srcKey); err == nil && tagging != "" {
-			create.Tagging = aws.String(tagging)
-		}
+	// A single-request copy carries the source's tags along whatever else it
+	// does — TaggingDirective defaults to COPY even under
+	// MetadataDirective=REPLACE — while a fresh multipart upload starts with
+	// none. So the tags are re-applied on every multipart copy, including a
+	// metadata save, and are read from the source *version* being copied.
+	// Tagging is optional on S3-compatible backends, so a failure degrades to
+	// "no tags" rather than failing a multi-gigabyte copy outright — the same
+	// trade the metadata editor makes.
+	if tagging, err := getObjectTagging(ctx, m.Client, sp.srcBucket, sp.srcKey, sp.srcVersion); err == nil && tagging != "" {
+		create.Tagging = aws.String(tagging)
 	}
 
 	started, err := m.Client.CreateMultipartUpload(ctx, create)
@@ -263,29 +264,37 @@ func (m *Model) copyMultipart(ctx context.Context, sp copySpec, size int64, attr
 
 	done, err := m.copyParts(ctx, sp, parts, uploadID)
 	if err != nil {
-		// Abort with a fresh context: when the copy was cancelled, ctx is
-		// already dead and the abort would be dropped, leaving the parts to
-		// accrue storage charges until a lifecycle rule reaps them.
-		abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), abortTimeout)
-		defer cancel()
-		_, _ = m.Client.AbortMultipartUpload(abortCtx, &s3.AbortMultipartUploadInput{
-			Bucket:   aws.String(sp.dstBucket),
-			Key:      aws.String(sp.dstKey),
-			UploadId: aws.String(uploadID),
-		})
+		m.abortMultipart(ctx, sp, uploadID)
 		return err
 	}
 
-	_, err = m.Client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+	if _, err := m.Client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
 		Bucket:          aws.String(sp.dstBucket),
 		Key:             aws.String(sp.dstKey),
 		UploadId:        aws.String(uploadID),
 		MultipartUpload: &s3t.CompletedMultipartUpload{Parts: done},
-	})
-	if err != nil {
+	}); err != nil {
+		// Completion can fail on its own (a rejected part list, a dead
+		// connection) and leaves the upload just as open as a failed part
+		// does, so it gets the same cleanup.
+		m.abortMultipart(ctx, sp, uploadID)
 		return fmt.Errorf("completing multipart copy of %s: %w", sp.dstKey, err)
 	}
 	return nil
+}
+
+// abortMultipart discards an upload whose parts will never be completed, so
+// they stop accruing storage charges. It runs on a context detached from the
+// caller's: a cancelled copy leaves ctx already dead, and the cleanup request
+// would be dropped before it was ever sent.
+func (m *Model) abortMultipart(ctx context.Context, sp copySpec, uploadID string) {
+	abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), abortTimeout)
+	defer cancel()
+	_, _ = m.Client.AbortMultipartUpload(abortCtx, &s3.AbortMultipartUploadInput{
+		Bucket:   aws.String(sp.dstBucket),
+		Key:      aws.String(sp.dstKey),
+		UploadId: aws.String(uploadID),
+	})
 }
 
 // copyParts runs the part-copies through a bounded worker pool and returns
@@ -351,9 +360,9 @@ func (m *Model) copyParts(ctx context.Context, sp copySpec, parts []copyPart, up
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	for _, d := range done {
+	for i, d := range done {
 		if d.ETag == nil {
-			return nil, fmt.Errorf("multipart copy of %s: part %d returned no ETag", sp.srcKey, d.PartNumber)
+			return nil, fmt.Errorf("multipart copy of %s: part %d returned no ETag", sp.srcKey, parts[i].Number)
 		}
 	}
 	return done, nil

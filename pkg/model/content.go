@@ -45,14 +45,18 @@ func trimETag(s *string) string {
 	return strings.Trim(aws.ToString(s), `"`)
 }
 
-// getObjectTagging fetches an object's tags as a URL-encoded string. Called
-// only when the GET reported a positive TagCount, so backends that don't
-// support tagging are never asked about it.
-func getObjectTagging(ctx context.Context, client *s3.Client, bucket, key string) (string, error) {
-	out, err := client.GetObjectTagging(ctx, &s3.GetObjectTaggingInput{
+// getObjectTagging fetches an object's tags as a URL-encoded string. version
+// selects a specific version; empty means the current one — a copy from an old
+// version must carry that version's tags, not whatever the key holds now.
+func getObjectTagging(ctx context.Context, client *s3.Client, bucket, key, version string) (string, error) {
+	in := &s3.GetObjectTaggingInput{
 		Bucket: aws.String(bucket),
 		Key:    aws.String(key),
-	})
+	}
+	if version != "" {
+		in.VersionId = aws.String(version)
+	}
+	out, err := client.GetObjectTagging(ctx, in)
 	if err != nil {
 		return "", err
 	}
@@ -150,7 +154,7 @@ func (m *Model) GetObjectContent(ctx context.Context, bucket *Object, key string
 	content := attrsFromGet(out)
 	content.Data = data
 	if out.TagCount > 0 {
-		tagging, err := getObjectTagging(ctx, m.Client, *bucket.Key, key)
+		tagging, err := getObjectTagging(ctx, m.Client, *bucket.Key, key, "")
 		if err != nil {
 			return ObjectContent{}, fmt.Errorf("reading tags of %s: %w", key, err)
 		}
@@ -227,7 +231,7 @@ func CrossCopy(ctx context.Context, src *Model, srcBucket *Object, srcKey string
 
 	attrs := attrsFromGet(out)
 	if out.TagCount > 0 {
-		tagging, err := getObjectTagging(ctx, src.Client, *srcBucket.Key, srcKey)
+		tagging, err := getObjectTagging(ctx, src.Client, *srcBucket.Key, srcKey, "")
 		if err != nil {
 			return fmt.Errorf("reading tags of %s: %w", srcKey, err)
 		}

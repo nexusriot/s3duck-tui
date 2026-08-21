@@ -720,6 +720,18 @@ func walkFollowingRoot(localPath string, fn filepath.WalkFunc) error {
 // skip, when non-nil, names remote keys the user chose to keep: those files
 // are walked and counted but never sent. The keys match PrepareUpload's
 // RemotePath exactly — the two key derivations are pinned together by test.
+// uploadKey derives the remote key for one walked local file. Upload and the
+// skip filter both go through it, and it must keep matching PrepareUpload's
+// RemotePath — TestIntegrationUploadMatchesPreparedKeys pins the two together.
+func uploadKey(localPath, s3Prefix, fpath string, isDir bool) string {
+	if isDir {
+		parent := filepath.Dir(localPath)
+		relPath, _ := filepath.Rel(parent, fpath)
+		return filepath.ToSlash(path.Join(s3Prefix, relPath))
+	}
+	return path.Join(s3Prefix, filepath.Base(fpath))
+}
+
 func (m *Model) Upload(
 	ctx context.Context,
 	localPath, s3Prefix string,
@@ -812,6 +824,25 @@ func (m *Model) Upload(
 		}
 	}
 
+	// Drop the files the user chose to keep BEFORE the totals are used: the
+	// walk counted every file, so leaving them in made the progress gauge
+	// measure bytes that were never going to be sent — a transfer that
+	// finishes at 60%% and an index counting files it skipped.
+	if len(skip) > 0 {
+		kept := files[:0:0]
+		totalSize = 0
+		for _, fpath := range files {
+			if skip[uploadKey(localPath, s3Prefix, fpath, isDir)] {
+				continue
+			}
+			if fi, err := os.Stat(fpath); err == nil {
+				totalSize += fi.Size()
+			}
+			kept = append(kept, fpath)
+		}
+		files = kept
+	}
+
 	uploader := newUploader(m.Client)
 
 	var uploadedTotal int64
@@ -823,17 +854,7 @@ func (m *Model) Upload(
 		default:
 		}
 
-		var s3Key string
-		if isDir {
-			parent := filepath.Dir(localPath)
-			relPath, _ := filepath.Rel(parent, fpath)
-			s3Key = filepath.ToSlash(path.Join(s3Prefix, relPath))
-		} else {
-			s3Key = path.Join(s3Prefix, filepath.Base(fpath))
-		}
-		if skip[s3Key] {
-			continue
-		}
+		s3Key := uploadKey(localPath, s3Prefix, fpath, isDir)
 
 		stat, err := os.Stat(fpath)
 		if err != nil {
