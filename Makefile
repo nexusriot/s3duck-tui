@@ -11,11 +11,12 @@
 #   uconsole          linux/arm64            (ClockworkPi uConsole, CM4)
 #   pizero2w          linux/arm64            (Raspberry Pi Zero 2 W, 64-bit OS)
 #   pizero2w-armhf    linux/arm  GOARM=7     (Pi Zero 2 W, 32-bit Raspberry Pi OS)
+#   licheerv          linux/riscv64          (LicheeRV Nano (W), riscv64)
 #   darwin            darwin/amd64 + arm64   (bonus, README-documented)
 #   windows           windows/amd64          (bonus, README-documented)
 #
 # Debian packages (.deb via dpkg-deb, mirrors build-deb.sh):
-#   deb-amd64  deb-arm64  deb-armhf   ->  build/<pkg>.deb
+#   deb-amd64  deb-arm64  deb-armhf  deb-riscv64   ->  build/<pkg>.deb
 #
 # Override version:   make debs VERSION=0.0.40
 # The version is also hard-coded in pkg/view/view.go and build-deb.sh; bump all three.
@@ -64,8 +65,9 @@ help:
 	@echo "  make uconsole           - linux/arm64 (ClockworkPi uConsole CM4)"
 	@echo "  make pizero2w           - linux/arm64 (Pi Zero 2 W, 64-bit OS)"
 	@echo "  make pizero2w-armhf     - linux/arm v7 (Pi Zero 2 W, 32-bit OS)"
+	@echo "  make licheerv           - linux/riscv64 (LicheeRV Nano (W))"
 	@echo "  make darwin windows     - macOS / Windows (README-documented)"
-	@echo "  make debs               - deb-amd64 + deb-arm64 + deb-armhf"
+	@echo "  make debs               - deb-amd64 + deb-arm64 + deb-armhf + deb-riscv64"
 	@echo "  make test | test-race | check | staticcheck | vet | fmt | tidy | clean"
 	@echo "  make test-integration   - tagged suite against a throwaway MinIO in Docker"
 
@@ -140,7 +142,7 @@ clean:
 	rm -rf $(BUILD_DIR) $(DIST_DIR) $(APP)
 
 .PHONY: all
-all: x86_64 x86_64-static freebsd-x86_64 uconsole pizero2w pizero2w-armhf darwin windows
+all: x86_64 x86_64-static freebsd-x86_64 uconsole pizero2w pizero2w-armhf licheerv darwin windows
 
 .PHONY: x86_64
 x86_64:
@@ -170,6 +172,10 @@ pizero2w:
 pizero2w-armhf:
 	$(call go_build,linux,arm,$(APP)-$(VERSION)-pizero2w-linux-armv7,0,7)
 
+.PHONY: licheerv
+licheerv:
+	$(call go_build,linux,riscv64,$(APP)-$(VERSION)-licheerv-linux-riscv64,0)
+
 .PHONY: darwin
 darwin:
 	$(call go_build,darwin,amd64,$(APP)-$(VERSION)-darwin-amd64,0)
@@ -180,7 +186,7 @@ windows:
 	$(call go_build,windows,amd64,$(APP)-$(VERSION)-windows-amd64.exe,0)
 
 .PHONY: debs
-debs: deb-amd64 deb-arm64 deb-armhf
+debs: deb-amd64 deb-arm64 deb-armhf deb-riscv64
 
 .PHONY: deb-amd64
 deb-amd64:
@@ -195,3 +201,8 @@ deb-arm64:
 .PHONY: deb-armhf
 deb-armhf:
 	$(call build_deb,armhf,arm,7)
+
+# riscv64 deb for the LicheeRV Nano (W).
+.PHONY: deb-riscv64
+deb-riscv64:
+	$(call build_deb,riscv64,riscv64)

@@ -110,6 +110,7 @@ jobs:
           - { goos: linux, goarch: amd64 }
           - { goos: linux, goarch: arm64 } # uConsole CM4, Pi Zero 2 W (64-bit)
           - { goos: linux, goarch: arm, goarm: "7" } # Pi Zero 2 W (32-bit)
+          - { goos: linux, goarch: riscv64 } # LicheeRV Nano (W)
           - { goos: freebsd, goarch: amd64 }
           - { goos: darwin, goarch: amd64 }
           - { goos: darwin, goarch: arm64 }

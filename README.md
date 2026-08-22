@@ -47,7 +47,7 @@ Features
 35. **Overwrite confirmation for remote writes** — rename, batch rename, copy, move, paste, upload and cross-profile copy all check the destination first and name exactly what they would replace, offering **Overwrite**, **Skip existing** (when that still leaves something to do) or **Cancel**. Skipping a destination on a *move* leaves the source in place too, so nothing is ever deleted without having been written somewhere. Sync is exempt: its dry-run plan already lists every update before anything moves
 36. **Copies above 5 GiB** — copy, move, rename, storage-class changes, metadata saves and version restores fall back to a concurrent multipart part-copy past the size where a single-request S3 copy is rejected, carrying content headers, metadata and tags across
 37. Custom endpoints and self-signed TLS support (`ignore_ssl`)
-38. Linux, FreeBSD and macOS / Windows builds (statically linkable)
+38. Linux (amd64/arm64/armv7/riscv64), FreeBSD and macOS / Windows builds (statically linkable)
 
 Screenshots
 -------------
@@ -282,6 +282,13 @@ Build (amd64 by default):
 ```
 ./build-deb.sh          # amd64
 ./build-deb-arm64.sh    # arm64
+./build-deb.sh riscv64  # riscv64
+```
+
+Or via the Makefile, which builds all four:
+
+```
+make debs
 ```
 
 Building a FreeBSD binary
@@ -289,6 +296,17 @@ Building a FreeBSD binary
 
 ```
 GOOS=freebsd GOARCH=amd64 go build ./cmd/s3duck-tui
+```
+
+Building for RISC-V (LicheeRV Nano)
+-------------
+
+CGO is off for every cross target, so riscv64 needs no extra toolchain:
+
+```
+make licheerv           # static binary into dist/
+make deb-riscv64        # riscv64 .deb into build/
+./build-licheerv.sh     # same binary, standalone script
 ```
 
 License

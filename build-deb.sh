@@ -10,9 +10,10 @@ if ! type "dpkg-deb" > /dev/null; then
 fi
 
 case "$arch" in
-  amd64)  goarch="amd64" ;;
-  arm64)  goarch="arm64" ;;
-  *)      echo "unsupported architecture: $arch"; exit 1 ;;
+  amd64)    goarch="amd64" ;;
+  arm64)    goarch="arm64" ;;
+  riscv64)  goarch="riscv64" ;;
+  *)        echo "unsupported architecture: $arch"; exit 1 ;;
 esac
 
 project="s3duck-tui_${version}_${arch}"
