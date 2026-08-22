@@ -161,6 +161,10 @@ Profiles live in `~/.config/s3duck-tui/config.json` as a JSON array of:
 Hotkeys
 -------------
 
+`Ctrl+H` opens the in-app list of these. It scrolls (↑/↓, PgUp/PgDn, Home/End,
+`j`/`k`) and sizes itself to the terminal, so the tail of the list is reachable
+on a short one; `Esc`, `q` or `Ctrl+H` closes it.
+
 **Profiles screen**
 
 | Key | Action |

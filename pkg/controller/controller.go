@@ -2913,15 +2913,10 @@ func (c *Controller) setConfigInput() {
 			c.ImportAWSProfiles()
 			return nil
 		case tcell.KeyCtrlH:
-			help := c.view.HotkeysModal(true)
-
-			// Close help on any key press inside the help view
-			help.SetInputCapture(func(_ *tcell.EventKey) *tcell.EventKey {
+			help := c.view.HotkeysModal(true, func() {
 				c.view.Pages.RemovePage("modal-help")
-				return nil
 			})
-
-			c.view.Pages.AddPage("modal-help", c.view.ModalEdit(help, 70, 22), true, true)
+			c.view.Pages.AddPage("modal-help", help, true, true)
 			return nil
 		case tcell.KeyCtrlV:
 			c.CheckProfile()
@@ -3314,12 +3309,10 @@ func (c *Controller) listInputCapture(event *tcell.EventKey) *tcell.EventKey {
 		c.copyOrMove(true)
 		return nil
 	case tcell.KeyCtrlH:
-		help := c.view.HotkeysModal(false)
-		help.SetInputCapture(func(_ *tcell.EventKey) *tcell.EventKey {
+		help := c.view.HotkeysModal(false, func() {
 			c.view.Pages.RemovePage("modal-help")
-			return nil
 		})
-		c.view.Pages.AddPage("modal-help", c.view.ModalEdit(help, 76, 44), true, true)
+		c.view.Pages.AddPage("modal-help", help, true, true)
 		return nil
 	case tcell.KeyCtrlA:
 		about := c.view.AboutModal()

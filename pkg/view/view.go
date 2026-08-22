@@ -3,13 +3,14 @@ package view
 import (
 	"fmt"
 	"strings"
+	"sync/atomic"
 
 	"github.com/dustin/go-humanize"
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
 
-const versionText = "S3Duck 🦆 TUI v.0.8.0"
+const versionText = "S3Duck 🦆 TUI v.0.9.0"
 
 // View ...
 type View struct {
@@ -30,6 +31,56 @@ type View struct {
 	headers [2]*tview.TextView
 	cols    [2]*tview.Flex
 	main    *tview.Flex
+
+	// Terminal size as of the last draw. tview's Application exposes no size
+	// getter in this version, and overlays that can outgrow the terminal (the
+	// hotkey list) have to know how tall they may be before they are laid out.
+	screenW, screenH atomic.Int32
+}
+
+// frameChromeRows is what the Frame keeps for itself around Pages: a blank
+// line plus the version line at the top, the hotkey line plus a blank line at
+// the bottom, and one separator row on each side (Frame's header/footer).
+const frameChromeRows = 6
+
+// ContentSize returns the space a page has to work with: the terminal size as
+// of the last draw, minus the frame chrome. It is (0, 0) before the first draw.
+func (v *View) ContentSize() (int, int) {
+	w, h := int(v.screenW.Load()), int(v.screenH.Load())
+	if w == 0 || h == 0 {
+		return 0, 0
+	}
+	return w - 2, h - frameChromeRows
+}
+
+// ModalClamped centers p like ModalEdit, but shrinks it to fit the terminal
+// instead of letting it run off the bottom. Anything scrollable stays reachable
+// by scrolling; anything else at least keeps its borders on screen.
+func (v *View) ModalClamped(p tview.Primitive, width, height int) tview.Primitive {
+	w, h := v.clampToContent(width, height)
+	return centerModal(p, w, h)
+}
+
+// centerModal centers p at a fixed size over whatever is behind it. It backs
+// the ModalEdit field, which is what the rest of the app calls.
+func centerModal(p tview.Primitive, width, height int) tview.Primitive {
+	return tview.NewFlex().
+		AddItem(nil, 0, 1, false).
+		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(nil, 0, 1, false).
+			AddItem(p, height, 1, true).
+			AddItem(nil, 0, 1, false), width, 1, true).
+		AddItem(nil, 0, 1, false)
+}
+
+// clampToContent shrinks a requested overlay size to what the terminal can
+// show. Before the first draw the size is unknown and the request stands.
+func (v *View) clampToContent(width, height int) (int, int) {
+	aw, ah := v.ContentSize()
+	if aw <= 0 || ah <= 0 {
+		return width, height
+	}
+	return min(width, aw), min(height, ah)
 }
 
 // newPaneColumn builds one browser pane: a column-header line above a bordered
@@ -115,20 +166,10 @@ func NewView() *View {
 	pages := tview.NewPages().
 		AddPage("main", main, true, true)
 
-	modal := func(p tview.Primitive, width, height int) tview.Primitive {
-		return tview.NewFlex().
-			AddItem(nil, 0, 1, false).
-			AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
-				AddItem(nil, 0, 1, false).
-				AddItem(p, height, 1, true).
-				AddItem(nil, 0, 1, false), width, 1, true).
-			AddItem(nil, 0, 1, false)
-	}
-
 	frame := tview.NewFrame(pages)
 	app.SetRoot(frame, true)
 
-	v := View{
+	v := &View{
 		App:       app,
 		Frame:     frame,
 		Pages:     pages,
@@ -136,14 +177,22 @@ func NewView() *View {
 		Filter:    filter0,
 		Header:    header0,
 		Details:   tv,
-		ModalEdit: modal,
+		ModalEdit: centerModal,
 		lists:     [2]*tview.List{list0, list1},
 		filters:   [2]*tview.InputField{filter0, filter1},
 		headers:   [2]*tview.TextView{header0, header1},
 		cols:      [2]*tview.Flex{col0, col1},
 		main:      main,
 	}
-	return &v
+
+	app.SetBeforeDrawFunc(func(screen tcell.Screen) bool {
+		w, h := screen.Size()
+		v.screenW.Store(int32(w))
+		v.screenH.Store(int32(h))
+		return false // carry on with the draw
+	})
+
+	return v
 }
 
 func (v *View) NewErrorMessageQ(header string, details string) *tview.Modal {
@@ -424,89 +473,150 @@ func (v *View) NewCreateForm(header string, disablePublic bool) *tview.Form {
 	return form
 }
 
-func (v *View) HotkeysModal(profiles bool) *tview.TextView {
-	helpText := `
-		[::b]Navigation[::-]
-          [↓,↑]Down/Up 
-		  Enter         Open selected profile
+// The hotkey panel is a fixed-width two-column layout: the key in the first 14
+// columns, one description per line, nothing wider than helpWidth. Word wrap is
+// off inside it, so a description that does not fit here would be clipped
+// rather than folded back to column zero (which is what the old text did).
+const (
+	helpWidth = 76 // panel width, borders included
 
-		[::b]Actions[::-]
-		  Ctrl+N        Create new profile
-          Ctrl+I        Import profile from ~/.aws (incl. session token)
-          Ctrl+Y        Copy profile
-		  Ctrl+E        Edit profile
-          Ctrl+V        Verify profile (test connection)
-		  Del           Delete profile
+	// Rows the panel spends on chrome: the two border lines and the footer hint.
+	helpChromeRows = 3
+)
 
-		[::b]Misc[::-]
-		  Ctrl+H        This help
-	      Ctrl+A        Show About
-		  Ctrl+Q        Quit
-		
-		[dim]Press any key to close.[-]
-	`
-	if !profiles {
-		helpText = `
-		[::b]Navigation[::-]
-		  [↓,↑]Down/Up 
-		  Enter         Open folder / select
-		  Backspace     Up ([..])
-          [ / ]         History back / forward (also Alt+left/right)
-        Ctrl+O        Toggle dual-pane
-        Tab           Switch active pane (dual-pane)
-        Ctrl+B        Bookmarks (go / add / remove)
-        Ctrl+K        Command palette
-        Ctrl+P        Show Profiles
+const helpProfiles = `
+  [::b]Navigation[::-]
+    [↓,↑]         Down / up
+    Enter         Open selected profile
 
-		[::b]Actions[::-]
-		  Ctrl+N        Create bucket / folder
-		  Ctrl+D        Download file/folder (for files and folders)
-          Ctrl+R        Rename (pattern rename when >1 marked)
-          Ctrl+Y        Copy selected/marked to a destination bucket/prefix
-          Ctrl+T        Move selected/marked to a destination bucket/prefix
-          Ctrl+G        Bucket/folder summary
-          Ctrl+L        File properties (size, ETag, link)
-          v             Version history (restore / download / delete)
-          m             Edit metadata & object tags
-          c             Storage class / Glacier restore
-          Ctrl+W        Copy presigned (time-limited) share link
-          Ctrl+U        Open local file manager (for upload)
-          Ctrl+E        Sync: local ⇄ this prefix, or this prefix → another
-          =             Compare the two panes (dual-pane, read-only)
-          D             Find duplicates under this prefix (size + ETag)
-          e             Edit object in $EDITOR (small text objects)
-          >             Copy marked items to another profile
-          y / x / p     Clipboard: copy / cut / paste objects
-          u             Undo last move/rename
-          t             Transfers panel (background jobs)
-          /             Filter the current listing (live)
-          s / S         Sort: cycle name/size/date / reverse direction
-          r / F5        Refresh the current listing
-          Ctrl+F        Recursive search (checkbox: all buckets)
-          Ctrl+K        Palette: abort uploads, bucket config, log…
-          Space			Select object for download
-          Ctrl+S        Select all objects for download
-          Ctrl+X        Unselect all objects for download
-		  Del           Delete marked/highlighted (recursive for dirs)
+  [::b]Actions[::-]
+    Ctrl+N        Create new profile
+    Ctrl+I        Import profile from ~/.aws (incl. session token)
+    Ctrl+Y        Copy profile
+    Ctrl+E        Edit profile
+    Ctrl+V        Verify profile (test connection)
+    Del           Delete profile
 
-		[::b]Misc[::-]
-		  Ctrl+H        This help
-          Ctrl+A        Show About
-		  Ctrl+Q        Quit
-		
-		[dim]Press any key to close.[-]
-	`
+  [::b]Misc[::-]
+    Ctrl+H        This help
+    Ctrl+A        Show About
+    Ctrl+Q        Quit
+`
+
+const helpBrowser = `
+  [::b]Navigation[::-]
+    [↓,↑]         Down / up
+    Enter         Open folder / select
+    Backspace     Up ([..])
+    [ / ]         History back / forward (also Alt+left/right)
+    Ctrl+O        Toggle dual-pane
+    Tab           Switch active pane (dual-pane)
+    Ctrl+B        Bookmarks (go / add / remove)
+    Ctrl+K        Command palette (abort uploads, bucket config, log…)
+    Ctrl+P        Show Profiles
+
+  [::b]Actions[::-]
+    Ctrl+N        Create bucket / folder
+    Ctrl+D        Download file/folder (for files and folders)
+    Ctrl+R        Rename (pattern rename when >1 marked)
+    Ctrl+Y        Copy selected/marked to a destination bucket/prefix
+    Ctrl+T        Move selected/marked to a destination bucket/prefix
+    Ctrl+G        Bucket/folder summary
+    Ctrl+L        File properties (size, ETag, link)
+    v             Version history (restore / download / delete)
+    m             Edit metadata & object tags
+    c             Storage class / Glacier restore
+    Ctrl+W        Copy presigned (time-limited) share link
+    Ctrl+U        Open local file manager (for upload)
+    Ctrl+E        Sync: local ⇄ this prefix, or this prefix → another
+    =             Compare the two panes (dual-pane, read-only)
+    D             Find duplicates under this prefix (size + ETag)
+    e             Edit object in $EDITOR (small text objects)
+    >             Copy marked items to another profile
+    y / x / p     Clipboard: copy / cut / paste objects
+    u             Undo last move/rename
+    t             Transfers panel (background jobs)
+    /             Filter the current listing (live)
+    s / S         Sort: cycle name/size/date / reverse direction
+    r / F5        Refresh the current listing
+    Ctrl+F        Recursive search (checkbox: all buckets)
+    Space         Select object for download
+    Ctrl+S        Select all objects for download
+    Ctrl+X        Unselect all objects for download
+    Del           Delete marked/highlighted (recursive for dirs)
+
+  [::b]Misc[::-]
+    Ctrl+H        This help
+    Ctrl+A        Show About
+    Ctrl+Q        Quit
+`
+
+// scrollHint is the footer under the hotkey list: it names the scroll keys and,
+// when the list does not fit, says which part of it is showing. A clipped list
+// with no footer looked complete, which is how the tail of it went unnoticed.
+func scrollHint(offset, visible, total int) string {
+	if visible <= 0 || total <= visible {
+		return "Esc / q closes"
 	}
+	if offset > total-visible {
+		offset = total - visible
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	return fmt.Sprintf("↑/↓ PgUp/PgDn scroll — lines %d-%d of %d — Esc / q closes",
+		offset+1, offset+visible, total)
+}
+
+// HotkeysModal builds the hotkey panel. The list is taller than a typical
+// terminal, so the panel scrolls (arrows, PgUp/PgDn, Home/End, j/k) and is
+// clamped to the terminal height rather than being cut off at a hard-coded 44
+// rows. onClose is called when the user dismisses it.
+func (v *View) HotkeysModal(profiles bool, onClose func()) tview.Primitive {
+	text := helpBrowser
+	if profiles {
+		text = helpProfiles
+	}
+	total := strings.Count(text, "\n")
 
 	tv := tview.NewTextView()
 	tv.SetDynamicColors(true)
 	tv.SetTextAlign(tview.AlignLeft)
-	tv.SetWordWrap(true)
-	tv.SetText(helpText)
-	tv.SetBorder(true)
-	tv.SetTitle(" Hotkeys ")
+	tv.SetWrap(false)
+	tv.SetScrollable(true)
+	tv.SetText(text)
+	tv.ScrollToBeginning()
 
-	return tv
+	// Drawn straight to the screen rather than held in a TextView: the hint
+	// depends on the scroll offset, which is only final once the list above has
+	// drawn, and this way there is no widget state to update mid-draw.
+	footer := tview.NewBox()
+	footer.SetDrawFunc(func(screen tcell.Screen, x, y, width, height int) (int, int, int, int) {
+		offset, _ := tv.GetScrollOffset()
+		_, _, _, visible := tv.GetInnerRect()
+		tview.Print(screen, scrollHint(offset, visible, total), x, y, width, tview.AlignCenter, tcell.ColorGray)
+		return x, y, width, height
+	})
+
+	// Esc / Enter / Tab arrive as "done"; q and Ctrl+H are handled below.
+	// Everything else falls through to the text view so it can scroll — the
+	// panel used to close on *any* key, which is why it could not be scrolled.
+	tv.SetDoneFunc(func(tcell.Key) { onClose() })
+	tv.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyCtrlH || event.Rune() == 'q' {
+			onClose()
+			return nil
+		}
+		return event
+	})
+
+	panel := tview.NewFlex().SetDirection(tview.FlexRow)
+	panel.AddItem(tv, 0, 1, true)
+	panel.AddItem(footer, 1, 0, false)
+	panel.SetBorder(true)
+	panel.SetTitle(" Hotkeys ")
+
+	return v.ModalClamped(panel, helpWidth, total+helpChromeRows)
 }
 
 func (v *View) AboutModal() *tview.TextView {

@@ -451,6 +451,39 @@ S3 has no real directories. The app follows the S3 convention:
 
 ---
 
+## Overlay sizing (0.9.0)
+
+Every modal is centred by `centerModal(p, width, height)` at a size its caller
+picks, which is fine for forms — they know how tall they are — and wrong for
+anything whose content grows. The hotkey panel outgrew its hard-coded 44 rows
+and the last six bindings became unreachable: the panel was also closing on
+*any* key, so the `TextView` underneath it (scrollable by default in tview)
+never saw an arrow key.
+
+`View.ModalClamped` shrinks a requested size to what the terminal can actually
+show, using `View.ContentSize()` — the terminal size cached by a
+`SetBeforeDrawFunc` hook, minus six rows of `Frame` chrome (a blank line plus
+the version line at the top, the hotkey line plus a blank line at the bottom,
+and one `Frame` header/footer row on each side). tview's `Application` exposes
+no size getter in this version, hence the hook rather than a direct query.
+
+The hotkey panel is then a `Flex` of the scrolling `TextView` plus a one-line
+footer, sized `lines + 3` and clamped. Word wrap is **off** inside it: the text
+is written to fit the panel width, and wrapping a two-column key/description
+list only ever folded descriptions back to column zero. The footer is drawn
+straight to the screen with `tview.Print` from a `SetDrawFunc`, because it
+reports the scroll offset — which is only final after the list above has drawn,
+and drawing it directly means there is no widget state to mutate mid-draw. It
+names the scroll keys and, when the list does not fit, which lines are showing;
+a clipped list with no footer looked complete, which is how its tail went
+unnoticed. Closing is explicit: Esc/Enter/Tab through `SetDoneFunc`, plus `q`
+and Ctrl+H, with every other key falling through to the text view.
+
+`pkg/view` got its first test file with this: `scrollHint` and the clamp
+arithmetic are pure, and the panel itself is rendered onto a `tcell`
+SimulationScreen at 80x24 and driven with real key events, which is what pins
+"the tail is reachable" rather than "the constructor was called correctly".
+
 ## Known limitations
 
 | Area | Description |
