@@ -102,18 +102,28 @@ func TestParseAWSProfiles(t *testing.T) {
 		}
 	})
 
-	t.Run("SSO and role profiles are listed with a reason, not silently dropped", func(t *testing.T) {
+	t.Run("SSO and role profiles are importable as delegating profiles", func(t *testing.T) {
+		// These carry no key material to copy, so they used to be listed with
+		// the reason they could not be imported. They are now imported as
+		// delegating profiles: the SDK resolves them on every use, which is
+		// also what keeps an expiring credential fresh.
 		sso := find(t, ps, "ssoish")
-		if sso.Usable() {
-			t.Errorf("SSO profile must not be usable")
+		if !sso.Usable() {
+			t.Errorf("an SSO profile should be importable by delegation: %+v", sso)
 		}
-		if sso.Err == "" || !strings.Contains(sso.Err, "SSO") {
-			t.Errorf("err = %q, want an SSO explanation", sso.Err)
+		if sso.Delegates != "sso" {
+			t.Errorf("Delegates = %q, want sso", sso.Delegates)
+		}
+		if sso.Err != "" {
+			t.Errorf("a delegating profile needs no error: %q", sso.Err)
+		}
+		if !strings.Contains(sso.Kind(), "AWS SDK") {
+			t.Errorf("Kind() = %q, should say who resolves it", sso.Kind())
 		}
 
 		role := find(t, ps, "roley")
-		if role.Usable() || !strings.Contains(role.Err, "role") {
-			t.Errorf("role profile: usable=%v err=%q", role.Usable(), role.Err)
+		if !role.Usable() || role.Delegates != "role" {
+			t.Errorf("role profile: usable=%v delegates=%q", role.Usable(), role.Delegates)
 		}
 	})
 

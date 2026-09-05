@@ -112,6 +112,12 @@ func metaSummary(meta model.ObjectMeta) string {
 // a metadata save is a full object copy, so it is not worth doing for a
 // tags-only edit.
 func (c *Controller) EditObjectMeta() {
+	if c.remoteOnly("Metadata editing") {
+		return
+	}
+	if c.readOnlyBlocked("edit metadata or tags") {
+		return
+	}
 	_, obj, ok := c.currentObject()
 	if !ok || obj.Ot != model.File {
 		return
@@ -244,6 +250,12 @@ func (c *Controller) saveObjectMeta(bucket *model.Object, key string, meta model
 // highlighted object. Restoring is offered only for archived objects, since
 // RestoreObject is meaningless (and an error) for the others.
 func (c *Controller) ChangeStorageClass() {
+	if c.remoteOnly("The storage class") {
+		return
+	}
+	if c.readOnlyBlocked("change the storage class or request a restore") {
+		return
+	}
 	_, obj, ok := c.currentObject()
 	if !ok || obj.Ot != model.File {
 		return

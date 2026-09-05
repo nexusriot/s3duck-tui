@@ -453,3 +453,92 @@ func TestPrefixesOverlap(t *testing.T) {
 		}
 	}
 }
+
+func TestParseExcludes(t *testing.T) {
+	got := parseExcludes(" .git , *.tmp ,, node_modules ")
+	want := []string{".git", "*.tmp", "node_modules"}
+	if len(got) != len(want) {
+		t.Fatalf("parseExcludes = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("parseExcludes[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	if parseExcludes("") != nil {
+		t.Error("an empty field should produce no patterns")
+	}
+}
+
+func TestApplyExcludes(t *testing.T) {
+	entries := []model.SyncEntry{
+		{Rel: "src/main.go", Size: 1},
+		{Rel: ".git/config", Size: 2},
+		{Rel: "node_modules/pkg/index.js", Size: 3},
+		{Rel: "build/out.bin", Size: 4},
+		{Rel: "notes.tmp", Size: 5},
+		{Rel: "README.md", Size: 6},
+	}
+	got := applyExcludes(entries, []string{".git", "node_modules", "*.tmp", "re:^build/"})
+	if len(got) != 2 {
+		t.Fatalf("kept %d entries (%v), want src/main.go and README.md", len(got), got)
+	}
+	kept := map[string]bool{got[0].Rel: true, got[1].Rel: true}
+	if !kept["src/main.go"] || !kept["README.md"] {
+		t.Errorf("wrong entries kept: %v", got)
+	}
+	// No patterns: the slice is returned untouched, not copied and filtered.
+	if len(applyExcludes(entries, nil)) != len(entries) {
+		t.Error("no patterns must keep everything")
+	}
+}
+
+func TestCommonRels(t *testing.T) {
+	src := []model.SyncEntry{{Rel: "b"}, {Rel: "a"}, {Rel: "only-src"}}
+	dst := []model.SyncEntry{{Rel: "a"}, {Rel: "b"}, {Rel: "only-dst"}}
+	got := commonRels(src, dst)
+	if len(got) != 2 || got[0] != "a" || got[1] != "b" {
+		t.Errorf("commonRels = %v, want [a b]", got)
+	}
+	if commonRels(src, nil) != nil {
+		t.Error("no destination means nothing in common")
+	}
+}
+
+func TestPlanSyncChecksumComparison(t *testing.T) {
+	// Same size, same mtime, different content: the case size+mtime provably
+	// cannot see, and the reason the checksum mode exists.
+	now := time.Now()
+	src := []model.SyncEntry{{Rel: "a", Size: 10, Mod: now, Sum: "CRC32C:AAA"}}
+	dst := []model.SyncEntry{{Rel: "a", Size: 10, Mod: now, Sum: "CRC32C:BBB"}}
+	ops := planSync(src, dst, false)
+	if len(ops) != 1 || ops[0].Kind != syncUpdate {
+		t.Fatalf("differing checksums should plan one update, got %+v", ops)
+	}
+	if !strings.Contains(ops[0].Reason, "content differs") {
+		t.Errorf("reason = %q, want it to name the content difference", ops[0].Reason)
+	}
+
+	// Equal checksums win over a newer source mtime: this is what stops an
+	// upload sync straight after a download sync from re-sending everything.
+	src = []model.SyncEntry{{Rel: "a", Size: 10, Mod: now.Add(time.Hour), Sum: "CRC32C:AAA"}}
+	dst = []model.SyncEntry{{Rel: "a", Size: 10, Mod: now, Sum: "CRC32C:AAA"}}
+	if ops := planSync(src, dst, false); len(ops) != 0 {
+		t.Errorf("equal checksums should plan nothing, got %+v", ops)
+	}
+
+	// Different algorithms are not comparable, so the old rule decides.
+	src = []model.SyncEntry{{Rel: "a", Size: 10, Mod: now.Add(time.Hour), Sum: "SHA256:AAA"}}
+	dst = []model.SyncEntry{{Rel: "a", Size: 10, Mod: now, Sum: "CRC32C:BBB"}}
+	ops = planSync(src, dst, false)
+	if len(ops) != 1 || ops[0].Reason != "source is newer" {
+		t.Errorf("incomparable sums should fall back to size+mtime, got %+v", ops)
+	}
+
+	// A sum on one side only is not a comparison either.
+	src = []model.SyncEntry{{Rel: "a", Size: 10, Mod: now, Sum: "CRC32C:AAA"}}
+	dst = []model.SyncEntry{{Rel: "a", Size: 10, Mod: now}}
+	if ops := planSync(src, dst, false); len(ops) != 0 {
+		t.Errorf("one-sided sum should leave the old rule in charge, got %+v", ops)
+	}
+}

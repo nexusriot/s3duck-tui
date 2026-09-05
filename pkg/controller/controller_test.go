@@ -206,14 +206,27 @@ func TestBuildSummaryGroupCap(t *testing.T) {
 		})
 	}
 	_, _, groups := buildSummary(objs, "")
-	if len(groups) != 10 {
-		t.Errorf("len(groups) = %d, want 10 (top-10 cap)", len(groups))
+	// Ten named prefixes plus one row accounting for the rest: the cap used
+	// to truncate silently, so a bucket with more prefixes than that showed
+	// ten and looked complete.
+	if len(groups) != summaryGroupRows+1 {
+		t.Fatalf("len(groups) = %d, want %d (top-10 plus the overflow row)", len(groups), summaryGroupRows+1)
 	}
-	for i := 1; i < len(groups); i++ {
-		if groups[i-1].Bytes < groups[i].Bytes {
+	named := groups[:summaryGroupRows]
+	for i := 1; i < len(named); i++ {
+		if named[i-1].Bytes < named[i].Bytes {
 			t.Errorf("groups not sorted desc by Bytes at %d: %d < %d",
-				i, groups[i-1].Bytes, groups[i].Bytes)
+				i, named[i-1].Bytes, named[i].Bytes)
 		}
+	}
+	// Sizes are 1..15, so the ten largest are 6..15 and the overflow row
+	// must account for exactly 1+2+3+4+5.
+	over := groups[summaryGroupRows]
+	if over.Bytes != 15 {
+		t.Errorf("overflow row = %d bytes, want 15", over.Bytes)
+	}
+	if !strings.Contains(over.Name, "5 more") {
+		t.Errorf("overflow row name = %q, should say how many are folded in", over.Name)
 	}
 }
 

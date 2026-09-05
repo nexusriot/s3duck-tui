@@ -187,6 +187,9 @@ func dropDupMember(groups []dupGroup, gi int, key string) ([]dupGroup, bool) {
 // opens a browser over the duplicate groups it finds. Runs on the UI goroutine
 // (key handler); the listing happens behind a modal.
 func (c *Controller) FindDuplicates() {
+	if c.remoteOnly("The duplicate finder") {
+		return
+	}
 	if c.currentBucket == nil {
 		go c.error("Duplicates", fmt.Errorf("open a bucket first"))
 		return
@@ -195,14 +198,24 @@ func (c *Controller) FindDuplicates() {
 	prefix := model.NormalizePrefix(c.currentPath)
 	mdl := c.model
 
-	scanning := tview.NewModal().SetText("Scanning for duplicates...")
-	c.view.Pages.AddPage("progress", scanning, true, true)
+	scanning, ctx, cancel := c.cancellableWait("progress", "Scanning for duplicates...")
 
 	go func() {
-		objs, err := mdl.ListObjects(prefix, bucket)
+		defer cancel()
+		// The scan is a full recursive listing; report progress so a large
+		// prefix does not look like a hang, and let Esc stop it.
+		progress := c.searchProgress(scanning, "duplicates")
+		var objs []s3t.Object
+		err := mdl.ListObjectsStream(ctx, prefix, bucket, func(page []s3t.Object, total int) bool {
+			objs = append(objs, page...)
+			progress(total, 0)
+			return true
+		})
 		if err != nil {
 			c.view.App.QueueUpdateDraw(func() { c.view.Pages.RemovePage("progress") })
-			c.error("Duplicate scan failed", err)
+			if ctx.Err() == nil {
+				c.error("Duplicate scan failed", err)
+			}
 			return
 		}
 		groups := findDuplicates(objs)
@@ -325,6 +338,9 @@ func (c *Controller) presentDupMembers(mdl *model.Model, bucket *model.Object, p
 // confirmDeleteDup deletes one copy after confirmation and re-renders the
 // member view (or the group list, if the group dissolved).
 func (c *Controller) confirmDeleteDup(mdl *model.Model, bucket *model.Object, prefix string, groups []dupGroup, gi int, m dupMember) {
+	if c.readOnlyBlocked("delete a duplicate") {
+		return
+	}
 	others := len(groups[gi].Members) - 1
 	verb := "remain"
 	if others == 1 {

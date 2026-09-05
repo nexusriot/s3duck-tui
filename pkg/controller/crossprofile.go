@@ -31,12 +31,29 @@ func crossDstKey(srcPrefix, dstPrefix, key string) string {
 	return dstPrefix + strings.TrimPrefix(key, srcPrefix)
 }
 
+// modelConfigFor translates a stored profile into the model's connection
+// config. It is the single place that mapping lives, so opening a profile and
+// building a second client for a cross-profile copy can't drift on which
+// options they honour — the bug that class of duplication produced before was
+// a cross-profile copy running unthrottled because only Duck read the cap.
+func modelConfigFor(p *cfg.Config) model.Config {
+	mc := model.NewConfig(
+		p.BaseUrl, p.Region, p.AccessKey, p.SecretKey, p.SessionToken,
+		!p.IgnoreSsl, p.MaxBytesPerSec)
+	mc.AWSProfile = p.AWSProfile
+	mc.Write = model.WriteOptions{
+		DetectMime:        !p.NoMimeDetect,
+		SSE:               p.SSE,
+		SSEKMSKeyID:       p.SSEKMSKeyID,
+		ChecksumAlgorithm: p.ChecksumAlgo,
+	}
+	return mc
+}
+
 // modelForProfile builds an independent client for another profile, the same
 // way opening the profile would.
 func modelForProfile(p *cfg.Config) (*model.Model, error) {
-	return model.NewModel(model.NewConfig(
-		p.BaseUrl, p.Region, p.AccessKey, p.SecretKey, p.SessionToken,
-		!p.IgnoreSsl, p.MaxBytesPerSec))
+	return model.NewModel(modelConfigFor(p))
 }
 
 // CopyToProfile copies the marked objects — or the highlighted one — to a
@@ -45,6 +62,9 @@ func modelForProfile(p *cfg.Config) (*model.Model, error) {
 // the server-side Ctrl+Y copy requires both buckets behind one endpoint.
 // Runs on the UI goroutine.
 func (c *Controller) CopyToProfile() {
+	if c.remoteOnly("Cross-profile copy") {
+		return
+	}
 	if c.currentBucket == nil || c.view.List.GetItemCount() == 0 {
 		return
 	}
@@ -124,6 +144,13 @@ func (c *Controller) CopyToProfile() {
 // pickCrossDestination builds the destination client, lists its buckets, and
 // asks for bucket + prefix. Runs on the UI goroutine; the listing is not.
 func (c *Controller) pickCrossDestination(items []copyMoveItem, src *model.Model, srcBucket *model.Object, srcPrefix string, dstProfile *cfg.Config) {
+	// The read-only flag that matters here belongs to the *destination*
+	// profile: this copy writes there and only reads here.
+	if dstProfile != nil && dstProfile.ReadOnly {
+		go c.error("Read-only destination", fmt.Errorf(
+			"%q is marked read-only, so it cannot be copied into", dstProfile.Name))
+		return
+	}
 	loading := tview.NewModal().SetText(fmt.Sprintf("Connecting to %s...", dstProfile.Name))
 	c.view.Pages.AddPage("progress", loading, true, true)
 
@@ -134,7 +161,7 @@ func (c *Controller) pickCrossDestination(items []copyMoveItem, src *model.Model
 			c.error(fmt.Sprintf("Cannot connect to %s", dstProfile.Name), err)
 			return
 		}
-		buckets, err := dst.ListBuckets()
+		buckets, err := dst.ListBuckets(context.Background())
 		if err != nil {
 			c.view.App.QueueUpdateDraw(func() { c.view.Pages.RemovePage("progress") })
 			c.error(fmt.Sprintf("Cannot list buckets on %s", dstProfile.Name), err)
@@ -221,7 +248,7 @@ func (c *Controller) runCrossCopy(items []copyMoveItem, src *model.Model, srcBuc
 				total += it.size
 				continue
 			}
-			objs, err := src.ListObjects(it.srcKey, srcBucket)
+			objs, err := src.ListObjects(ctx, it.srcKey, srcBucket)
 			if err != nil {
 				c.finalizeJob(job, false, 1)
 				c.view.App.QueueUpdateDraw(func() { c.view.Pages.RemovePage("progress") })

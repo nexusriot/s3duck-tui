@@ -83,6 +83,13 @@ const syncModTolerance = 2 * time.Second
 // differ, or when the sizes match but the source is more than syncModTolerance
 // newer. Deletes are only emitted when del is set; without it, sync never
 // removes anything.
+//
+// When both sides carry a comparable checksum (same algorithm), that decides
+// it instead: equal sums mean no transfer whatever the timestamps say, and
+// different sums mean a transfer whatever the sizes say. This is what closes
+// the two documented holes in size+mtime comparison — a file edited in place
+// to the same length is now seen, and a download-then-upload no longer
+// re-sends every file because its local mtime is newer.
 func planSync(src, dst []model.SyncEntry, del bool) []syncOp {
 	dstByRel := make(map[string]model.SyncEntry, len(dst))
 	for _, e := range dst {
@@ -98,6 +105,21 @@ func planSync(src, dst []model.SyncEntry, del bool) []syncOp {
 		if !ok {
 			creates = append(creates, syncOp{Kind: syncCreate, Rel: s.Rel, Bytes: s.Size})
 			continue
+		}
+		// Content comparison wins when it is available on both sides.
+		if sa, _ := model.SumAlgo(s.Sum); sa != "" {
+			if da, _ := model.SumAlgo(d.Sum); da == sa {
+				if s.Sum == d.Sum {
+					continue // identical content: nothing to do
+				}
+				updates = append(updates, syncOp{
+					Kind:   syncUpdate,
+					Rel:    s.Rel,
+					Bytes:  s.Size,
+					Reason: fmt.Sprintf("content differs (%s)", sa),
+				})
+				continue
+			}
 		}
 		if s.Size != d.Size {
 			updates = append(updates, syncOp{
@@ -254,6 +276,15 @@ type syncSpec struct {
 	dstBucket *model.Object
 	dstPrefix string
 	del       bool
+	// checksum asks for content comparison instead of size+mtime. It costs a
+	// request per remote object and a full read per local one, which is why
+	// it is a choice and not the default.
+	checksum bool
+	// exclude holds glob/regex patterns (match.go syntax) applied to both
+	// sides' relative paths before the diff. Without it sync could not be
+	// pointed at any real working tree: .git/, node_modules/ and *.tmp would
+	// all be mirrored.
+	exclude []string
 }
 
 // prefixesOverlap reports whether one normalized prefix contains the other
@@ -294,6 +325,9 @@ func (s syncSpec) dstLabel() string {
 // one operation here that can both overwrite and (optionally) delete, so it
 // never runs unreviewed.
 func (c *Controller) Sync() {
+	if c.remoteOnly("Sync") {
+		return
+	}
 	if c.currentBucket == nil {
 		go c.error("Sync", fmt.Errorf("open a bucket first"))
 		return
@@ -318,7 +352,7 @@ func (c *Controller) Sync() {
 	mdl := c.model
 	go func() {
 		bucketNames := []string{*bucket.Key}
-		if list, err := mdl.ListBuckets(); err == nil {
+		if list, err := mdl.ListBuckets(context.Background()); err == nil {
 			bucketNames = bucketNames[:0]
 			for _, b := range list {
 				if b != nil && b.Key != nil {
@@ -348,8 +382,10 @@ func (c *Controller) showSyncForm(bucket *model.Object, prefix string, bucketNam
 		_, dstBucketName := form.GetFormItemByLabel(view.FieldSyncDstBucket).(*tview.DropDown).GetCurrentOption()
 		dstPfx := model.NormalizePrefix(form.GetFormItemByLabel(view.FieldSyncDstPrefix).(*tview.InputField).GetText())
 		del := form.GetFormItemByLabel(view.FieldSyncDelete).(*tview.Checkbox).IsChecked()
+		sum := form.GetFormItemByLabel(view.FieldSyncChecksum).(*tview.Checkbox).IsChecked()
+		excl := parseExcludes(form.GetFormItemByLabel(view.FieldSyncExclude).(*tview.InputField).GetText())
 
-		spec := syncSpec{dir: syncDirection(dirIdx), del: del, localDir: localDir}
+		spec := syncSpec{dir: syncDirection(dirIdx), del: del, localDir: localDir, checksum: sum, exclude: excl}
 		switch spec.dir {
 		case syncUpload:
 			if localDir == "" {
@@ -400,7 +436,7 @@ func (c *Controller) showSyncForm(bucket *model.Object, prefix string, bucketNam
 }
 
 // syncFormHeight sizes the sync dialog.
-const syncFormHeight = 17
+const syncFormHeight = 21
 
 // syncDirectionLabels are the dropdown options, ordered to match the
 // syncDirection constants so the selected index IS the direction.
@@ -415,7 +451,7 @@ func syncDirectionLabels() []string {
 // collectSides gathers the entry lists for both sides of a spec. A missing
 // local directory is fatal for an upload (nothing to send) but normal for a
 // download's first run, where the transfer will create it.
-func (c *Controller) collectSides(mdl *model.Model, spec syncSpec) (src, dst []model.SyncEntry, err error) {
+func (c *Controller) collectSides(ctx context.Context, mdl *model.Model, spec syncSpec) (src, dst []model.SyncEntry, err error) {
 	local := func() ([]model.SyncEntry, error) {
 		entries, err := model.WalkLocal(spec.localDir)
 		if err != nil && spec.dir == syncDownload && os.IsNotExist(err) {
@@ -429,22 +465,184 @@ func (c *Controller) collectSides(mdl *model.Model, spec syncSpec) (src, dst []m
 		if src, err = local(); err != nil {
 			return nil, nil, err
 		}
-		dst, err = mdl.ListRemoteEntries(spec.dstPrefix, spec.dstBucket)
+		dst, err = mdl.ListRemoteEntries(ctx, spec.dstPrefix, spec.dstBucket)
 	case syncDownload:
-		if src, err = mdl.ListRemoteEntries(spec.srcPrefix, spec.srcBucket); err != nil {
+		if src, err = mdl.ListRemoteEntries(ctx, spec.srcPrefix, spec.srcBucket); err != nil {
 			return nil, nil, err
 		}
 		dst, err = local()
 	default: // syncRemote
-		if src, err = mdl.ListRemoteEntries(spec.srcPrefix, spec.srcBucket); err != nil {
+		if src, err = mdl.ListRemoteEntries(ctx, spec.srcPrefix, spec.srcBucket); err != nil {
 			return nil, nil, err
 		}
-		dst, err = mdl.ListRemoteEntries(spec.dstPrefix, spec.dstBucket)
+		dst, err = mdl.ListRemoteEntries(ctx, spec.dstPrefix, spec.dstBucket)
 	}
 	if err != nil {
 		return nil, nil, err
 	}
+
+	// Exclusions are applied before anything else looks at the entries, so
+	// neither the diff nor a delete-extraneous pass can see a filtered path.
+	src = applyExcludes(src, spec.exclude)
+	dst = applyExcludes(dst, spec.exclude)
+
+	if spec.checksum {
+		c.fillSums(ctx, mdl, spec, src, dst)
+	}
 	return src, dst, nil
+}
+
+// parseExcludes splits the form's comma-separated pattern list. Patterns keep
+// match.go's syntax, so "node_modules" is a substring, "*.tmp" a glob and
+// "re:^build/" a regex — the same three dialects the filter and the search
+// use, learned once.
+func parseExcludes(text string) []string {
+	var out []string
+	for _, p := range strings.Split(text, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// excluded reports whether a relative path matches any pattern. A path is also
+// matched by a pattern naming one of its parent directories, so "node_modules"
+// excludes everything under it — the behaviour anyone typing that expects,
+// and the reason the test for it is explicit.
+func excluded(rel string, patterns []matcher) bool {
+	if len(patterns) == 0 {
+		return false
+	}
+	segments := strings.Split(rel, "/")
+	for _, m := range patterns {
+		if m.match(rel) {
+			return true
+		}
+		for i, seg := range segments {
+			if m.match(seg) {
+				return true
+			}
+			// Also try the directory prefix, so "re:^build/" works.
+			if i > 0 && m.match(strings.Join(segments[:i+1], "/")+"/") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// applyExcludes filters one side of the diff. Filtering *before* the diff is
+// what makes the exclusions safe: an excluded path is invisible to the
+// planner, so a delete-extraneous run cannot decide it is extraneous.
+func applyExcludes(entries []model.SyncEntry, patterns []string) []model.SyncEntry {
+	if len(patterns) == 0 {
+		return entries
+	}
+	ms := make([]matcher, 0, len(patterns))
+	for _, p := range patterns {
+		ms = append(ms, mustMatcher(p))
+	}
+	out := make([]model.SyncEntry, 0, len(entries))
+	for _, e := range entries {
+		if excluded(e.Rel, ms) {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// commonRels returns the paths present on both sides — the only ones a
+// checksum comparison can say anything about. A path missing at the
+// destination is already a create; hashing it would be work for no decision.
+func commonRels(src, dst []model.SyncEntry) []string {
+	in := make(map[string]bool, len(dst))
+	for _, e := range dst {
+		in[e.Rel] = true
+	}
+	var out []string
+	for _, e := range src {
+		if in[e.Rel] {
+			out = append(out, e.Rel)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// fillSums resolves content checksums for the paths present on both sides and
+// writes them into the entry slices in place.
+//
+// Remote sums come from the object's stored checksum (or its ETag when the
+// object is single-part); local ones are computed with whatever algorithm the
+// remote side reported, because two sums are only comparable when the
+// algorithms match. Anything that cannot be resolved is simply left empty and
+// falls back to the size+mtime rule for that one path.
+func (c *Controller) fillSums(ctx context.Context, mdl *model.Model, spec syncSpec, src, dst []model.SyncEntry) {
+	rels := commonRels(src, dst)
+	if len(rels) == 0 {
+		return
+	}
+
+	remote := func(bucket *model.Object, prefix string) map[string]string {
+		keys := make([]string, 0, len(rels))
+		for _, rel := range rels {
+			keys = append(keys, prefix+rel)
+		}
+		sums, _ := mdl.RemoteChecksums(ctx, bucket, keys)
+		out := make(map[string]string, len(sums))
+		for _, rel := range rels {
+			if v, ok := sums[prefix+rel]; ok {
+				out[rel] = v
+			}
+		}
+		return out
+	}
+
+	localFor := func(want map[string]string) map[string]string {
+		out := make(map[string]string, len(want))
+		for _, rel := range rels {
+			algo, _ := model.SumAlgo(want[rel])
+			if algo == "" {
+				continue // nothing comparable on the other side
+			}
+			if ctx.Err() != nil {
+				return out
+			}
+			path := filepath.Join(spec.localDir, filepath.FromSlash(rel))
+			v, err := model.LocalChecksum(path, algo)
+			if err != nil {
+				continue
+			}
+			out[rel] = algo + ":" + v
+		}
+		return out
+	}
+
+	var srcSums, dstSums map[string]string
+	switch spec.dir {
+	case syncUpload:
+		dstSums = remote(spec.dstBucket, spec.dstPrefix)
+		srcSums = localFor(dstSums)
+	case syncDownload:
+		srcSums = remote(spec.srcBucket, spec.srcPrefix)
+		dstSums = localFor(srcSums)
+	default: // syncRemote
+		srcSums = remote(spec.srcBucket, spec.srcPrefix)
+		dstSums = remote(spec.dstBucket, spec.dstPrefix)
+	}
+
+	for i := range src {
+		if v, ok := srcSums[src[i].Rel]; ok {
+			src[i].Sum = v
+		}
+	}
+	for i := range dst {
+		if v, ok := dstSums[dst[i].Rel]; ok {
+			dst[i].Sum = v
+		}
+	}
 }
 
 // previewSync scans both sides off the UI goroutine and shows the plan with an
@@ -452,14 +650,16 @@ func (c *Controller) collectSides(mdl *model.Model, spec syncSpec) (src, dst []m
 // runs behind a "Scanning…" modal.
 func (c *Controller) previewSync(spec syncSpec) {
 	mdl := c.model
-	scanning := tview.NewModal().SetText("Scanning both sides...")
-	c.view.Pages.AddPage("progress", scanning, true, true)
+	_, ctx, cancel := c.cancellableWait("progress", "Scanning both sides...")
 
 	go func() {
-		src, dst, err := c.collectSides(mdl, spec)
+		defer cancel()
+		src, dst, err := c.collectSides(ctx, mdl, spec)
 		if err != nil {
 			c.view.App.QueueUpdateDraw(func() { c.view.Pages.RemovePage("progress").SwitchToPage("main") })
-			c.error("Sync scan failed", err)
+			if ctx.Err() == nil {
+				c.error("Sync scan failed", err)
+			}
 			return
 		}
 
@@ -506,6 +706,11 @@ func (c *Controller) showPlan(title, text string, onApply func(), applicable boo
 // Failures are collected rather than aborting the run, so one unreadable file
 // doesn't strand the rest of the sync.
 func (c *Controller) runSync(spec syncSpec, ops []syncOp) {
+	// A remote→local sync only writes to the filesystem, so a read-only
+	// profile may still run it; the other two directions write objects.
+	if spec.dir != syncDownload && c.readOnlyBlocked("sync to remote storage") {
+		return
+	}
 	// Runs on the UI goroutine: capture the client before spawning workers so
 	// a profile switch can't retarget a queued/backgrounded sync.
 	mdl := c.model
@@ -552,7 +757,9 @@ func (c *Controller) runSync(spec syncSpec, ops []syncOp) {
 		var mu sync.Mutex
 		var lastDraw time.Time
 		var doneBytes int64
-		var failed []string
+		// failures carry the operation itself, not just its message, so the
+		// report can offer to re-run exactly the ones that failed.
+		var failed []opFailure
 		inFlight := map[int]int64{}
 		okCount := 0
 		doneCount := 0
@@ -627,7 +834,10 @@ func (c *Controller) runSync(spec syncSpec, ops []syncOp) {
 					delete(inFlight, it.index)
 					doneCount++
 					if err != nil {
-						failed = append(failed, fmt.Sprintf("%s %s: %v", it.op.Kind, it.op.Rel, err))
+						failed = append(failed, opFailure{
+							item: retryItem{label: fmt.Sprintf("%s %s", it.op.Kind, it.op.Rel), target: it.op},
+							err:  err,
+						})
 					} else {
 						okCount++
 						doneBytes += it.op.Bytes
@@ -652,7 +862,10 @@ func (c *Controller) runSync(spec syncSpec, ops []syncOp) {
 			runPhase(deletes)
 		} else if writesFailed > 0 && len(deletes) > 0 {
 			mu.Lock()
-			failed = append(failed, fmt.Sprintf("%d delete(s) skipped: %d write(s) failed", len(deletes), writesFailed))
+			failed = append(failed, opFailure{
+				item: retryItem{label: fmt.Sprintf("%d delete(s) skipped", len(deletes))},
+				err:  fmt.Errorf("%d write(s) failed, so the plan's deletes are no longer covered by your approval", writesFailed),
+			})
 			mu.Unlock()
 		}
 		canceled := ctx.Err() != nil
@@ -665,36 +878,28 @@ func (c *Controller) runSync(spec syncSpec, ops []syncOp) {
 			return
 		}
 
-		c.view.App.QueueUpdateDraw(func() {
-			// Re-check ON the UI goroutine: a Background press racing job
-			// completion may have removed the progress page after the check
-			// above — mutating and focusing a detached modal would route all
-			// input into an invisible widget with no way back.
-			if job.isBackgrounded() || !c.view.Pages.HasPage("progress") {
-				return
-			}
-			status := "Sync complete."
-			if len(failed) > 0 {
-				status = "Sync finished with errors."
-			}
-			msg := fmt.Sprintf("%s\n\nApplied: %d\nFailed: %d\nTransferred: %s",
-				status, okCount, len(failed), humanize.IBytes(uint64(doneBytes)))
-			for i, f := range failed {
-				if i == 8 {
-					msg += fmt.Sprintf("\n  ...and %d more", len(failed)-8)
-					break
+		// Re-check on the UI goroutine inside reportOpResult: a Background
+		// press racing completion may have removed the progress page, and
+		// mutating a detached modal would route input into an invisible
+		// widget. The guard below is the cheap pre-check.
+		if !c.view.Pages.HasPage("progress") {
+			c.refreshAfterSync(spec)
+			return
+		}
+		res := &opResult{name: "Sync", okCount: okCount, bytes: doneBytes, failures: failed}
+		c.reportOpResult(progress, res, canceled, func(items []retryItem) {
+			// Re-running only the failures is the whole point of keeping
+			// them: a 5000-file sync that lost twelve objects to a flaky
+			// link should cost twelve operations, not another full plan.
+			retry := make([]syncOp, 0, len(items))
+			for _, it := range items {
+				if op, ok := it.target.(syncOp); ok {
+					retry = append(retry, op)
 				}
-				msg += "\n  - " + f
 			}
-			msg += "\n\nPress Done to return."
-
-			progress.ClearButtons()
-			progress.SetText(msg)
-			progress.AddButtons([]string{"Done"})
-			progress.SetDoneFunc(func(_ int, _ string) {
-				c.view.Pages.RemovePage("progress").SwitchToPage("main")
-			})
-			c.view.App.SetFocus(progress)
+			if len(retry) > 0 {
+				c.runSync(spec, retry)
+			}
 		})
 
 		c.refreshAfterSync(spec)
@@ -817,15 +1022,17 @@ func (c *Controller) ComparePanes() {
 		srcBucket: c.currentBucket, srcPrefix: model.NormalizePrefix(c.currentPath),
 		dstBucket: other.currentBucket, dstPrefix: model.NormalizePrefix(other.currentPath)}
 
-	scanning := tview.NewModal().SetText("Comparing both panes...")
-	c.view.Pages.AddPage("progress", scanning, true, true)
+	_, ctx, cancel := c.cancellableWait("progress", "Comparing both panes...")
 
 	mdl := c.model
 	go func() {
-		src, dst, err := c.collectSides(mdl, left)
+		defer cancel()
+		src, dst, err := c.collectSides(ctx, mdl, left)
 		if err != nil {
 			c.view.App.QueueUpdateDraw(func() { c.view.Pages.RemovePage("progress").SwitchToPage("main") })
-			c.error("Compare failed", err)
+			if ctx.Err() == nil {
+				c.error("Compare failed", err)
+			}
 			return
 		}
 		// del=true so entries present only on the right are reported too; a

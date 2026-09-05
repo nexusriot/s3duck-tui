@@ -60,6 +60,13 @@ type Config struct {
 	SessionToken   string
 	SSl            bool
 	MaxBytesPerSec int64 // 0 = unlimited
+	// AWSProfile delegates credentials to the AWS SDK's own resolution for
+	// that shared-config profile instead of using the static keys above. Empty
+	// means static credentials. See GetConfig.
+	AWSProfile string
+	// Write holds the per-profile decisions for every object this app creates
+	// (content type, encryption, checksums). See WriteOptions.
+	Write WriteOptions
 }
 
 // rateLimiter is a token-bucket throttle shared across all transfer workers of
@@ -224,6 +231,7 @@ func NewConfig(url string, region *string, accKey string, secKey string, session
 		SessionToken:   sessionToken,
 		SSl:            ssl,
 		MaxBytesPerSec: maxBytesPerSec,
+		Write:          DefaultWriteOptions(),
 	}
 }
 
@@ -246,13 +254,22 @@ func GetConfig(cf Config, update bool) (aws.Config, error) {
 		return endpoint, nil
 	})
 
-	staticProvider := credentials.NewStaticCredentialsProvider(cf.AccessKey, cf.SecretKey, cf.SessionToken)
-
 	var opts []optsFunc
 	if update && strings.Contains(cf.Url, "amazonaws.com") {
 		opts = []optsFunc{config.WithRegion(*cf.Region)}
 	} else {
 		opts = []optsFunc{config.WithEndpointResolverWithOptions(customResolver)}
+	}
+
+	// Static keys suit a long-lived MinIO key; anything temporary wants the
+	// SDK's own resolution chain, which runs the SSO flow, assumes the role or
+	// invokes credential_process — and re-resolves when what it handed out
+	// expires. Naming a shared-config profile stores no key material here.
+	if cf.AWSProfile != "" {
+		opts = append(opts, config.WithSharedConfigProfile(cf.AWSProfile))
+	} else {
+		opts = append(opts, config.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider(cf.AccessKey, cf.SecretKey, cf.SessionToken)))
 	}
 
 	// Timeouts are per phase, NOT http.Client.Timeout: that one spans the whole
@@ -272,10 +289,31 @@ func GetConfig(cf Config, update bool) (aws.Config, error) {
 			ResponseHeaderTimeout: 30 * time.Second,
 		},
 	}
-	opts = append(opts, config.WithCredentialsProvider(staticProvider), config.WithHTTPClient(timeoutClient))
+	opts = append(opts, config.WithHTTPClient(timeoutClient))
 
 	cfg, err := config.LoadDefaultConfig(context.TODO(), opts...)
-	return cfg, err
+	if err != nil {
+		return cfg, err
+	}
+	// A delegating profile that resolves to nothing is worth catching here,
+	// while the message can still name the profile: the alternative is an
+	// opaque "no EC2 IMDS role found" on the first listing.
+	if cf.AWSProfile != "" && cfg.Credentials == nil {
+		return cfg, fmt.Errorf("aws profile %q resolved no credentials", cf.AWSProfile)
+	}
+	return cfg, nil
+}
+
+// CredentialSource describes where this connection's credentials come from,
+// for the profile details pane.
+func (c Config) CredentialSource() string {
+	if c.AWSProfile != "" {
+		return "aws profile " + c.AWSProfile + " (SDK-resolved, auto-refreshing)"
+	}
+	if c.SessionToken != "" {
+		return "static keys + session token (expires, no refresh)"
+	}
+	return "static keys"
 }
 
 func NewModel(cf Config) (*Model, error) {
@@ -323,24 +361,57 @@ func (m *Model) RefreshClient(bucket *string) error {
 	m.Downloader = GetDownloader(m.Client)
 	return nil
 }
-func (m *Model) ListObjects(key string, bucket *Object) ([]s3t.Object, error) {
-	if bucket == nil || bucket.Key == nil {
-		return nil, fmt.Errorf("bucket is nil")
-	}
 
-	var objects []s3t.Object
+// ListObjectsStream lists every object under key recursively (no delimiter),
+// handing each page to onPage along with the running total. onPage returns
+// false to stop early, which is how the callers that cap their result set
+// avoid paying for pages they will throw away.
+//
+// Cancellation is checked before every page as well as being passed into the
+// request, so a cancelled scan stops at the next page boundary at the latest.
+func (m *Model) ListObjectsStream(ctx context.Context, key string, bucket *Object, onPage func(page []s3t.Object, total int) bool) error {
+	if bucket == nil || bucket.Key == nil {
+		return fmt.Errorf("bucket is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	input := &s3.ListObjectsV2Input{
 		Bucket: aws.String(*bucket.Key),
 		Prefix: aws.String(key),
 	}
 
+	total := 0
 	paginator := s3.NewListObjectsV2Paginator(m.Client, input)
 	for paginator.HasMorePages() {
-		output, err := paginator.NextPage(context.TODO())
-		if err != nil {
-			return nil, err
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		objects = append(objects, output.Contents...)
+		output, err := paginator.NextPage(ctx)
+		if err != nil {
+			return err
+		}
+		total += len(output.Contents)
+		if onPage != nil && !onPage(output.Contents, total) {
+			return nil
+		}
+	}
+	return nil
+}
+
+// ListObjects lists every object under key recursively (no delimiter). The
+// context is honoured between pages as well as inside them: a recursive
+// listing of a large prefix is dozens of round trips, and cancelling a
+// copy/sync/delete used to keep paginating to the end because this ran on
+// context.TODO().
+func (m *Model) ListObjects(ctx context.Context, key string, bucket *Object) ([]s3t.Object, error) {
+	var objects []s3t.Object
+	err := m.ListObjectsStream(ctx, key, bucket, func(page []s3t.Object, _ int) bool {
+		objects = append(objects, page...)
+		return true
+	})
+	if err != nil {
+		return nil, err
 	}
 	return objects, nil
 }
@@ -375,24 +446,56 @@ func normalizeBucketLocation(constraint string) string {
 	}
 }
 
-func (m *Model) List(path string, bucket *Object) ([]*Object, error) {
-	if bucket == nil || bucket.Key == nil {
-		return nil, fmt.Errorf("bucket is nil")
-	}
+// List is the delimited listing behind ordinary navigation: one prefix level,
+// folders (common prefixes) and files. It accumulates every page; ListStream
+// is the incremental form the browser uses so a prefix holding a hundred
+// thousand keys can be shown as it arrives instead of after the last page.
+func (m *Model) List(ctx context.Context, path string, bucket *Object) ([]*Object, error) {
 	objs := make([]*Object, 0)
+	err := m.ListStream(ctx, path, bucket, func(page []*Object, _ int) bool {
+		objs = append(objs, page...)
+		return true
+	})
+	if err != nil {
+		return nil, err
+	}
+	return objs, nil
+}
+
+// ListStream is List, page by page. onPage receives the objects decoded from
+// one ListObjectsV2 page and the running total, and returns false to stop —
+// which is how the browser enforces its listing cap without fetching the rest
+// of a huge prefix.
+//
+// Before this took a context, navigating into a prefix with a hundred
+// thousand keys at one level meant a hundred blocking round trips that
+// nothing could interrupt, and the whole set landed in the list widget at
+// once. The context is honoured between pages as well as within them.
+func (m *Model) ListStream(ctx context.Context, path string, bucket *Object, onPage func(page []*Object, total int) bool) error {
+	if bucket == nil || bucket.Key == nil {
+		return fmt.Errorf("bucket is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	input := &s3.ListObjectsV2Input{
 		Bucket:    aws.String(*bucket.Key),
 		Delimiter: aws.String("/"),
 		Prefix:    aws.String(path),
 	}
 
+	total := 0
 	paginator := s3.NewListObjectsV2Paginator(m.Client, input)
 
 	for paginator.HasMorePages() {
-		output, err := paginator.NextPage(context.TODO())
-		if err != nil {
-			return nil, err
+		if err := ctx.Err(); err != nil {
+			return err
 		}
+		output, err := paginator.NextPage(ctx)
+		if err != nil {
+			return err
+		}
+		objs := make([]*Object, 0, len(output.CommonPrefixes)+len(output.Contents))
 
 		for _, p := range output.CommonPrefixes {
 			if p.Prefix == nil {
@@ -445,15 +548,24 @@ func (m *Model) List(path string, bucket *Object) ([]*Object, error) {
 			}
 			objs = append(objs, ko)
 		}
+		total += len(objs)
+		if onPage != nil && !onPage(objs, total) {
+			return nil
+		}
 	}
-	return objs, nil
+	return nil
 }
 
-func (m *Model) ListBuckets() ([]*Object, error) {
+// ListBuckets returns the endpoint's buckets. ctx may be nil, in which case a
+// generous whole-call bound applies.
+func (m *Model) ListBuckets(ctx context.Context) ([]*Object, error) {
 	// A generous whole-call bound only: hung connections are already cut by the
 	// per-phase transport timeouts, and 5s here used to make profiles unusable
 	// over slow links (high-latency VPNs, huge bucket lists).
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
 	objs := make([]*Object, 0)
@@ -479,18 +591,24 @@ func (m *Model) ListBuckets() ([]*Object, error) {
 	return objs, nil
 }
 
-func (m *Model) Delete(key *string, bucket *Object) error {
+// Delete removes a single key, or every object under a folder prefix. A
+// prefix delete lists recursively first, so it takes the caller's context: a
+// cancelled delete stops rather than paginating a huge prefix to the end.
+func (m *Model) Delete(ctx context.Context, key *string, bucket *Object) error {
 	if bucket == nil || bucket.Key == nil {
 		return fmt.Errorf("bucket is nil")
 	}
 	if key == nil || *key == "" {
 		return fmt.Errorf("key is empty")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	var objectIds []s3t.ObjectIdentifier
 
 	if strings.HasSuffix(*key, "/") {
-		ks, err := m.ListObjects(*key, bucket)
+		ks, err := m.ListObjects(ctx, *key, bucket)
 
 		if err != nil {
 			return err
@@ -505,18 +623,20 @@ func (m *Model) Delete(key *string, bucket *Object) error {
 		objectIds = append(objectIds, s3t.ObjectIdentifier{Key: aws.String(*key)})
 	}
 
-	return m.deleteObjectIDs(bucket, objectIds)
+	return m.deleteObjectIDs(ctx, bucket, objectIds)
 }
 
 // deleteObjectIDs removes the given objects in DeleteObjects batches of 1000
 // (the S3 API maximum), failing on the first per-key error the service reports.
-func (m *Model) deleteObjectIDs(bucket *Object, objectIds []s3t.ObjectIdentifier) error {
+func (m *Model) deleteObjectIDs(ctx context.Context, bucket *Object, objectIds []s3t.ObjectIdentifier) error {
 	if len(objectIds) == 0 {
 		return nil
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	const maxDelete = 1000
-	ctx := context.TODO()
 
 	for i := 0; i < len(objectIds); i += maxDelete {
 		end := i + maxDelete
@@ -548,11 +668,14 @@ func (m *Model) deleteObjectIDs(bucket *Object, objectIds []s3t.ObjectIdentifier
 // has already promised the user exactly this removal. On a versioned bucket
 // this writes delete markers only: old versions survive, and the subsequent
 // DeleteBucket still fails with BucketNotEmpty (see DESIGN.md).
-func (m *Model) EmptyBucket(bucket *Object) error {
+func (m *Model) EmptyBucket(ctx context.Context, bucket *Object) error {
 	if bucket == nil || bucket.Key == nil {
 		return fmt.Errorf("bucket is nil")
 	}
-	objs, err := m.ListObjects("", bucket)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	objs, err := m.ListObjects(ctx, "", bucket)
 	if err != nil {
 		return err
 	}
@@ -562,7 +685,7 @@ func (m *Model) EmptyBucket(bucket *Object) error {
 			ids = append(ids, s3t.ObjectIdentifier{Key: o.Key})
 		}
 	}
-	return m.deleteObjectIDs(bucket, ids)
+	return m.deleteObjectIDs(ctx, bucket, ids)
 }
 
 func (m *Model) DeleteBucket(name *string) error {
@@ -690,10 +813,15 @@ func (m *Model) CreateBucket(name *string, public bool) error {
 }
 
 func (m *Model) CreateFolder(name *string, bucket *Object) error {
-	_, err := m.Client.PutObject(context.TODO(), &s3.PutObjectInput{
+	in := &s3.PutObjectInput{
 		Bucket: aws.String(*bucket.Key),
 		Key:    aws.String(*name),
-	})
+	}
+	// No name to derive a type from — a folder marker is not a file — but a
+	// profile that encrypts everything must encrypt this too, or a bucket
+	// policy requiring SSE rejects the marker and folder creation fails.
+	m.writeOpts().applyPut(in, "")
+	_, err := m.Client.PutObject(context.TODO(), in)
 	return err
 }
 
@@ -879,11 +1007,16 @@ func (m *Model) Upload(
 
 		uploadCtx, cancel := context.WithCancel(ctx)
 
-		_, err = uploader.Upload(uploadCtx, &s3.PutObjectInput{
+		in := &s3.PutObjectInput{
 			Bucket: aws.String(*bucket.Key),
 			Key:    aws.String(s3Key),
 			Body:   reader,
-		})
+		}
+		// Content-Type is derived from the local file (name first, then a
+		// sniff for extensionless ones) rather than left to the server's
+		// octet-stream default; encryption and checksum come from the profile.
+		m.writeOpts().applyPut(in, fpath)
+		_, err = uploader.Upload(uploadCtx, in)
 		fp.Close()
 		cancel() // release per-file context immediately, not at Upload() return
 
@@ -983,12 +1116,15 @@ func (m *Model) MakeBucketPublic(bucketName string) error {
 // ResolveDownloadObjects resolves the objects to be downloaded.
 // If `isFolder` is true, it performs a prefix-based list.
 // If false, returns a single exact match using the key and size.
-func (m *Model) ResolveDownloadObjects(key string, isFolder bool, size *int64, bucket *Object) ([]DownloadTarget, int64, error) {
+func (m *Model) ResolveDownloadObjects(ctx context.Context, key string, isFolder bool, size *int64, bucket *Object) ([]DownloadTarget, int64, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if isFolder {
 		if !strings.HasSuffix(key, "/") {
 			key += "/"
 		}
-		objs, err := m.ListObjects(key, bucket)
+		objs, err := m.ListObjects(ctx, key, bucket)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -1277,7 +1413,7 @@ func (m *Model) copyKeysTracked(
 		return nil, err
 	}
 
-	objs, err := m.ListObjects(src, srcBucket)
+	objs, err := m.ListObjects(ctx, src, srcBucket)
 	if err != nil {
 		return nil, err
 	}
@@ -1334,7 +1470,7 @@ func (m *Model) MoveKeys(
 	for _, k := range copied {
 		ids = append(ids, s3t.ObjectIdentifier{Key: aws.String(k)})
 	}
-	if err := m.deleteObjectIDs(srcBucket, ids); err != nil {
+	if err := m.deleteObjectIDs(ctx, srcBucket, ids); err != nil {
 		return len(copied), fmt.Errorf("copied ok, but failed to delete source: %w", err)
 	}
 	return len(copied), nil

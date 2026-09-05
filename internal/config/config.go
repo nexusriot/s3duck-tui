@@ -7,6 +7,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 )
 
 const (
@@ -43,6 +44,68 @@ type Config struct {
 	MaxBytesPerSec int64 `json:"max_bytes_per_sec,omitempty"`
 	// Bookmarks are saved bucket+prefix locations for this profile.
 	Bookmarks []Bookmark `json:"bookmarks,omitempty"`
+
+	// AWSProfile delegates credentials to the AWS SDK's own resolution chain
+	// for that ~/.aws profile, instead of the static keys above. It is what
+	// makes SSO, assume-role and credential_process profiles usable — and
+	// what keeps their credentials refreshed, which a stored session token
+	// can never be. Empty means "use the keys above".
+	AWSProfile string `json:"aws_profile,omitempty"`
+
+	// ReadOnly blocks every mutating operation for this profile: the guard is
+	// in the controller, so a production profile can be browsed, searched and
+	// downloaded from but not written to or deleted from by accident.
+	ReadOnly bool `json:"read_only,omitempty"`
+
+	// NoMimeDetect switches off Content-Type derivation on upload for buckets
+	// whose types are managed elsewhere. Detection is on by default.
+	NoMimeDetect bool `json:"no_mime_detect,omitempty"`
+	// SSE is the server-side encryption applied to objects this app creates:
+	// "" (bucket default), "AES256" or "aws:kms".
+	SSE string `json:"sse,omitempty"`
+	// SSEKMSKeyID names the CMK for SSE="aws:kms"; empty uses the account default.
+	SSEKMSKeyID string `json:"sse_kms_key_id,omitempty"`
+	// ChecksumAlgo asks S3 to verify an extra checksum on every write
+	// ("CRC32C", "CRC32", "SHA256", "SHA1"). Empty sends none.
+	ChecksumAlgo string `json:"checksum_algo,omitempty"`
+	// VerifyDownloads re-reads each downloaded file and compares it against
+	// the object's checksum (or its ETag, for a single-part object) before
+	// the download counts as a success.
+	VerifyDownloads bool `json:"verify_downloads,omitempty"`
+
+	// Trash makes delete a move into TrashPrefix instead of a removal, for
+	// profiles where an accidental delete is unrecoverable. Undo only ever
+	// covered move/rename; this covers delete.
+	Trash bool `json:"trash,omitempty"`
+	// TrashPrefix is where a trashed object lands. Empty means DefaultTrashPrefix.
+	TrashPrefix string `json:"trash_prefix,omitempty"`
+
+	// LastBucket / LastPrefix are where this profile was last browsing, so
+	// reopening it lands where you left off instead of at the bucket list.
+	LastBucket string `json:"last_bucket,omitempty"`
+	LastPrefix string `json:"last_prefix,omitempty"`
+}
+
+// DefaultTrashPrefix is where safe-delete moves objects when the profile does
+// not name a prefix of its own. The leading dot keeps it out of the way of
+// ordinary listings on backends that hide dot-prefixes, and the name is
+// distinctive enough to grep for.
+const DefaultTrashPrefix = ".s3duck-trash/"
+
+// Trashed reports the trash prefix in force for this profile ("" when safe
+// delete is off), always terminated with a slash so it reads as a folder.
+func (c *Config) Trashed() string {
+	if c == nil || !c.Trash {
+		return ""
+	}
+	p := c.TrashPrefix
+	if p == "" {
+		p = DefaultTrashPrefix
+	}
+	if !strings.HasSuffix(p, "/") {
+		p += "/"
+	}
+	return p
 }
 
 // Bookmark is a saved location within a profile's storage.

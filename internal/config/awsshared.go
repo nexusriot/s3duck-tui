@@ -9,22 +9,42 @@ import (
 )
 
 // AWSProfile is one profile read from the AWS shared credentials/config files.
-// Only the fields s3duck needs are kept; role-assumption and SSO profiles carry
-// no static keys and are reported through Err instead.
+// Only the fields s3duck needs are kept.
 type AWSProfile struct {
 	Name         string
 	AccessKey    string
 	SecretKey    string
 	SessionToken string
 	Region       string
-	// Err explains why a profile can't be imported as-is (e.g. it delegates to
-	// source_profile or sso_session, which s3duck cannot resolve itself).
+	// Delegates names the mechanism a profile without static keys uses to
+	// obtain them ("sso", "role", "credential_process"). Such a profile is
+	// imported as a *delegating* s3duck profile — the SDK resolves it, which
+	// is also what keeps it refreshed — rather than by copying key material
+	// that isn't there.
+	Delegates string
+	// Err explains why a profile carries nothing usable at all.
 	Err string
 }
 
-// Usable reports whether the profile carries credentials s3duck can use.
+// Usable reports whether the profile can be imported: either it carries static
+// keys, or it delegates to a mechanism the SDK can resolve.
 func (p AWSProfile) Usable() bool {
+	if p.Delegates != "" {
+		return true
+	}
 	return p.Err == "" && p.AccessKey != "" && p.SecretKey != ""
+}
+
+// Kind describes the credential source for the import list.
+func (p AWSProfile) Kind() string {
+	switch {
+	case p.Delegates != "":
+		return p.Delegates + ", resolved by the AWS SDK"
+	case p.SessionToken != "":
+		return "temporary credentials"
+	default:
+		return "long-lived key"
+	}
 }
 
 // EndpointURL returns the regional S3 endpoint for the profile's region,
@@ -119,13 +139,17 @@ func ParseAWSProfiles(credentialsData, configData string) []AWSProfile {
 			Region:       kv["region"],
 		}
 		if p.AccessKey == "" || p.SecretKey == "" {
+			// No keys here. These profiles used to be listed with the reason
+			// they could not be imported; they can now be imported as
+			// delegating profiles, since the SDK resolves them (and refreshes
+			// them) on our behalf.
 			switch {
 			case kv["sso_session"] != "" || kv["sso_start_url"] != "":
-				p.Err = "SSO profile: run `aws sso login`, then import the cached credentials"
+				p.Delegates = "sso"
 			case kv["role_arn"] != "":
-				p.Err = "role profile: assume the role first, then import the temporary credentials"
+				p.Delegates = "role"
 			case kv["credential_process"] != "":
-				p.Err = "credential_process profile: not resolvable by s3duck"
+				p.Delegates = "credential_process"
 			default:
 				p.Err = "no aws_access_key_id / aws_secret_access_key"
 			}

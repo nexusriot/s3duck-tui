@@ -63,6 +63,9 @@ func versionsTitle(key string, vs []model.ObjectVersion) string {
 // on an unversioned bucket S3 reports a single "null" version, which is exactly
 // what the list will show rather than pretending the feature is missing.
 func (c *Controller) ShowVersions() {
+	if c.remoteOnly("Version history") {
+		return
+	}
 	_, obj, ok := c.currentObject()
 	if !ok || obj.Ot != model.File {
 		return
@@ -108,7 +111,7 @@ func (c *Controller) presentVersions(bucket *model.Object, key, shortName string
 	}
 
 	help := tview.NewTextView().SetDynamicColors(true).SetText(
-		"  [::b]Enter[::-] restore as latest   [::b]w[::-] download this version   " +
+		"  [::b]Enter[::-] restore as latest   [::b]w[::-] download   [::b]D[::-] diff vs current   " +
 			"[::b]d[::-] delete permanently   [::b]Esc[::-] close")
 
 	selected := func() (model.ObjectVersion, bool) {
@@ -141,6 +144,19 @@ func (c *Controller) presentVersions(bucket *model.Object, key, shortName string
 					c.confirmDeleteVersion(bucket, key, shortName, v)
 				}
 				return nil
+			case 'D':
+				// "What actually changed?" is the question a version list
+				// invites and could not answer: restoring blind was the only
+				// way to find out.
+				if v, ok := selected(); ok {
+					if v.IsDeleteMark {
+						go c.error("Diff", fmt.Errorf("a delete marker has no content to diff"))
+						return nil
+					}
+					c.view.Pages.RemovePage("modal-versions")
+					c.diffVersions(bucket, key, v)
+				}
+				return nil
 			}
 		}
 		return event
@@ -158,6 +174,9 @@ func (c *Controller) presentVersions(bucket *model.Object, key, shortName string
 // the chosen version to the top of the history rather than rewinding, so
 // nothing is lost either way.
 func (c *Controller) confirmRestoreVersion(bucket *model.Object, key, shortName string, v model.ObjectVersion) {
+	if c.readOnlyBlocked("restore a version") {
+		return
+	}
 	if v.IsLatest && !v.IsDeleteMark {
 		go c.error("Restore version", fmt.Errorf("that version is already the latest"))
 		return
@@ -195,6 +214,9 @@ func (c *Controller) confirmRestoreVersion(bucket *model.Object, key, shortName 
 // screen: deleting a version bypasses the delete-marker mechanism and the data
 // is unrecoverable.
 func (c *Controller) confirmDeleteVersion(bucket *model.Object, key, shortName string, v model.ObjectVersion) {
+	if c.readOnlyBlocked("delete a version") {
+		return
+	}
 	what := "version"
 	extra := "\n\n[red]This is permanent — a version delete leaves no delete marker."
 	if v.IsDeleteMark {

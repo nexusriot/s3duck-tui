@@ -66,6 +66,14 @@ func tempSuffix(key string) string {
 // with the Content-Type and user metadata preserved. Guarded by a size cap and
 // a binary sniff — this is for configs and notes, not archives.
 func (c *Controller) EditObject() {
+	if c.remoteOnly("Editing") {
+		return
+	}
+	// Blocked at entry rather than at save: opening an editor whose save can
+	// only be refused is worse than saying so up front.
+	if c.readOnlyBlocked("edit objects") {
+		return
+	}
 	_, obj, ok := c.currentObject()
 	if !ok || obj.Ot != model.File {
 		return
