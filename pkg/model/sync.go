@@ -21,6 +21,21 @@ type SyncEntry struct {
 	Rel  string
 	Size int64
 	Mod  time.Time
+	// Sum is an optional content checksum as "ALGO:VALUE" (e.g.
+	// "CRC32C:Nks/tw=="), filled only when the run asked to compare content.
+	// It is what lets sync notice a file edited in place to the same size
+	// with its mtime preserved — the case size+mtime provably cannot see.
+	// Two sums are only comparable when their algorithms match, hence the
+	// prefix.
+	Sum string
+}
+
+// SumAlgo splits an "ALGO:VALUE" sum into its parts.
+func SumAlgo(sum string) (algo, value string) {
+	if i := strings.Index(sum, ":"); i > 0 {
+		return sum[:i], sum[i+1:]
+	}
+	return "", sum
 }
 
 // WalkLocal lists every regular file under root as a SyncEntry. Directories
@@ -65,9 +80,9 @@ func WalkLocal(root string) ([]SyncEntry, error) {
 // ListRemoteEntries lists the objects under prefix as SyncEntries keyed by the
 // path relative to that prefix. Folder-marker keys (ending in "/") are skipped:
 // they are an encoding of a directory, not a file to transfer.
-func (m *Model) ListRemoteEntries(prefix string, bucket *Object) ([]SyncEntry, error) {
+func (m *Model) ListRemoteEntries(ctx context.Context, prefix string, bucket *Object) ([]SyncEntry, error) {
 	prefix = NormalizePrefix(prefix)
-	objs, err := m.ListObjects(prefix, bucket)
+	objs, err := m.ListObjects(ctx, prefix, bucket)
 	if err != nil {
 		return nil, err
 	}
@@ -135,11 +150,13 @@ func (m *Model) UploadFile(ctx context.Context, localPath, key string, bucket *O
 		limiter: m.Limiter,
 	}
 
-	_, err = uploader.Upload(ctx, &s3.PutObjectInput{
+	in := &s3.PutObjectInput{
 		Bucket: aws.String(*bucket.Key),
 		Key:    aws.String(key),
 		Body:   reader,
-	})
+	}
+	m.writeOpts().applyPut(in, localPath)
+	_, err = uploader.Upload(ctx, in)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return fmt.Errorf("upload canceled for %s", localPath)

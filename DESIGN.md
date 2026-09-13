@@ -19,7 +19,7 @@ pkg/controller          ← app state, keybindings, modal flows, goroutine orche
    └── pkg/utils        ← small helpers (path split, rand string, clipboard)
 ```
 
-`pkg/controller` is intentionally large because the modal flows — profile CRUD, download with overwrite prompts, upload, copy/move, delete, summary — are deeply coupled to tview's callback/page model; splitting them would mean passing around opaque page/modal handles. It is split by feature where a feature is self-contained: `controller.go` (everything above) plus `sync.go` (directory sync), `objectmeta.go` (metadata / tags / storage class / restore) and `versions.go` (version history). Each splits cleanly because its logic is pure or reaches shared state only through existing helpers. `pkg/model` mirrors the shape: `model.go` plus `sync.go`, `object.go` and `versions.go`.
+`pkg/controller` is intentionally large because the modal flows — profile CRUD, download with overwrite prompts, upload, copy/move, delete, summary — are deeply coupled to tview's callback/page model; splitting them would mean passing around opaque page/modal handles. It is split by feature where a feature is self-contained: `controller.go` (everything above) plus `sync.go` (directory sync), `objectmeta.go` (metadata / tags / storage class / restore), `versions.go` (version history), `keymap.go` (bindings as data), `listing.go` (streamed listings), `opresult.go` (the failure ledger), `localpane.go`, `usage.go`, `preview.go`, `match.go`, `guard.go`, `trash.go`, `verify.go`, `notify.go`, `audit.go` and `options.go`. Each splits cleanly because its logic is pure or reaches shared state only through existing helpers. `pkg/model` mirrors the shape: `model.go` plus `sync.go`, `object.go`, `versions.go`, `copy.go`, `content.go`, `conflicts.go`, `write.go`, `checksum.go` and `local.go`.
 
 The tree is `gofmt`-, `go vet`- and `staticcheck`-clean; keep it that way. Controller actions that report exclusively through modals (`Delete`, `Upload`) return nothing rather than an always-nil `error`, so a caller can't be misled into writing a dead error branch.
 
@@ -29,7 +29,7 @@ Two suites, split by what they can actually establish.
 
 **Unit tests** cover the pure functions only — planners, formatters, parsers, comparators — and need no network. This is a deliberate consequence of the architecture: the interesting decisions are pushed into pure helpers (`planSync`, `deleteConfirmText`, `filterSortObjects`, `ParseRestoreStatus`, `ParseAWSProfiles`) precisely so they can be tested without a server or a terminal. The UI layer has no seam and is not unit-tested.
 
-**Integration tests** (`pkg/model/integration_test.go`, build tag `integration`) run against a live S3-compatible endpoint. They exist because the most important properties of this package are unobservable without one:
+**Integration tests** (`pkg/model/integration_test.go` and `integration_new_test.go`, build tag `integration`) run against a live S3-compatible endpoint. They exist because the most important properties of this package are unobservable without one:
 
 - a version restore *adds* a version rather than rewinding the history
 - a `DeleteVersion` leaves no delete marker, while an ordinary delete does
@@ -37,8 +37,15 @@ Two suites, split by what they can actually establish.
 - a storage-class change preserves metadata (`MetadataDirective` stays at COPY)
 - `DeleteKey` refuses a prefix-like key **and removes nothing**
 - the session token actually reaches the wire — a bogus one is rejected while the same credentials without one succeed, which is the only way to verify that fix short of real STS
+- an uploaded object's stored `Content-Type` is the derived one (and an unrecognisable body keeps the server's default) — the client can only prove what it *sent*
+- a requested checksum is really stored, a locally computed one matches it, and a tampered local file is detected — plus the ETag fallback for a single-part object
+- a ranged read returns exactly the requested window, and asking for more than the object holds returns the object rather than an error
+- `GetVersionContent` reaches a specific old version, which is what the diff needs
+- `ListObjectsStream` pages incrementally, stops when the callback says so, and reports a cancelled context instead of running to the end
 
-They skip entirely without `S3DUCK_TEST_ENDPOINT`, so a tagged run on a machine with no server is a no-op rather than a failure. `make test-integration` brings up a throwaway MinIO in Docker and tears it down again.
+They skip entirely without `S3DUCK_TEST_ENDPOINT`, so a tagged run on a machine with no server is a no-op rather than a failure. `make test-integration` brings up a throwaway MinIO in Docker and tears it down again. Individual tests skip themselves when the endpoint lacks the feature (SSE-S3 needs a KMS MinIO does not configure by default, versioning may be unsupported) rather than failing against a legitimate backend.
+
+**What neither suite covers** is the terminal: there is no seam between the controller and tview, so the wiring — a keypress reaching the right action, a modal appearing, a title rendering — is only observable by driving the real binary. That is worth doing by hand (or from a pty harness) after touching input or overlays: it is how a pane title reading `[local]` was caught being swallowed as a tview colour tag, which no unit test could see because the string was correct.
 
 Because the tag hides them from `go build ./...`, CI runs `go vet -tags integration ./...` in the fast job as well, so they cannot silently stop compiling between integration runs.
 
@@ -54,13 +61,16 @@ CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) is three jobs: lint+un
 |---|---|---|
 | **UI goroutine** | tview event loop, all input handlers, `SetChangedFunc` / `AddItem` callbacks | The only goroutine allowed to mutate tview widgets directly |
 | **Network goroutines** | `ListBuckets`, `List`, `GetBucketLocation`, upload, download, delete, copy/move, summary | Spawned by controller; results returned to the UI goroutine via `App.QueueUpdateDraw` |
-| **Refresh goroutine** | `updateList()` — fetches the object map, then queues a redraw | Serialised by `refreshMu`; at most one active at a time |
+| **Refresh goroutine** | `updateList()` — fetches the object map page by page, then queues a redraw | Serialised by `refreshMu`; at most one active at a time, and cancellable through `listingState` |
+| **Status ticker** | `runStatusTicker()` — recomputes the header's transfer badge / notice | One for the app's lifetime; queues a redraw *only* when the text changed, so an idle app costs a string compare |
 
 ### Mutexes
 
 | Mutex | Protects |
 |---|---|
-| `Controller.mu` | `objs` (the displayed object map), `selectedByScope` (multi-select state), `filter`, and `sortBy`/`sortDesc`. All are read on the UI goroutine (input handlers, list callbacks) and written by background refresh/download/upload goroutines. |
+| `Controller.mu` | `objs` (the displayed object map), `selectedByScope` (multi-select state), `filter`, `partial` (the listing-was-incomplete flag) and `sortBy`/`sortDesc`. All are read on the UI goroutine (input handlers, list callbacks) and written by background refresh/download/upload goroutines. |
+| `Controller.jobsMu` | The transfer-job list *and* the header notice (`notice`/`noticeUntil`), which the status ticker reads and `announceJob` writes from transfer goroutines. |
+| `listingState.mu` | The in-flight listing's cancel function, so Esc can cancel a listing started by another goroutine. |
 | `Controller.refreshMu` | Serialises `updateList()` so overlapping refreshes can't race on the object map or stack redundant network calls. |
 | `downloadSummary` per-download `sumMu` | All per-download mutable state inside the download goroutine: the summary counters, `activeProgress` map, `completedBytes`, throttle timestamp. |
 
@@ -70,7 +80,7 @@ Any code that modifies a tview widget **must** run on the UI goroutine. Backgrou
 
 The mirror-image rule bites more often: **`c.error` and `c.success` are themselves built on `QueueUpdateDraw`, so they must NOT be called inline from the UI goroutine** — from a button handler, a form callback, or a list's selected-func. Doing so blocks the event loop waiting on itself and freezes the app (this is exactly the `Upload()`-on-an-empty-directory bug, and — found in the 2026-08-11 review — the filter box's `SetChangedFunc` calling `renderList` inline, which froze the app on the first keystroke ever typed into the filter). Anything a widget event handler invokes synchronously must not block on `QueueUpdateDraw`. From UI-goroutine code call them as `go c.error(...)` / `go c.success(...)`; from a background goroutine call them directly. `c.chooseDir` is the same trap from the other side: it invokes its `onChosen` callback *on* the UI goroutine, so callers must update widgets directly there rather than wrapping them in `QueueUpdateDraw`.
 
-**Page names.** `Pages.AddPage` with an existing name *replaces* the old page, so the transient toasts live on their own page (`"modal-msg"`) — when they shared `"modal"` with the long-lived forms, any asynchronous error or success (a failed background transfer, a late refresh, a rename completing) silently destroyed whatever form the user was typing into. The directory picker has its own page too (`"modal-dir"`), which lets it *overlay* the sync form instead of replacing it. Two more captured invariants: transfer flows capture `c.model` at entry alongside bucket/path (a profile switch swaps `c.model`, and a queued transfer reading it lazily would run against the wrong account — `CheckProfile` now verifies with a throwaway client for the same reason), and `Duck` clears the clipboard and the one-step undo (both carry bucket/key names that would otherwise be replayed against a same-named bucket on the new endpoint).
+**Page names.** The overlays each own a name: `"modal"` (long-lived forms), `"modal-msg"` (transient toasts), `"modal-dir"` (the directory picker, which must *overlay* the sync form), `"progress"` (wait/progress modals), `"searching"`, `"modal-help"`, `"modal-about"`, `"modal-palette"`, `"modal-transfers"`, `"modal-activity"`, `"modal-versions"`, `"modal-dups"`, `"modal-usage"`, `"modal-preview"` and `"modal-diff"`. `Pages.AddPage` with an existing name *replaces* the old page, so the transient toasts live on their own page (`"modal-msg"`) — when they shared `"modal"` with the long-lived forms, any asynchronous error or success (a failed background transfer, a late refresh, a rename completing) silently destroyed whatever form the user was typing into. The directory picker has its own page too (`"modal-dir"`), which lets it *overlay* the sync form instead of replacing it. Two more captured invariants: transfer flows capture `c.model` at entry alongside bucket/path (a profile switch swaps `c.model`, and a queued transfer reading it lazily would run against the wrong account — `CheckProfile` now verifies with a throwaway client for the same reason), and `Duck` clears the clipboard and the one-step undo (both carry bucket/key names that would otherwise be replayed against a same-named bucket on the new endpoint).
 
 ---
 
@@ -106,6 +116,7 @@ for each ri in toDownload:
         defer wg.Done(); defer <-sem
         track in activeProgress
         DownloadTarget(ctx, ri, ...)
+        if profile verifies: compare the file against the object's checksum
         update sum, completedBytes, completedCount
 wg.Wait()
 showSummary()
@@ -115,6 +126,16 @@ Cancellation flow:
 1. User clicks Cancel → tview `SetDoneFunc` fires → `cancel()` called → ctx cancelled
 2. Next semaphore `select` picks `<-ctx.Done()`, sets `canceled = true`, breaks loop
 3. Running workers see `ctx.Err() != nil` after `DownloadTarget` returns; `DownloadTarget` itself cancels the S3 download and removes its temp file (the target file — old content included — is never touched by a canceled transfer)
+
+A worker's last step, when the profile asks for it, is the **post-transfer
+verify**: the file on disk is re-read and compared against the object's
+checksum (or its single-part ETag). A mismatch is counted as a *failure*, not
+a success — a silently corrupt local file is the worst of the three possible
+outcomes — while an object that cannot be compared at all (multipart, no
+additional checksum) is counted separately and disclosed as "not verifiable"
+rather than being quietly called verified. The setting is read once, on the UI
+goroutine, and carried into the transfer: a profile switch mid-download must
+not change the rules a running transfer is playing by.
 4. `wg.Wait()` drains workers; `showSummary()` shows the final report
 
 ### Progress display (parallel)
@@ -139,18 +160,18 @@ file1.txt  report.zip
 
 `updateList()` and `renderList()` are split so the list can re-render without hitting the network:
 
-- **`updateList()`** — takes `refreshMu`, calls `makeObjectMap()` (network `List` / `ListBuckets`), then `renderList()`. Use it whenever the object set changes (navigation, delete, upload, rename, copy/move).
+- **`updateList()`** — takes `refreshMu`, calls `makeObjectMap()` (network `ListStream` / `ListBuckets`, page by page with a live count and a cancellable context — see *Streamed, cancellable listings*), then `renderList()`. Use it whenever the object set changes (navigation, delete, upload, rename, copy/move). For a local pane it reads one directory instead (`makeLocalObjectMap`), which needs no pagination and no cancellation.
 - **`renderList()`** — pure re-render from the in-memory `objs` map: applies the active filter and the active sort (`filterSortObjects`, see *Listing order* below), then rebuilds the list widget inside a single `QueueUpdateDraw`. No network. Cheap enough to call on every keystroke.
 
 Selection toggles (`ToggleSelectCurrent`, `SelectAllVisible`, `ClearSelection`), the live filter and the sort keys call `renderList()` directly, avoiding a redundant `List` round-trip on every Space / `/` / `s` press. `Refresh` (`r`/F5) is the one binding that deliberately goes back to the network via `updateList()`. All cursor/list reads now happen **inside** the `QueueUpdateDraw` closure on the UI goroutine (this also removed the earlier off-goroutine read of list state).
 
 ## In-listing filter
 
-A persistent one-line `InputField` sits under the list (`view.Filter`). `/` focuses it; typing sets `c.filter` (guarded by `mu`) through `SetChangedFunc` and re-renders live; Enter keeps the filter and returns focus to the list; Esc clears it. Matching is a case-insensitive substring test on the object's short display name. The filter is reset on every navigation (`Down` / `Up` / `Profiles`) so it never leaks across folders. `filterSuppress` stops the change handler from re-rendering when the field is cleared programmatically (`SetText` fires `SetChangedFunc` inline on the UI goroutine).
+A persistent one-line `InputField` sits under the list (`view.Filter`). `/` focuses it; typing sets `c.filter` (guarded by `mu`) through `SetChangedFunc` and re-renders live; Enter keeps the filter and returns focus to the list; Esc clears it. Matching goes through the shared matcher (see *Query syntax* below): plain text is a case-insensitive substring of the object's short display name, `*.log` is a glob, `re:` is a regex, and the mode in force is named in the pane title. The filter is reset on every navigation (`Down` / `Up` / `Profiles`) so it never leaks across folders. `filterSuppress` stops the change handler from re-rendering when the field is cleared programmatically (`SetText` fires `SetChangedFunc` inline on the UI goroutine).
 
 ## Recursive search
 
-Ctrl+F prompts for a query, then lists the current prefix recursively (`ListObjects`, no delimiter) on a background goroutine behind a "Searching…" modal. `computeHits` filters keys by case-insensitive substring (skipping folder-marker keys) and caps results at `searchMaxResults` (1000), flagging truncation in the results title. Enter on a result calls `revealKey`: it clears any active filter, sets `currentPath` to the hit's `parentPrefix`, sets `restoreNext` to the full key, and calls `updateList()` — so the browser lands in the containing folder with the object highlighted.
+Ctrl+F prompts for a query, then walks the current prefix recursively (`ListObjectsStream`, no delimiter) on a background goroutine behind a cancellable "Searching…" modal that reports "scanned N keys, M match(es)". Matching is the shared matcher (text / glob / `re:`), applied **page by page** rather than to one accumulated slice: an all-buckets scan can page through millions of keys, and holding them all only to discard nearly all of them cost memory proportional to the account rather than to the result set. A malformed regex is refused up front here (unlike the live filter, a search is a deliberate one-shot request, and an empty result set would read as "no matches"). Results are capped at `searchMaxResults` (1000), and a cancelled scan reports what it found so far, flagged as truncated. `computeHits` remains the pure, testable form of the same filter. Enter on a result calls `revealKey`: it clears any active filter, sets `currentPath` to the hit's `parentPrefix`, sets `restoreNext` to the full key, and calls `updateList()` — so the browser lands in the containing folder with the object highlighted.
 
 ## Dual-pane (state-swap)
 
@@ -169,12 +190,15 @@ The two-pane (Midnight Commander) layout is implemented by **state-swap** rather
 
 - **Bookmarks** live in `Config.Bookmarks` per profile; `jumpTo(bucket, prefix)` navigates like `Down`. `addBookmark` dedups by bucket+prefix.
 - **History** is a per-pane `histStack` (back/forward). `recordHistory` runs at the start of each user navigation (`Down`/`Up`/`jumpTo`/`revealKey`); `HistoryBack`/`HistoryForward` drive `navigateTo`, which does *not* record (so it doesn't corrupt the stacks).
-- **Command palette** filters a static `paletteActions` registry with a case-insensitive subsequence match (`filterActions`); the chosen action runs on the active pane.
+- **Command palette** filters the `paletteActions` registry with a case-insensitive subsequence match (`filterActions`); the chosen action runs on the active pane. The registry is rebuilt per invocation rather than being a package-level table, so an entry whose wording depends on state can say which way it will go (the local-pane toggle labels itself *open* or *close*).
 - **Batch rename** resolves marked items through the pure `planBatchRename` (which applies `applyRenamePattern` and rejects `/`, duplicates, and targets that would clobber another selected item's source), then runs `MoveKeys` per item behind a progress modal.
 
 ## Background transfer queue
 
 Download/upload progress used to live in a blocking modal. Now each transfer is a `transferJob` (id/kind/desc/status/total/done/counts, its own `cancel`, guarded by a per-job mutex). The progress modal gains a **Background** button: pressing it sets `job.bg` and removes the modal, so the transfer keeps running headless while you browse; `showProgress`/the upload callback update the job always and the modal only when `!job.isBackgrounded()`. The transfers panel (`t`) is a `tview.List` re-rendered by a 300 ms ticker from `jobSnapshot()`; `d`/Del cancels the selected job's context, `c` clears finished. `transferRow` is pure (takes `elapsed`) for testing.
+
+A finished job is announced rather than left to be discovered — see
+*Background transfer notices*.
 
 Concurrency: **download overwrite resolution stays foreground** (the interactive `askOverwrite` loop in Download's Phase 1), then a `jobSem` (buffered chan, cap 2) gates the byte-transfer phase so at most two transfers push bytes at once; aggregate bandwidth is still capped by `model.Limiter`. Trade-off: two downloads started while one is mid-Phase-1 could show overlapping overwrite modals (minor, not data loss).
 
@@ -182,7 +206,7 @@ Concurrency: **download overwrite resolution stays foreground** (the interactive
 
 - **Clipboard** (`clip`): `y`/`x` fill it (copy/cut) from the marked/highlighted set via pure `clipItems`; `p` pastes into the current location. `runCopyOrMove` was generalized to take an explicit `srcBucket` so paste works from the clipboard's origin bucket (cross-bucket).
 - **Undo** (`lastUndo`, guarded by `undoMu`): the move path (`runCopyOrMove` when `isMove`, incl. paste-cut) and rename paths record the successful moves; pure `invertOps` swaps src/dst so re-applying reverses them. One-step; `u` confirms then runs the reverse `MoveKeys`. Copy/delete are not undoable.
-- **Activity log**: a capped ring buffer (`appendCapped`, pure) of timestamped entries written by `logActivity` from transfer/copy/move/rename/abort/undo paths; shown newest-first via the palette.
+- **Activity log**: a capped ring buffer (`appendCapped`, pure) of timestamped entries written by `logActivity` from transfer/copy/move/rename/abort/undo paths; shown newest-first via the palette, and simultaneously appended to a file (see *Persistent activity log and session restore*).
 
 ## Listing columns
 
@@ -202,7 +226,7 @@ The header line is a `TextView` above each pane's list. Its indent is derived at
 
 `Delete` resolves its targets the same way copy/move/rename do — the marked set, falling back to the highlighted item — so the destructive operation is no longer the odd one out that ignored multi-select. Buckets are still single-target (they can't be marked; selection scope only exists inside a bucket).
 
-Because a folder target is a prefix delete, the confirmation must state its cost: a scan goroutine runs `ListObjects` per folder/bucket target, filling in `objects`/`bytes`, behind a "Calculating…" modal. `deleteConfirmText` (pure) renders the totals and names up to 6 targets. A target whose scan failed is counted separately and disclosed — the totals are never silently short. `runDelete` then deletes sequentially behind a progress modal, collecting failures instead of aborting, and drops each deleted name from the selection set as it goes. A bucket target is emptied first (`EmptyBucket`) — S3 only deletes empty buckets, and the confirm has already promised the objects go; on a *versioned* bucket old versions survive and the bucket delete still fails (see the limitations table).
+Because a folder target is a prefix delete, the confirmation must state its cost: a scan goroutine runs `ListObjects` per folder/bucket target, filling in `objects`/`bytes`, behind a "Calculating…" modal. `deleteConfirmText` (pure) renders the totals and names up to 6 targets. A target whose scan failed is counted separately and disclosed — the totals are never silently short. `runDelete` then deletes sequentially behind a **cancellable** progress modal (a folder delete lists recursively before it removes anything, so it is long enough to want out of; cancelling stops before the next target and reports what already went), collecting failures into an `opResult` instead of aborting — so the report can offer *Retry failed* — and drops each deleted name from the selection set as it goes. A bucket target is emptied first (`EmptyBucket`) — S3 only deletes empty buckets, and the confirm has already promised the objects go; on a *versioned* bucket old versions survive and the bucket delete still fails (see the limitations table). When the profile enables safe delete, each non-bucket target is diverted through `trashTarget` instead of being removed (see *Trash*).
 
 ## Overwrite confirmation for remote writes
 
@@ -260,6 +284,12 @@ The check is a snapshot, not a lock. An object that appears at the destination
 between the scan and the write is still overwritten silently — S3 offers no
 transaction to close that window, and the download flow has always had the same
 gap.
+
+Restoring from the trash goes through it too, and has to: a restore writes
+back to the key the object was deleted from, which is exactly the key most
+likely to have been written again since. Declining leaves that item in the
+trash — `MoveKeys` deletes only what it copied — and the report counts it as
+skipped rather than restored.
 
 Two paths deliberately stay unprompted: **sync**, whose mandatory dry-run plan
 already lists every update before anything moves, and **undo**, which has its
@@ -323,17 +353,17 @@ carries a `-<partcount>` suffix that a single `CopyObject` could never produce.
 
 ## Credentials
 
-`model.Config.SessionToken` feeds `credentials.NewStaticCredentialsProvider`'s third argument, which was previously hard-coded to `""` — that omission made every form of temporary credential (assume-role, SSO, MFA) unusable regardless of what the user pasted into the profile form.
+`model.Config.SessionToken` feeds `credentials.NewStaticCredentialsProvider`'s third argument, which was previously hard-coded to `""` — that omission made every form of temporary credential (assume-role, SSO, MFA) unusable regardless of what the user pasted into the profile form. Static keys are only one of the two credential paths now; the other, and the better answer for anything temporary, is *Credentials, delegated* below.
 
-`internal/config/awsshared.go` reads `~/.aws/credentials` and `~/.aws/config` (honoring `AWS_SHARED_CREDENTIALS_FILE` / `AWS_CONFIG_FILE`) with a small pure INI parser rather than the SDK's shared-config loader, so the profile list, the merge precedence (credentials file wins) and the `[profile x]` vs `[x]` section naming are all directly testable. Profiles that delegate rather than carry keys (`sso_session`, `role_arn`, `credential_process`) are **listed with the reason they can't be imported** instead of being dropped, so the import dialog explains itself. `Ctrl+I` on the profiles screen imports the selected one as `aws-<name>`, de-duplicated by `uniqueProfileName`.
+`internal/config/awsshared.go` reads `~/.aws/credentials` and `~/.aws/config` (honoring `AWS_SHARED_CREDENTIALS_FILE` / `AWS_CONFIG_FILE`) with a small pure INI parser rather than the SDK's shared-config loader, so the profile list, the merge precedence (credentials file wins) and the `[profile x]` vs `[x]` section naming are all directly testable. Profiles that delegate rather than carry keys (`sso_session`, `role_arn`, `credential_process`) are recognised by `AWSProfile.Delegates` and imported as **delegating** s3duck profiles — the SDK resolves them on every use, which is also what keeps them refreshed (see *Credentials, delegated* below). Only a profile with neither keys nor a delegation mechanism is listed with the reason it cannot be imported. `Ctrl+I` on the profiles screen imports the selected one as `aws-<name>`, de-duplicated by `uniqueProfileName`.
 
 ## Sync
 
 `Sync` (Ctrl+E) mirrors a local directory against the current bucket+prefix in either direction. It is the only operation that can both overwrite and delete, so the flow is always **scan → dry-run plan → explicit Apply**; there is no way to run it unreviewed.
 
 - **Spec.** A run is described by one `syncSpec` (direction + local dir + source and destination bucket/prefix). Introducing it replaced a growing parameter list: the local↔remote flows only ever needed one bucket, but a remote↔remote run needs two, and threading both through every function is where mistakes would have lived. `collectSides` is the single place that knows which side comes from where.
-- **Collect.** `model.WalkLocal` walks the local root into `SyncEntry{Rel, Size, Mod}` (regular files only — a directory has no counterpart to compare against); `model.ListRemoteEntries` does the same from a paginated `ListObjects`, skipping folder-marker keys. Both sides key on a slash-separated path relative to their root, so they compare directly.
-- **Plan.** `planSync(src, dst, del)` is pure. A file transfers when it is missing at the destination, when the sizes differ, or when the sizes match but the source is newer by more than `syncModTolerance` (2s, absorbing clock skew and coarse filesystem/S3 timestamp granularity). A zero timestamp on either side degrades to a size-only comparison rather than forcing a transfer. Deletes are emitted **only** when the flag is set. Output is ordered creates → updates → deletes, each group by path, so the plan is deterministic and reviewable.
+- **Collect.** `model.WalkLocal` walks the local root into `SyncEntry{Rel, Size, Mod}` (regular files only — a directory has no counterpart to compare against); `model.ListRemoteEntries` does the same from a paginated `ListObjects`, skipping folder-marker keys. Both sides key on a slash-separated path relative to their root, so they compare directly. `collectSides` then applies the run's **exclude patterns** (`applyExcludes`, matcher syntax) *before* anything else looks at the entries — an excluded path is invisible to the planner, so a delete-extraneous run cannot decide it is extraneous — and, when asked, fills each side's `Sum` for the paths present on both (`fillSums`).
+- **Plan.** `planSync(src, dst, del)` is pure. When both sides carry a checksum with the same algorithm, that decides it: equal sums mean no transfer whatever the timestamps say, different sums mean a transfer whatever the sizes say. Otherwise a file transfers when it is missing at the destination, when the sizes differ, or when the sizes match but the source is newer by more than `syncModTolerance` (2s, absorbing clock skew and coarse filesystem/S3 timestamp granularity). A zero timestamp on either side degrades to a size-only comparison rather than forcing a transfer. Deletes are emitted **only** when the flag is set. Output is ordered creates → updates → deletes, each group by path, so the plan is deterministic and reviewable.
 - **Apply.** `runSync` reuses the transfer-job machinery (`addJob`/`jobSem`/`finalizeJob`), so a sync is cancellable and backgroundable like any other transfer and honors the bandwidth limiter. Operations run through a **4-worker pool** (`syncWorkerCount`, never more workers than work), in two phases from the pure `splitSyncPhases`: every write completes before any delete starts, so a run that is cancelled partway leaves the destination having *gained* the new files but not yet *lost* the old ones — the safer intermediate state. Within a phase the operations are independent by construction (a path is either present at the source or not), so they interleave freely. Shared counters and the throttled redraw sit behind one mutex, and per-file byte counts are tracked in an `inFlight` map keyed by plan index so the displayed total stays correct with several transfers in progress. Per-op work goes through `model.UploadFile` (upload to an explicit key — `Model.Upload` derives keys from a directory walk and can't target one), `model.DownloadTarget`, `model.DeleteKey`, or `os.Remove`. Failures are collected, not fatal: one unreadable file doesn't strand the rest.
 - **Remote → remote.** The planner never knew which side was local — it diffs two `[]SyncEntry` — so the third direction needed only a second `ListRemoteEntries` call and one branch in `applySyncOp`, which issues a server-side `CopyObject` instead of an upload. Two consequences worth knowing: a server-side copy moves no bytes through this process, so there is **no byte progress** for a remote→remote run (the op counter is the only thing that advances); and it inherits the same-endpoint constraint documented below, since both sides go through one client.
 - **Safety.** Deletes are skipped entirely when any write failed — a partly-written destination is not the mirror the reviewed plan assumed, so removals are no longer covered by the user's approval. A remote→remote run between overlapping prefixes of the same bucket is rejected up front (`prefixesOverlap`): the source listing would include the destination, so src-inside-dst with delete-extraneous would delete the physical source objects, and dst-inside-src re-nests one level per run (`mirror/mirror/…`). `DeleteKey` refuses any key ending in `/`, so a sync delete can never degrade into `Delete`'s recursive prefix removal. For files the reviewed plan marked as updates, the download op passes `overwrite=true` and `DownloadTarget` swaps the file atomically (temp + rename) once the body is fully on disk — it used to pre-remove the stale copy, which destroyed the local file even when the transfer then failed. `WalkLocal` follows a symlinked root (`walkFollowingRoot`): `filepath.Walk` lstats its root, so a symlinked directory used to produce an *empty listing with a nil error* — precisely the partial-listing-taken-as-truth case the doc comment promises can't happen, and with delete-extraneous set it planned deleting the entire destination.
@@ -352,11 +382,11 @@ Both forms are read back with `GetFormItemByLabel` and the exported `view.Field*
 
 `ListVersions` gives one object's history. `ListObjectVersions` is **prefix**-based, so it also returns every key that merely starts with this one; the exact-key filter is what turns it into a per-object history (verified: a sibling `doc.txt.bak` does not leak into `doc.txt`'s history). Pagination is followed to the end, since a heavily-rewritten object easily exceeds a page. Delete markers are listed alongside real versions rather than filtered out — the marker *is* what makes an object look deleted, and removing it is how you undo that.
 
-`RestoreVersion` copies the chosen version to the top of the history rather than rewinding, which is the only non-destructive way to go back in a versioned bucket; the e2e run confirms the history grows from 3 entries to 4. `DeleteVersion` is the one genuinely destructive action here — it removes the data outright and leaves no delete marker — so it is behind an explicit confirmation that says so. Downloads are saved as `name.<8-char-version>.ext` so several versions can coexist in one directory.
+`RestoreVersion` copies the chosen version to the top of the history rather than rewinding, which is the only non-destructive way to go back in a versioned bucket; the e2e run confirms the history grows from 3 entries to 4. `DeleteVersion` is the one genuinely destructive action here — it removes the data outright and leaves no delete marker — so it is behind an explicit confirmation that says so. Downloads are saved as `name.<8-char-version>.ext` so several versions can coexist in one directory. `D` diffs the selected version against the current one (`GetVersionContent` for both bodies, then `unifiedDiff`); a delete marker has no body and is refused rather than diffed.
 
 ## Duplicate finder
 
-`D` lists the current prefix recursively and groups objects by **(size, ETag)** — the strongest content signal S3 offers without downloading. For single-part uploads the ETag is the body's MD5, so a match means identical content; multipart ETags depend on the part split, so identical files uploaded differently won't group — a missed duplicate, never a false positive (and size is the second factor guarding against multipart-ETag collisions). The help line discloses this. ETag quotes are normalized because some backends omit them.
+`D` lists the current prefix recursively and groups objects by **(size, ETag)** — the strongest content signal S3 offers without downloading. For single-part uploads the ETag is the body's MD5, so a match means identical content; multipart ETags depend on the part split, so identical files uploaded differently won't group — a missed duplicate, never a false positive (and size is the second factor guarding against multipart-ETag collisions). The help line discloses this. `ObjectChecksum` (see *Integrity*) is what would close that blind spot; doing it costs one request per candidate, so it is on the roadmap as an opt-in deep scan rather than folded into the default grouping. ETag quotes are normalized because some backends omit them.
 
 `findDuplicates` is pure: groups sort by wasted bytes descending (the first group frees the most), members oldest-first — the oldest copy is the likeliest original and is marked `*`, making everything after it a natural deletion candidate. The browser is two `tview.List` views on one page (`modal-dups`): groups → members, with Enter revealing a copy via `revealKey` and `d` deleting it behind a confirm. Deleting updates the group through the pure `dropDupMember`, which also answers the question the view must not get wrong: after a dissolve, the same index denotes the *next* group, so only an explicit "did this group survive" result prevents teleporting the user into an unrelated group's members with the same `d`-to-delete binding. The surgery runs on the UI goroutine (the member list stays live during the network delete, and its handlers read the same slice), only the `DeleteKey` round-trip happens in the goroutine. The scan's bucket, prefix and client are captured at entry, per the transfer-capture rule.
 
@@ -386,6 +416,8 @@ Multi-select state is keyed by `bucket:path` so selections survive navigation in
 selectedByScope["my-bucket:photos/2024/"] = {"vacation.jpg": true, "trip.mp4": true}
 ```
 
+A local pane keys its own scope as `local:<directory>` (`localPaneScope`): sharing the empty scope with the buckets screen would leak marks between the two.
+
 `mu` guards `selectedByScope` because selections are read by input handlers (UI goroutine) and cleared by post-download/move cleanup (network goroutines).
 
 ---
@@ -396,7 +428,7 @@ selectedByScope["my-bucket:photos/2024/"] = {"vacation.jpg": true, "trip.mp4": t
 - **Buckets**: `*o.Key` (the bucket name)
 - **Files / Folders**: `*o.FullPath` (the full S3 prefix, e.g. `photos/2024/vacation.jpg`)
 
-Using `FullPath` avoids collisions between a file `"x"` and a folder `"x/"` at the same prefix level.
+Using `FullPath` avoids collisions between a file `"x"` and a folder `"x/"` at the same prefix level. A **local** pane's entries reuse the same struct with `FullPath` set to the absolute filesystem path — directories keeping a trailing separator — so the same rule holds there and every selection, filter and column path works unchanged.
 
 ---
 
@@ -411,13 +443,43 @@ Profiles are stored in `~/.config/s3duck-tui/config.json` (mode `0600`), created
   "region":       "us-east-1",
   "access_key":   "AKIA...",
   "secret_key":   "plaintext — file is 0600 but not encrypted",
-  "session_token": "plaintext, optional — temporary credentials only",
+  "session_token": "plaintext, optional — static temporary credentials only",
   "ignore_ssl":   false,
-  "download_dir": "~/Downloads/s3"
+  "download_dir": "~/Downloads/s3",
+  "max_bytes_per_sec": 0,
+  "bookmarks":    [{"name": "photos/2024/", "bucket": "photos", "prefix": "2024/"}],
+
+  "aws_profile":      "sso-dev",
+  "read_only":        false,
+  "no_mime_detect":   false,
+  "sse":              "",
+  "sse_kms_key_id":   "",
+  "checksum_algo":    "CRC32C",
+  "verify_downloads": true,
+  "trash":            false,
+  "trash_prefix":     "",
+  "last_bucket":      "reports",
+  "last_prefix":      "2026/"
 }
 ```
 
-`secret_key` and `session_token` are stored in plaintext. The file has `0600` permissions (owner-readable only), but there is no OS-keychain integration. Future work: `github.com/zalando/go-keyring`.
+The second group is edited on its own form (`o` on the profiles screen) rather
+than on the connection form: tview's `Form` does not scroll, and the
+connection form is already as tall as a small terminal can show. Splitting by
+*kind* — how to reach the storage, versus how this app should behave against
+it — also keeps each form readable. Every field is optional and omitted when
+unset, so a config file written by an older build loads unchanged; note that
+`no_mime_detect` is stored inverted for exactly that reason, so an existing
+profile gets content-type derivation *on* rather than off.
+
+`secret_key` and `session_token` are stored in plaintext. The file has `0600` permissions (owner-readable only), but there is no OS-keychain integration. Future work: `github.com/zalando/go-keyring` — less pressing now that `aws_profile` stores no key material at all, though still the answer for a static MinIO key.
+
+Two more files sit beside it, both optional:
+
+| Path | Written by | Purpose |
+|---|---|---|
+| `~/.config/s3duck-tui/keys.json` | the user | Rebinds any action; see *Keymap*. Never written by the app. |
+| `$XDG_STATE_HOME/s3duck-tui/activity.log` | the app | Append-only operation log, mode 0600, rotated once at 2 MiB; see *Persistent activity log*. |
 
 ---
 
@@ -468,7 +530,10 @@ and one `Frame` header/footer row on each side). tview's `Application` exposes
 no size getter in this version, hence the hook rather than a direct query.
 
 The hotkey panel is then a `Flex` of the scrolling `TextView` plus a one-line
-footer, sized `lines + 3` and clamped. Word wrap is **off** inside it: the text
+footer, sized `lines + 3` and clamped. Its *body* for the browser screen is
+generated from the live keymap (`keymap.helpLines()`), so the panel describes
+the keys as bound rather than as once written down; the profiles screen keeps
+its static list, whose keys are not configurable. Word wrap is **off** inside it: the text
 is written to fit the panel width, and wrapping a two-column key/description
 list only ever folded descriptions back to column zero. The footer is drawn
 straight to the screen with `tview.Print` from a `SetDrawFunc`, because it
@@ -484,6 +549,330 @@ arithmetic are pure, and the panel itself is rendered onto a `tcell`
 SimulationScreen at 80x24 and driven with real key events, which is what pins
 "the tail is reachable" rather than "the constructor was called correctly".
 
+## Content type, encryption and checksums on write (`model/write.go`)
+
+Everything this app creates used to be born `application/octet-stream`:
+neither `Upload` nor `UploadFile` set `ContentType`, and the s3manager
+uploader does not sniff one. Every *other* path is meticulous about carrying
+the header around — `CopyObject` inherits it, the multipart copy re-applies
+it, `CrossCopy` forwards it, `PutBytes` preserves it — so the only place a
+wrong type could enter was the one place an object is first written. The
+symptom is invisible until something serves the bucket over HTTP, and the only
+remedy (the metadata editor) costs a full server-side copy per object.
+
+`WriteOptions` now travels on the `Model` (built from the profile by
+`modelConfigFor`, the single place a stored profile becomes a connection) and
+is applied at every creation point: both upload paths, `PutBytes`, folder
+markers, the multipart-copy `CreateMultipartUpload`, and the destination side
+of a cross-profile copy. It decides three things — the derived Content-Type,
+the server-side encryption, and the additional checksum.
+
+- **The MIME table is explicit before it is systemic.** `mimeTable` is
+  consulted before `mime.TypeByExtension`, because that function reads
+  `/etc/mime.types`: absent in a scratch container, and different between
+  distributions, which would make an object's type depend on the machine that
+  uploaded it.
+- **An extension beats a sniff**, and a sniff is only used for extensionless
+  files (`README`, `Makefile`) — a `.csv` sniffs as `text/plain` and a `.svg`
+  as `text/xml`.
+- **A sniff that lands on octet-stream reports nothing.** Saying nothing lets
+  the server apply its own default, which keeps a re-upload of the same file
+  from *changing* an object's type.
+- **An input that already carries a type keeps it.** A copy or an edit knows
+  the object's real type; `applyPut` only fills a gap.
+- **Folder markers are encrypted but not typed.** A profile whose bucket policy
+  requires SSE would otherwise fail folder creation.
+
+## Integrity (`model/checksum.go`)
+
+The ETag is only an MD5 for single-part uploads; a multipart ETag is a hash of
+part hashes with a `-N` suffix, so it depends on the part size the uploader
+happened to use. That single fact limited three separate features, and S3's
+additional checksums close all three at once:
+
+- a **post-transfer verify** covers multipart objects, not just small ones;
+- the **duplicate finder**'s documented blind spot (identical files uploaded
+  with different part sizes never group) becomes closeable;
+- **sync** gains a real content comparison.
+
+`ObjectChecksum` reads the stored checksum through `GetObjectAttributes` —
+the only API that reports one — and falls back to a `HeadObject` ETag when a
+backend does not implement it, so an unsupported endpoint yields "nothing to
+compare" rather than an error. `VerifyLocalFile` prefers a whole-object
+checksum, falls back to the ETag for single-part objects, and refuses to
+compare a *composite* checksum against a whole-file hash: that false alarm
+would be worse than no answer. A size difference is reported on its own
+because "1.2 GiB vs 900 MiB" says more than a hash mismatch.
+
+`LocalChecksum` encodes as S3 does — base64 for the additional checksums, hex
+for MD5, which is only ever compared against an ETag — and CRC32C uses the
+Castagnoli polynomial, which is the whole difference from CRC32 and the
+easiest thing to get silently wrong (there is a test that pins it).
+
+Sync's checksum mode fills `SyncEntry.Sum` as `"ALGO:VALUE"` for the paths
+present on *both* sides only (a path missing at the destination is already a
+create; hashing it would be work for no decision). `planSync` compares sums
+when both sides carry the same algorithm and falls back to size+mtime
+otherwise — which is what closes the two documented holes in the old rule: a
+file edited in place to the same length is now seen, and a download-then-upload
+no longer re-sends everything because the local mtime is newer.
+
+## Streamed, cancellable listings (`controller/listing.go`)
+
+`Model.List` paginated to exhaustion on `context.TODO()`. Entering a prefix
+holding a hundred thousand keys at one level meant a hundred blocking round
+trips that no keypress could interrupt, followed by all hundred thousand rows
+landing in the list widget at once — the app looked hung with nothing to do
+but kill it.
+
+`ListStream`/`ListObjectsStream` hand each page to a callback with the running
+total and stop when it returns false; the context is checked *between* pages as
+well as passed into the request, so a cancelled scan stops at the next page
+boundary at the latest. `updateList` then:
+
+- reports "listing… N" in the pane title, throttled to 250 ms, writing to the
+  **list widget captured before the fetch** — a `Tab` mid-listing must not
+  redirect the counter into the other pane;
+- stops at `listCap` (20 000) per level and says so;
+- treats a cancelled listing as a *partial* result rather than an error: what
+  arrived is kept and rendered, because a browsable first slice of a huge
+  prefix is far more use than an empty pane. `partial` is per-pane, like the
+  object map it describes, and the title discloses it.
+
+The same ctx plumbing reached `ListObjects`, `ListBuckets`, `Delete`,
+`EmptyBucket`, `ListRemoteEntries`, `ResolveDownloadObjects` and
+`PlannedCopyKeys`, which closes the "cancellation doesn't reach listing
+phases" hardening item: the delete scan, the summary scan, the duplicate scan,
+the searches, the sync scan and the pane comparison all run behind
+`cancellableWait` modals now and abandon their listing when cancelled.
+Cancelling the delete *scan* abandons the delete rather than confirming
+against half-counted totals.
+
+What deliberately still runs on `context.TODO()` is the set of single-request
+bucket-level calls — `CreateBucket`, `CreateFolder`, `DeleteBucket`,
+`MakeBucketPublic`, `GetBucketLocation`, `BucketConfig`, `PresignGetURL`,
+`ListMultipartUploads`, `AbortMultipartUpload`. Each is one round trip
+bounded by the transport's per-phase timeouts, with no pagination to escape
+from, so threading a context through them would add signature churn for no
+behaviour a user could observe. `GetConfig`'s `LoadDefaultConfig` is the same
+case.
+
+## The failure ledger (`controller/opresult.go`)
+
+Every multi-item operation correctly collected failures instead of aborting on
+the first one — and then threw them away: the report printed the first eight
+and "…and N more", and once dismissed there was no way to see the rest, let
+alone act on them.
+
+`opResult` keeps every failure with the flow's own descriptor (`retryItem.target`,
+opaque here and type-asserted back by the retry callback that owns it). The
+report then offers **Retry failed**, which re-enters the same flow with only
+the failed units — a 5000-file sync that lost twelve objects to a flaky link
+costs twelve operations, not another full plan — and **Export list**, which
+writes all of them to a file, since a `tview.Modal` cannot scroll. Wired into
+delete, sync, copy/move, batch rename and download; `text()` is pure, so the
+wording of a partial failure is testable.
+
+## Profile identity and read-only (`controller/guard.go`)
+
+The browser screen never named the open profile: the list title carried
+bucket, path, selection and sort, and nothing else. With dual panes, a
+cross-profile copy and a `Delete` that empties buckets, "am I in staging or
+production?" was unanswerable without leaving the browser.
+
+`identityLabel` puts profile, endpoint host, region and a read-only marker in
+the frame's header — the left field of the *same row* as the version string,
+since tview's `Frame` puts differently-aligned header texts on one line, so it
+costs no rows. `readOnlyBlocked` is one guard called from each mutating entry
+point (rather than a mode every action would have to interpret) and it names
+the action it refused, because "nothing happened" is the failure mode it
+replaces. The cross-profile copy checks the *destination* profile's flag: that
+copy writes there and only reads here.
+
+## Background transfer notices (`controller/notify.go`)
+
+Backgrounding a transfer is a promise — "carry on, I'll tell you when it's
+done" — and the app kept the first half only: `finalizeJob` wrote one activity
+line and nothing else. The only way to find out was to keep opening the
+transfers panel, which defeats the point.
+
+A single long-lived ticker recomputes a header badge twice a second and queues
+a redraw **only when the text changed**, so an idle app costs a string compare
+and no draws. `finalizeJob` announces a job that was backgrounded (never a
+foreground one, whose modal is already reporting) as a transient notice plus
+the terminal bell — through `Screen.Beep()`, captured in the view's
+before-draw hook, because this tview version exposes no screen getter and a
+raw write would land inside the rendered frame. A modal would have been wrong:
+it would steal focus from whatever the user moved on to.
+
+## Credentials, delegated (`GetConfig`)
+
+Static keys are fine for a long-lived MinIO key and structurally wrong for
+everything temporary: an assume-role or SSO credential was stored as pasted
+and simply started failing when it expired. It also left `~/.aws` profiles
+that *delegate* (`sso_session`, `role_arn`, `credential_process`) unusable —
+there is no key pair in them to copy.
+
+`Config.AWSProfile` switches the credential provider to
+`config.WithSharedConfigProfile`, handing the whole problem to the SDK's own
+resolution chain, which knows how to run an SSO flow, assume a role, invoke a
+`credential_process` and re-resolve on expiry. Nothing is stored in s3duck's
+config but the profile's name. The AWS import now offers these profiles as
+delegating ones instead of listing the reason they could not be imported; a
+delegating profile that resolves to nothing is caught in `GetConfig`, while
+the message can still name the profile.
+
+## Local pane (`controller/localpane.go`, `model/local.go`)
+
+Upload was a modal browser that took exactly one item per flow: no
+multi-select, no sorting, no size or date columns, and no view of the
+destination while picking. Meanwhile the dual-pane layout, the column engine,
+the selection scoping and the transfer queue all existed — for remote panes
+only.
+
+The trick that keeps this small is that a local entry is described by the same
+`model.Object` as a remote one (directories carry a trailing separator in
+`FullPath`, so a file and a directory of the same name cannot collide in the
+selection set). Filtering, sorting, column layout, selection and `renderList`
+needed **no changes at all**; only navigation, the pane title and the transfer
+verbs had to learn which side they were looking at:
+
+- `localDir` is part of the swapped pane state, so a local pane survives `Tab`
+  and is cleared by `resetPanes` (it must not outlive a profile switch);
+- `scopeKey` gives a local pane its own selection scope — sharing the empty one
+  with the buckets screen would leak marks between them;
+- `Ctrl+Y` from a local pane uploads to the other pane's bucket+prefix
+  (`LocalTargets` expands the selection, keeping each selected directory's own
+  name at the destination); a download with a local pane open lands in that
+  directory rather than the profile's download directory;
+- `remoteOnly` refuses the object-only actions. The local pane deliberately
+  does **not** delete, rename or create: those keys have S3 meanings people
+  have muscle memory for, and a mis-aimed one outside the bucket is not
+  recoverable by anything this app offers. A move across the boundary is
+  refused for the same reason.
+
+## Usage browser (`controller/usage.go`)
+
+`buildSummary` answered "how big is this?" one level deep, bytes only, and
+silently truncated to the top ten — so on a bucket with a hundred prefixes the
+question "where did the other 4 TB go?" had no answer, and nothing said the
+table was incomplete.
+
+`buildUsageTree` folds the same recursive listing (one pass, no extra
+requests) into a prefix tree whose sizes and counts accumulate up the tree, and
+the browser walks it: children largest-first — size *is* the ordering here, so
+folders are not floated to the top the way the file listing does it — with
+share bars, object counts and a storage-class breakdown at every level. `g`
+hands the location to the ordinary browser, because every action that follows
+from "where are the bytes" already exists one screen over. The flat summary
+now folds its overflow into one disclosed row instead of truncating.
+
+## Preview and version diff (`controller/preview.go`)
+
+Inspecting an object's contents meant downloading it or opening `$EDITOR`,
+which refuses anything binary or over 1 MiB. The missing piece was the ranged
+GET: `GetObjectHead` reads a fixed 64 KiB window, so previewing a 40 GiB log
+costs one small request, and the read is capped independently of the range
+because some S3-compatible backends ignore `Range` entirely.
+
+Binary content is rendered as a hexdump rather than refused — the question a
+preview answers about a blob is usually "what *is* this?", and magic numbers
+answer it. Content goes through `sanitizeText` (control bytes to dots, tabs
+expanded) and `escapeForTextView` (`[` doubled), or a log line containing
+`[red]` would be swallowed as markup. The viewer is a scrollable `TextView`
+inside `ModalClamped`, not a `Modal`: a Modal's text cannot scroll, and a
+preview that shows only what fits is not a preview.
+
+`unifiedDiff` is a plain LCS walk rather than Myers — the inputs are capped at
+1 MiB, where the quadratic table costs nothing worth optimising — and shows
+full context, because a version diff is usually a config file where the
+surrounding lines are the point. Identical bodies produce empty output, which
+is what lets the caller say "identical" instead of opening an empty window.
+
+## Trash (`controller/trash.go`)
+
+Undo covered move and rename; delete was the one irreversible action, and on an
+unversioned bucket a mistaken folder delete had no remedy at all. With safe
+delete on, `Delete` becomes a server-side move into
+`<trash>/<YYYYmmdd-HHMMSS>/<original key>` — no bytes cross the wire, and the
+dated folder is what keeps two deletes of the same key from colliding and what
+makes a restore unambiguous (`restoreKeyFrom` inverts the mapping). Deleting
+something already *inside* the trash removes it for real: otherwise the trash
+could never be emptied and each attempt would nest a deeper copy of it inside
+itself. Emptying the trash sizes it first and says plainly that the objects are
+not recoverable.
+
+## Keymap (`controller/keymap.go`)
+
+The browser's key space was full: `Ctrl+A`–`Ctrl+Y` almost without a gap, and
+`y x p u t s S r v m c e D > = / [ ]` besides. Every new feature had to
+displace a binding or hide in the palette, and a user who wanted a different
+layout had no way to ask.
+
+Bindings are now data: `defaultBindings()` pairs each named action with a chord
+and a description, `~/.config/s3duck-tui/keys.json` overrides any of them, and
+a leader key (default `,`) opens a second namespace for what no longer fits.
+`actionTable()` is the app's vocabulary; the palette and the hotkey panel are
+both generated from the pair, so the panel can no longer drift from what the
+keys do. Details worth keeping:
+
+- **The defaults are exactly what the keys did before**, pinned by a test that
+  lists them, because changing one is a user-visible break.
+- **A rebound action loses its default chord** — leaving both working is the
+  confusing half-state.
+- **An unparseable override leaves the default in place** (only a *usable*
+  override counts as one), so one typo cannot silently remove a key with
+  nothing to replace it. Warnings are shown once at startup and logged.
+- **Ctrl+letter is matched by key constant, not by rune**: tcell reports it as
+  `KeyCtrlD` with the rune cleared, so `chordKey` canonicalises both a parsed
+  spec and a live event the same way. Shift is not part of the canonical form —
+  it is already expressed in the rune, and terminals do not report it
+  consistently for anything else.
+- **An unknown key after the leader does nothing** rather than falling
+  through: `,` then a typo must not delete anything.
+
+## Persistent activity log and session restore (`controller/audit.go`)
+
+The activity log was a 200-entry ring that died with the process. For a tool
+that empties buckets, moves objects between accounts and deletes versions
+permanently, "what did I do yesterday?" is a reasonable question with nowhere
+to look.
+
+`logActivity` now also appends `timestamp<TAB>profile<TAB>message` to
+`$XDG_STATE_HOME/s3duck-tui/activity.log` (mode 0600, rotated once at 2 MiB —
+two files is enough to answer "what happened recently", and unbounded rotation
+is a disk-space surprise). Message newlines and tabs are folded to spaces, so
+a key or an error text cannot forge an entry or shift the columns. Write errors
+are deliberately dropped: an unwritable log must never interrupt the operation
+it is describing.
+
+The same file's neighbour question — "where was I?" — is answered by
+`LastBucket`/`LastPrefix` on the profile, recorded in memory on navigation and
+written out when the profile is closed or the app exits (one config rewrite per
+navigation would mean rewriting a file full of credentials dozens of times a
+minute). `restoreLocation` must run on the UI goroutine, because `jumpTo`
+clears the filter box and the details pane synchronously before spawning its
+own goroutine.
+
+## Query syntax (`controller/match.go`)
+
+The filter and the search were case-insensitive substring tests. One matcher
+now serves the in-listing filter, the recursive search and sync's exclude list,
+with the mode picked from the query itself so there is no toggle to discover:
+plain text is a substring, anything containing `*` or `?` is an anchored glob,
+and an `re:` prefix is a regular expression (case-insensitive unless the
+pattern says otherwise).
+
+Two decisions worth recording. The glob dialect is two metacharacters wide and
+`*` **crosses `/`**, unlike `path.Match`: the recursive search matches full
+keys, and `*.log` there has to find `logs/2024/app.log` or the feature is
+useless. And `globMatch` is an iterative two-cursor scan with one backtrack
+point rather than recursion — a pattern like `*a*b*c` over a long key would
+otherwise branch exponentially, and keys here arrive from listings that can
+hold a hundred thousand of them. A query that fails to compile degrades to
+*matching nothing*, with the reason in the pane title: silently ignoring it
+would look like the filter had been applied and found everything.
+
 ## Known limitations
 
 | Area | Description |
@@ -495,11 +884,11 @@ SimulationScreen at 80x24 and driven with real key events, which is what pins
 | **Cross-bucket copy/move is same-endpoint only** | `CopyKeys` / `MoveKeys` take separate source/destination buckets and issue a server-side copy, so both buckets must be reachable through the one configured endpoint. This covers any single S3-compatible endpoint (MinIO/Ceph) and same-region AWS. Copying between AWS buckets in *different regions* is not handled (the client stays pinned to the source region); across *profiles*, `>` streams through the client instead. |
 | ~~Copies fail above 5 GiB~~ | **Fixed.** Sources over `MultipartCopyThreshold` are copied part by part with `UploadPartCopy` (see *Large copies*). |
 | **No download resume** | Interrupted downloads restart from byte 0. Transfers write to a sibling `*.s3duck-part` temp file that is removed on cancel/failure; the target file is only ever replaced by a completed download. |
-| **Sync compares size + mtime, not content** | `planSync` never hashes. A file edited in place to exactly the same size, with its mtime preserved, is not detected as changed. Comparing ETags would only help for single-part uploads (a multipart ETag is not the MD5 of the object) and would need a matching local chunking scheme. |
-| **An upload sync straight after a download sync re-uploads** | A downloaded file's local mtime is its download time, which is newer than the object's `LastModified`. Reversing the direction therefore sees "source is newer" for every file and re-sends them once (sizes are equal, so nothing is corrupted, and the second reversal is a no-op). This matches `aws s3 sync` semantics; the dry-run plan shows it before anything moves. |
+| ~~Sync compares size + mtime, not content~~ | **Fixed (optional).** The sync form's *Compare content by checksum* fills `SyncEntry.Sum` from the object's stored checksum (or its single-part ETag) and a locally computed one, and `planSync` compares those when both sides agree on the algorithm. It costs one request per remote object and a full read per local one, so it is a choice rather than the default; paths where either side cannot produce a comparable sum fall back to size+mtime. |
+| **An upload sync straight after a download sync re-uploads** | A downloaded file's local mtime is its download time, which is newer than the object's `LastModified`. Reversing the direction therefore sees "source is newer" for every file and re-sends them once (sizes are equal, so nothing is corrupted, and the second reversal is a no-op). This matches `aws s3 sync` semantics; the dry-run plan shows it before anything moves — and *Compare content by checksum* avoids it entirely. |
 | ~~Sync applies one operation at a time~~ | **Fixed.** `runSync` now uses a 4-worker pool with a writes-then-deletes barrier (see *Sync* above). |
 | **Sync direction is one-way** | Each run treats one side as the source of truth. There is no bidirectional merge and no conflict resolution — the newer-wins rule only ever applies in the chosen direction. |
-| **Session tokens expire, silently** | An imported temporary credential is stored as-is. When it expires, calls start failing with an auth error; s3duck neither refreshes it nor warns beforehand. Re-import after `aws sso login` / a fresh assume-role. |
+| **Static session tokens expire, silently** | A *stored* temporary credential is used as-is: when it expires, calls start failing with an auth error and s3duck neither refreshes it nor warns beforehand. The fix is not to store one — set the profile's `aws_profile` instead and the SDK re-resolves (and re-runs SSO / assume-role) on expiry. |
 | **Versioned buckets can't be emptied from the TUI** | `model.Delete` sends no `VersionId`, so folder deletes write delete markers only; `EmptyBucket` clears current objects but old versions survive, and `DeleteBucket` then fails with BucketNotEmpty. A version-aware purge is on the roadmap. |
 | **Whitespace keys** | Every secondary-text reader trims the key, so `"dir/report "` resolves to `"dir/report"` in lookups (wrong object if both exist, silent no-op if only the padded one does). |
 | **Versioning needs a versioned bucket** | On an unversioned bucket S3 reports a single `null` version; the browser shows exactly that rather than hiding the feature. Enabling versioning is a bucket-level operation s3duck does not perform. |
@@ -507,7 +896,15 @@ SimulationScreen at 80x24 and driven with real key events, which is what pins
 | **Metadata edits rewrite the object** | A metadata save is a server-side copy onto the same key. On a versioned bucket that creates a new version; the ETag may also change for multipart objects (and always does when the object is large enough to take the multipart-copy path, which re-chunks it). |
 | **Undo and sync do not prompt before overwriting** | Every other remote write confirms first (see *Overwrite confirmation*). Sync is exempt because its dry-run plan already lists the updates; undo because it has its own confirmation and restores objects to where they just were. |
 | **The inactive pane keeps its previous column layout** | `renderList` renders the active pane, so right after `Ctrl+O` the other pane still shows columns sized for the previous width. It self-heals the moment you `Tab` to it (`swapAndFocus` re-fetches and re-renders). Fixing it properly needs a render path that can target a pane other than the active one. |
-| **Summary top-10 cap** | `buildSummary` silently truncates the groups table to the top 10 by size. Groups ranked 11+ are not shown and not counted in any "overflow" indicator. |
+| ~~Summary top-10 cap~~ | **Fixed.** The graph folds everything past the top ten into one disclosed row, and the usage browser (`G`) walks the whole tree without a cap. |
+| ~~Cancellation doesn't reach listing phases~~ | **Fixed.** Context is plumbed through `List`/`ListObjects`/`ListBuckets`/`Delete`/`EmptyBucket`/`ListRemoteEntries`/`ResolveDownloadObjects`/`PlannedCopyKeys`, and every scan (delete sizing, summary, duplicates, search, sync, compare) runs behind a cancellable wait modal. |
+| **Listings cap at 20 000 objects per level** | A prefix with more keys at one level is listed to `listCap` and marked *partial* in the title; the rest is reachable through the recursive search (Ctrl+F) or the usage browser. The cap exists because a `tview.List` holding a hundred thousand rows is slower to render than the listing was to fetch. |
+| **The local pane never writes locally** | It browses, marks and uploads; it does not delete, rename or create. Deliberate: those keys have S3 meanings, and a mis-aimed one outside the bucket is beyond anything this app can undo. A move across the pane boundary is refused for the same reason. |
+| **A trashed object still costs storage** | Safe delete is a move, not a removal: the objects stay in the bucket (and keep their storage class) until the trash is emptied. On a versioned bucket the move also leaves a delete marker at the original key. |
+| **Verification cannot cover every object** | A multipart object with no additional checksum can only be compared by size, and `VerifyLocalFile` says so rather than comparing a hash that could never match. Set the profile's `checksum_algo` and objects written from then on are fully verifiable. |
+| **`GetObjectAttributes` support varies** | S3-compatible backends may not implement it; `ObjectChecksum` then falls back to the HEAD ETag, which limits verification to single-part objects. Reported, not silently degraded. |
+| **The keymap is app-wide, not per-screen** | `keys.json` rebinds the browser's actions; the profiles screen and the modal overlays keep their built-in keys. Rebinding a chord the modals also use (Esc, Enter) affects only the browser. |
+| **The activity log is append-only and unencrypted** | It records bucket and object names (never credentials) at mode 0600, rotated once at 2 MiB. Delete the file to clear it; there is no in-app purge. |
 
 ---
 

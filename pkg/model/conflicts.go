@@ -57,7 +57,7 @@ func CommonPrefix(keys []string) string {
 // expanding a folder into the concrete objects underneath it. It runs the
 // same planFolderCopy/remapKey mapping CopyKeys does, so what the overwrite
 // confirmation lists is exactly what the transfer would write.
-func (m *Model) PlannedCopyKeys(srcBucket, dstBucket *Object, srcKey, dstKey string, isFolder bool) ([]string, error) {
+func (m *Model) PlannedCopyKeys(ctx context.Context, srcBucket, dstBucket *Object, srcKey, dstKey string, isFolder bool) ([]string, error) {
 	if srcBucket == nil || srcBucket.Key == nil || dstBucket == nil || dstBucket.Key == nil {
 		return nil, errors.New("bucket is nil")
 	}
@@ -69,7 +69,7 @@ func (m *Model) PlannedCopyKeys(srcBucket, dstBucket *Object, srcKey, dstKey str
 	if err != nil {
 		return nil, err
 	}
-	objs, err := m.ListObjects(src, srcBucket)
+	objs, err := m.ListObjects(ctx, src, srcBucket)
 	if err != nil {
 		return nil, err
 	}
@@ -217,7 +217,7 @@ func (m *Model) conflictsByHead(ctx context.Context, bucket *Object, keys []stri
 // It is given plain object keys only; folder candidates are answered by
 // conflictingFolders.
 func (m *Model) conflictsByListing(ctx context.Context, bucket *Object, keys []string) ([]string, error) {
-	objs, err := m.ListObjects(CommonPrefix(keys), bucket)
+	objs, err := m.ListObjects(ctx, CommonPrefix(keys), bucket)
 	if err != nil {
 		return nil, err
 	}

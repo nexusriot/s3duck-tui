@@ -11,15 +11,15 @@ Features
 -------------
 
 1. Multi-profile support (create / edit / delete / clone / verify)
-2. Bucket browsing with folder-style navigation (delimiter `/`), a live in-listing name filter (`/`, narrows as you type), and recursive search under the current prefix (Ctrl+F) whose results jump straight to the matching object
+2. Bucket browsing with folder-style navigation (delimiter `/`), a live in-listing name filter (`/`, narrows as you type — plain text, `*.glob` or `re:regex`), and recursive search under the current prefix (Ctrl+F, same query syntax) whose results jump straight to the matching object. Listings are **streamed page by page** with a live count, stop on `Esc`, and cap at 20 000 objects per level, so a prefix with a hundred thousand keys is browsable instead of a hang
 3. Bucket creation (private or public-read) and deletion
 4. Folder creation (zero-byte `prefix/` markers)
 5. Recursive download of files and folders with **4-worker parallel downloads**: overwrite conflicts are resolved sequentially first (Overwrite / Skip / Overwrite All / Skip All / Cancel), then approved objects download concurrently — an existing file is replaced only after its download fully succeeded, so a canceled or failed run never destroys local data; live progress shows worker count, per-file active names, combined byte progress, and **transfer speed + ETA**; configurable per-profile destination directory (defaults to `~/Downloads`, supports a leading `~`)
 6. Multi-select for batch download, copy, move, rename and **delete** (Space, Ctrl+S all, Ctrl+X none)
-7. Upload with a built-in, icon-styled local filesystem browser; preserves directory tree, creates markers for empty folders
+7. Upload with a built-in, icon-styled local filesystem browser; preserves directory tree, creates markers for empty folders. Every uploaded object gets a **derived Content-Type** (extension table first, content sniff for extensionless files), so a bucket serving a site over HTTP does not answer `application/octet-stream` to everything
 8. Bucket / folder size summary (Ctrl+G)
 9. Object properties (size, ETag, storage class, last modified) in the side panel; presigned (time-limited) share links for private objects (Ctrl+W, or the "Presign Link" button in properties — 15m / 1h / 24h / 7d, capped at the SigV4 7-day max)
-10. Clipboard yank of profile data (Ctrl+Y)
+10. Profile cloning (Ctrl+Y on the profiles screen) and system-clipboard copy of a presigned link (Ctrl+W) or a download report
 11. Server-side copy / move / rename, recursive for folders, multi-select aware, **cross-bucket** (pick any destination bucket) with live object rate + ETA (Ctrl+Y copy, Ctrl+T move, Ctrl+R rename)
 12. **Dual-pane (Midnight Commander style)** layout (Ctrl+O toggle, Tab to switch panes); copy/move defaults its destination to the other pane
 13. **Batch / pattern rename** of multiple marked objects (Ctrl+R with >1 selected): `{name}` / `{ext}` / `{n}` tokens plus an optional find→replace
@@ -30,10 +30,10 @@ Features
 18. **Object clipboard** — yank/cut objects (`y`/`x`) and paste (`p`) into any folder or the other pane (cross-bucket aware)
 19. **Undo** the last move/rename (`u`)
 20. **Search across all buckets** (checkbox in the Ctrl+F prompt); results jump straight to the matching object in its bucket
-21. **Abort incomplete multipart uploads** and a **read-only bucket-config dashboard** (versioning / encryption / object-lock / region), via the command palette
-22. **In-session operation activity log** (command palette)
-23. **Sync** (Ctrl+E) — mirror in any of three directions: local → remote, remote → local, or **remote → remote** (bucket/prefix to bucket/prefix, server-side copies). Always preceded by a mandatory dry-run plan (create / update / delete, per-file reason, total bytes); optional deletion of extraneous objects at the destination. Applied by a 4-worker pool, writes before deletes
-24. **Temporary AWS credentials** — `session_token` support (assume-role / SSO / MFA) plus one-key import of profiles from `~/.aws/credentials` and `~/.aws/config` (Ctrl+I on the profiles screen)
+21. **Abort incomplete multipart uploads** (`, m`) and a **read-only bucket-config dashboard** (versioning / encryption / object-lock / region) (`, b`), also in the command palette
+22. **Operation activity log** — the current session in-app (`, a` or the palette), and every operation appended to a file on disk
+23. **Sync** (Ctrl+E) — mirror in any of three directions: local → remote, remote → local, or **remote → remote** (bucket/prefix to bucket/prefix, server-side copies). Always preceded by a mandatory dry-run plan (create / update / delete, per-file reason, total bytes); optional deletion of extraneous objects at the destination. Applied by a 4-worker pool, writes before deletes. **Exclude globs** filter both sides before the diff (`.git, node_modules, *.tmp`), and an optional **checksum comparison** replaces size+mtime with real content comparison
+24. **AWS credentials, delegated or static** — name a `~/.aws` profile and the AWS SDK resolves it on every use, which makes **SSO, assume-role and `credential_process` profiles work and stay refreshed** (a stored session token cannot). Static keys with an optional `session_token` still work; `Ctrl+I` on the profiles screen imports either kind from `~/.aws/credentials` / `~/.aws/config`
 25. **Sort** the listing by name / size / date, ascending or descending (`s` cycles the key, `S` reverses); **refresh** with `r` or F5
 26. **Object versioning** (`v`) — full history for the selected object including delete markers; restore an old version as current (a copy to the top of the history, so nothing is lost), download any version, or permanently delete one
 27. **Object metadata & tags** (`m`) — edit Content-Type / Cache-Control / Content-Disposition / Content-Encoding and `x-amz-meta-*` pairs, plus the object tag set; only the halves you actually changed are written
@@ -44,10 +44,21 @@ Features
 32. **Cross-profile copy** (`>`) — copy the marked objects or folders to a bucket in a *different profile*, streamed through the client (GET here → PUT there), so the two sides can be entirely different endpoints (MinIO → AWS, provider migration). Content headers, metadata and tags ride along (storage class deliberately not — class names aren't portable across providers); runs as a cancellable background transfer
 33. **Duplicate finder** (`D`) — scan the current prefix recursively and browse groups of identical objects (matched by size + ETag), ordered by wasted bytes; reveal any copy in the browser or delete it with a confirmation. The oldest copy is marked as the likely original
 34. **Pane comparison** (`=`) — read-only diff of the two dual-pane locations (left-only / differs / right-only), answering "are these two prefixes actually the same?" without transferring anything
-35. **Overwrite confirmation for remote writes** — rename, batch rename, copy, move, paste, upload and cross-profile copy all check the destination first and name exactly what they would replace, offering **Overwrite**, **Skip existing** (when that still leaves something to do) or **Cancel**. Skipping a destination on a *move* leaves the source in place too, so nothing is ever deleted without having been written somewhere. Sync is exempt: its dry-run plan already lists every update before anything moves
+35. **Overwrite confirmation for remote writes** — rename, batch rename, copy, move, paste, upload, cross-profile copy and restore-from-trash all check the destination first and name exactly what they would replace, offering **Overwrite**, **Skip existing** (when that still leaves something to do) or **Cancel**. Skipping a destination on a *move* leaves the source in place too, so nothing is ever deleted without having been written somewhere. Sync is exempt: its dry-run plan already lists every update before anything moves
 36. **Copies above 5 GiB** — copy, move, rename, storage-class changes, metadata saves and version restores fall back to a concurrent multipart part-copy past the size where a single-request S3 copy is rejected, carrying content headers, metadata and tags across
 37. Custom endpoints and self-signed TLS support (`ignore_ssl`)
-38. Linux (amd64/arm64/armv7/riscv64), FreeBSD and macOS / Windows builds (statically linkable)
+38. **Local pane** (`l`) — point one dual-pane side at a directory and browse it with the same columns, sort, filter and multi-select as a bucket; `Ctrl+Y` then uploads the marked files, and a download lands in that directory. The local pane never deletes, renames or creates: it is a transfer endpoint, not a file manager
+39. **Usage browser** (`G`) — one recursive listing, then drill down through the prefix tree by size: share bars, object counts and a **storage-class breakdown** at every level, `g` to jump to any node in the browser. The flat top-10 summary (Ctrl+G) now discloses what it folded away instead of truncating silently
+40. **Preview** (`P`) — read-only look at the head of any object through a **ranged GET**, so previewing a 40 GiB log costs one small request; binary content is shown as a hexdump, and `e` hands the object to the editor
+41. **Version diff** (`D` in the version browser) — unified diff of any old version against the current one
+42. **Read-only profiles** — a per-profile flag that refuses every mutating action, and a header that always names the open profile, its endpoint and its read-only state, so "which account is this?" is answerable without leaving the browser
+43. **Safe delete (trash)** — a per-profile mode where delete becomes a server-side move into `.s3duck-trash/<timestamp>/`; `R` restores objects to the keys they came from — through the same overwrite confirmation as any other remote write, since the original key may hold something newer by then — and emptying the trash is the one delete that is never diverted
+44. **Checksums** — ask S3 to verify a `CRC32C` / `CRC32` / `SHA256` / `SHA1` checksum on every write, verify a downloaded file against it automatically or on demand (`V`), and get a straight answer for multipart objects, whose ETag can never be compared. Optional per-upload **server-side encryption** (SSE-S3 / SSE-KMS)
+45. **Retry failed / export list** — every multi-item operation (download, sync, copy, move, rename, delete) keeps its failures with enough context to re-run exactly those units, and can write the full list to a file instead of showing the first eight and forgetting the rest
+46. **Background transfer notices** — a header badge while transfers run, plus a transient notice and a terminal bell when a backgrounded one finishes; no modal steals focus from what you moved on to
+47. **Configurable keymap** — every browser action is a named action bound in `~/.config/s3duck-tui/keys.json`, with a **leader key** (`,`) opening a second namespace; the in-app hotkey panel is generated from the live keymap, so it cannot drift from what the keys do
+48. **Persistent activity log** — every operation is appended to `~/.local/state/s3duck-tui/activity.log` (rotated at 2 MiB) alongside the in-session view, and each profile reopens where it was last browsing
+49. Linux (amd64/arm64/armv7/riscv64), FreeBSD and macOS / Windows builds (statically linkable)
 
 Screenshots
 -------------
@@ -76,7 +87,7 @@ The project follows a classic **Model–View–Controller** layout. The controll
 +------------------------------------------------------------+
 |                    pkg/controller                          |
 |  - app state: current bucket, path, selection, sort        |
-|  - keybindings, modals, forms, progress UI                 |
+|  - action table + keymap, modals, forms, progress UI       |
 |  - orchestrates Model calls from goroutines, marshals      |
 |    UI updates back via App.QueueUpdateDraw                 |
 +----------+----------------------------+--------------------+
@@ -85,7 +96,7 @@ The project follows a classic **Model–View–Controller** layout. The controll
 +----------------------+    +----------------------------+
 |   pkg/view           |    |   pkg/model                |
 |  tview widgets:      |    |  AWS SDK v2 wrapper:       |
-|   - List / Frame     |    |   - ListBuckets / List     |
+|   - List / Frame     |    |   - ListBuckets/ListStream |
 |   - Details TextView |    |   - CreateBucket/Folder    |
 |   - Modals & Forms   |    |   - Delete (paged 1000)    |
 |   - Hotkeys / About  |    |   - Upload  (s3manager)    |
@@ -98,6 +109,10 @@ The project follows a classic **Model–View–Controller** layout. The controll
                             |     ListRemoteEntries      |
                             |   - progressReader /       |
                             |     progressWriterAt       |
+                            |   - GetObjectHead (ranged) |
+                            |   - ObjectChecksum /       |
+                            |     VerifyLocalFile        |
+                            |   - WalkDir / LocalTargets |
                             +-------------+--------------+
                                           |
                                           v
@@ -122,20 +137,20 @@ The project follows a classic **Model–View–Controller** layout. The controll
 | Path | Responsibility |
 | --- | --- |
 | `cmd/s3duck-tui/main.go` | Thin entrypoint: instantiates the controller and runs the tview app loop. |
-| `pkg/controller` | Application state and event handling. Owns key bindings, modal flows (create/edit profile, create bucket/folder, download, upload, overwrite prompt, summary, delete confirmation), listing order, selection scoping per `bucket:path`, and goroutine→UI marshalling. `sync.go` holds the directory-sync planner and its dialog/apply flow. |
+| `pkg/controller` | Application state and event handling. Owns the action table, modal flows (create/edit profile, create bucket/folder, download, upload, overwrite prompt, summary, delete confirmation), listing order, selection scoping per `bucket:path`, and goroutine→UI marshalling. Split by feature: `sync.go` (directory sync), `objectmeta.go`, `versions.go`, `duplicates.go`, `crossprofile.go`, `columns.go`, `edit.go`, `overwrite.go`, plus `keymap.go` (bindings as data), `listing.go` (streamed, cancellable listings), `opresult.go` (the failure ledger behind Retry failed / Export list), `localpane.go` (the local-filesystem pane), `usage.go` (the du browser), `preview.go` (preview + version diff), `match.go` (the text/glob/regex query used by the filter, the search and sync excludes), `guard.go` (read-only and profile identity), `trash.go`, `verify.go`, `notify.go`, `audit.go` and `options.go`. |
 | `pkg/view` | Pure tview construction. Builds the main flex layout (object list + details panel), modal helper, profile form, local-file browser, hotkeys / about pop-ups. Contains the version string. |
-| `pkg/model` | S3 layer. Wraps `s3.Client`, `s3manager.Downloader/Uploader`, custom endpoint resolver, static-credentials provider, and TLS skip-verify. Exposes high-level operations: `List`, `ListBuckets`, `ListObjects`, `DownloadTarget`, `Upload`, `PrepareUpload`, `HeadObject`, `PutObjectMeta`, `ObjectTags` / `PutObjectTags`, `SetStorageClass`, `RestoreObject`, `ListVersions`, `RestoreVersion`, `DeleteVersion`, `DownloadVersion`, `ResolveDownloadObjects`, `Delete`, `DeleteKey`, `DeleteBucket`, `UploadFile`, `WalkLocal`, `ListRemoteEntries`, `CreateBucket`, `CreateFolder`, `MakeBucketPublic`, `GetBucketLocation`, `RefreshClient`. Implements `progressReader` / `progressWriterAt` for live byte-count progress. |
+| `pkg/model` | S3 layer (`model.go` plus `sync.go`, `object.go`, `versions.go`, `copy.go`, `content.go`, `conflicts.go`, `write.go` for per-profile write options and MIME derivation, `checksum.go` for integrity, `local.go` for the local pane's listings and upload expansion). Wraps `s3.Client`, `s3manager.Downloader/Uploader`, custom endpoint resolver, static-credentials provider, and TLS skip-verify. Exposes high-level operations: `List` / `ListStream`, `ListBuckets`, `ListObjects` / `ListObjectsStream`, `DownloadTarget`, `Upload`, `PrepareUpload`, `HeadObject`, `PutObjectMeta`, `ObjectTags` / `PutObjectTags`, `SetStorageClass`, `RestoreObject`, `ListVersions`, `RestoreVersion`, `DeleteVersion`, `DownloadVersion`, `GetVersionContent`, `GetObjectHead`, `ObjectChecksum` / `VerifyLocalFile` / `LocalChecksum` / `RemoteChecksums`, `MimeForName` / `MimeForFile`, `WalkDir` / `LocalTargets`, `ResolveDownloadObjects`, `Delete`, `DeleteKey`, `DeleteBucket`, `UploadFile`, `WalkLocal`, `ListRemoteEntries`, `CreateBucket`, `CreateFolder`, `MakeBucketPublic`, `GetBucketLocation`, `RefreshClient`. Every operation that *paginates* or moves bytes takes a `context.Context` and can be cancelled; the single-request bucket-level calls (`CreateBucket`, `DeleteBucket`, `BucketConfig`, `GetBucketLocation`, `PresignGetURL`, the multipart-upload listing/abort) do not. Implements `progressReader` / `progressWriterAt` for live byte-count progress. |
 | `pkg/utils` | Small helpers: path-split rune predicate, random string, clipboard write. |
 | `internal/config` | JSON profile storage in `~/.config/s3duck-tui/config.json` — load, write, append, copy, delete; auto-creates the file/dir on first run with `0700` permissions. `awsshared.go` parses `~/.aws/credentials` / `~/.aws/config` for the profile import. |
 
 ### Data flow
 
 1. **Startup** — `main` builds a `Controller`, which builds a `View` and loads `Params` from `internal/config`. The profile list is rendered first.
-2. **Open profile** — selecting a profile constructs a `model.Config` and calls `model.NewModel`, which builds the AWS config (custom endpoint resolver + static credentials, including the optional session token, + 30s HTTP client with optional `InsecureSkipVerify`).
-3. **Browse** — selecting a bucket triggers `RefreshClient` (resolves bucket region via `GetBucketLocation`, rebuilds the client). Subsequent navigation uses `List(prefix, bucket)` with `Delimiter="/"` to render folders + files.
-4. **Transfer** — long-running operations (download / upload / delete / summary) run in goroutines with a `context.Context` that the cancel button on the progress modal can cancel. Progress callbacks are funneled back to the UI through `App.QueueUpdateDraw`.
+2. **Open profile** — selecting a profile goes through `modelConfigFor` (the single place a stored profile becomes a connection: credentials, throughput cap, write options) and `model.NewModel`, which builds the AWS config — custom endpoint resolver, then either static credentials or the SDK's own resolution for the profile's `aws_profile`, plus a per-phase-timeout HTTP client with optional `InsecureSkipVerify`. If the profile remembers a location, it is reopened there.
+3. **Browse** — selecting a bucket triggers `RefreshClient` (resolves bucket region via `GetBucketLocation`, rebuilds the client). Subsequent navigation uses `ListStream(ctx, prefix, bucket, onPage)` with `Delimiter="/"`, rendering folders + files as pages arrive; `Esc` cancels and whatever arrived stays browsable. A pane pointed at a local directory reads it with `WalkDir` instead.
+4. **Transfer** — long-running operations (download / upload / delete / summary / scans) run in goroutines with a `context.Context` that the cancel button on the progress or wait modal can cancel. Progress callbacks are funneled back to the UI through `App.QueueUpdateDraw`; failures accumulate in an `opResult`, so the final report can re-run only what failed.
 5. **Selection scope** — multi-select state is keyed by `bucket:path`, so selections survive navigation in and out of folders.
-6. **Sync** — `Ctrl+E` scans both sides (local tree and/or remote prefixes), diffs them with the pure `planSync`, shows the resulting plan, and only then applies it through the same transfer-job machinery as downloads and uploads. `=` runs the same diff read-only across the two panes.
+6. **Sync** — `Ctrl+E` scans both sides (local tree and/or remote prefixes), drops anything matching the run's exclude patterns, optionally resolves per-file checksums, diffs them with the pure `planSync`, shows the resulting plan, and only then applies it through the same transfer-job machinery as downloads and uploads. `=` runs the same diff read-only across the two panes.
 
 ### Configuration
 
@@ -156,7 +171,86 @@ Profiles live in `~/.config/s3duck-tui/config.json` as a JSON array of:
 }
 ```
 
-`region` is optional for non-AWS endpoints; for AWS it is auto-detected from `GetBucketLocation` on bucket entry. `download_dir` is optional; omitting it shows a directory-picker dialog on each download. A leading `~` is expanded to the user's home directory. `max_bytes_per_sec` (0 = unlimited) caps combined upload/download throughput. `bookmarks` are managed in-app (Ctrl+B); both fields are omitted from the file when unset. `session_token` is only needed for temporary credentials (assume-role / SSO / MFA) and is easiest to obtain via **Ctrl+I → import from `~/.aws`** on the profiles screen; it is omitted when empty. Note that `secret_key` and `session_token` are stored in plaintext (the file is `0600`).
+`region` is optional for non-AWS endpoints; for AWS it is auto-detected from `GetBucketLocation` on bucket entry. `download_dir` is optional; omitting it shows a directory-picker dialog on each download. A leading `~` is expanded to the user's home directory. `max_bytes_per_sec` (0 = unlimited) caps combined upload/download throughput. `bookmarks` are managed in-app (Ctrl+B); both fields are omitted from the file when unset. `session_token` is only needed for static temporary credentials and is easiest to obtain via **Ctrl+I → import from `~/.aws`** on the profiles screen; it is omitted when empty. Note that `secret_key` and `session_token` are stored in plaintext (the file is `0600`).
+
+#### Per-profile options (`o` on the profiles screen)
+
+Behaviour settings live on a second form, because the connection form is
+already as tall as a small terminal can show:
+
+```json
+{
+  "aws_profile":       "sso-dev",
+  "read_only":         true,
+  "trash":             true,
+  "trash_prefix":      ".s3duck-trash/",
+  "no_mime_detect":    false,
+  "sse":               "aws:kms",
+  "sse_kms_key_id":    "arn:aws:kms:...",
+  "checksum_algo":     "CRC32C",
+  "verify_downloads":  true,
+  "last_bucket":       "reports",
+  "last_prefix":       "2026/"
+}
+```
+
+- **`aws_profile`** delegates credentials to the AWS SDK's own resolution for
+  that `~/.aws` profile instead of the static keys. This is what makes SSO,
+  assume-role and `credential_process` profiles usable — and what keeps them
+  refreshed. Nothing is stored here but the profile's name.
+- **`read_only`** refuses every write for this profile (delete, upload, copy,
+  move, rename, paste, undo, metadata, storage class, version restore/delete,
+  sync to remote, trash operations). Browsing, searching and downloading still
+  work, and the header shows `[READ-ONLY]` in red.
+- **`trash`** turns delete into a server-side move under `trash_prefix`
+  (default `.s3duck-trash/`), inside a timestamped folder that preserves the
+  original key. `R` restores, asking first if the original key is occupied
+  again; emptying the trash deletes for real.
+- **`no_mime_detect`** switches off Content-Type derivation on upload, for
+  buckets whose types are managed elsewhere.
+- **`sse`** / **`sse_kms_key_id`** encrypt every object this app creates
+  (`AES256` or `aws:kms`), including folder markers and multipart copies.
+- **`checksum_algo`** asks S3 to verify an additional checksum on every write.
+  Combined with **`verify_downloads`**, a downloaded file is re-read and
+  compared against it; without it, single-part objects are still verified
+  against their ETag and multipart ones are honestly reported as not
+  verifiable.
+- **`last_bucket`** / **`last_prefix`** are written on exit so the profile
+  reopens where it was left.
+
+#### Keymap (`~/.config/s3duck-tui/keys.json`)
+
+Every browser action is a named action; the file rebinds any of them. A missing
+file means the defaults, a malformed one is reported at startup and ignored,
+and an unparseable single binding leaves that action's default in place.
+
+```json
+{
+  "leader": ",",
+  "keys": {
+    "preview": "z",
+    "usage": "Ctrl+J",
+    "delete": ""
+  },
+  "leader_keys": {
+    "activity-log": "L"
+  }
+}
+```
+
+Chords are `Ctrl+`/`Alt+`/`Shift+` prefixes plus a single character or a key
+name (`Enter`, `Esc`, `Tab`, `Backspace`, `Del`, `Home`, `End`, `PgUp`,
+`PgDn`, `Up`/`Down`/`Left`/`Right`, `F1`–`F12`, `Space`). An empty chord
+unbinds an action. Action names are the ones the hotkey panel lists; the
+leader key (default `,`) prefixes a second namespace, and pressing it shows
+what it offers in the header.
+
+#### Activity log
+
+Operations are appended to `$XDG_STATE_HOME/s3duck-tui/activity.log` (default
+`~/.local/state/s3duck-tui/activity.log`, mode `0600`, rotated once at 2 MiB)
+as `timestamp<TAB>profile<TAB>message`. The in-app view (palette → *Activity
+log*) still shows the current session only.
 
 Hotkeys
 -------------
@@ -173,7 +267,8 @@ on a short one; `Esc`, `q` or `Ctrl+H` closes it.
 | Enter | Open profile |
 | Ctrl+N | Create profile |
 | Ctrl+I | Import a profile from `~/.aws/credentials` / `~/.aws/config` |
-| Ctrl+E | Edit profile |
+| Ctrl+E | Edit profile (connection) |
+| o | Per-profile options (credentials source, read-only, trash, SSE, checksums) |
 | Ctrl+Y | Copy / clone profile |
 | Ctrl+V | Verify profile (test connection) |
 | Del | Delete profile |
@@ -188,7 +283,8 @@ on a short one; `Esc`, `q` or `Ctrl+H` closes it.
 | ↑ / ↓ | Navigate |
 | Enter | Open folder / bucket |
 | Backspace | Go up (`..`) |
-| / | Filter the current listing live (Enter keeps it, Esc clears) |
+| / | Filter the current listing live — text, `*.glob` or `re:regex` (Enter keeps it, Esc clears) |
+| Esc | Stop a running listing (what has arrived stays browsable) |
 | s / S | Sort: cycle name → size → date / reverse the direction |
 | r / F5 | Refresh the current listing |
 | Ctrl+F | Recursive search under the current prefix; Enter reveals a hit |
@@ -221,10 +317,33 @@ on a short one; `Esc`, `q` or `Ctrl+H` closes it.
 | m | Edit object metadata and tags |
 | c | Change storage class, or request a Glacier restore |
 | Ctrl+W | Copy presigned (time-limited) share link to clipboard |
-| Del | Delete marked objects, or the highlighted one (recursive for prefixes) |
-| Ctrl+H | Hotkeys help |
+| Del / Delete | Delete marked objects, or the highlighted one (recursive for prefixes) |
+| l | Point the other pane at a local directory (`Ctrl+Y` uploads from it) |
+| P | Preview the highlighted object (ranged GET; hexdump for binaries) |
+| G | Usage browser — drill down by size, with a storage-class breakdown |
+| V | Verify the local copy against the object's checksum |
+| R | Restore the marked items from the trash (safe-delete profiles) |
+| , | Leader key — press it, then one of the keys it lists in the header |
+| Ctrl+H | Hotkeys help (generated from your keymap) |
 | Ctrl+A | About |
 | Ctrl+Q | Quit |
+
+**Leader namespace** — press `,` (the leader), then one of:
+
+| Key | Action |
+| --- | --- |
+| , a | Activity log |
+| , b | Bucket configuration (versioning / encryption / object lock / region) |
+| , m | Abort incomplete multipart uploads |
+| , t | Empty the trash (safe-delete profiles) |
+| , u | Usage browser (same as `G`) |
+| , v | Verify the local copy (same as `V`) |
+
+Pressing the leader lists its namespace in the header, so it needs no memorising.
+
+Every binding above is a default and can be rebound in
+`~/.config/s3duck-tui/keys.json` — see *Configuration*. `Ctrl+H` shows the
+list as it is actually bound, generated from your keymap.
 
 Testing
 -------------
@@ -232,13 +351,20 @@ Testing
 ```
 make test          # unit tests
 make test-race     # unit tests with the race detector
-make check         # everything CI enforces: gofmt, vet, build, race tests
+make check         # gofmt, vet (both tag sets), build, race tests
+make staticcheck   # the remaining lint CI runs (needs staticcheck installed)
 ```
 
-The unit suite is pure-function only and needs no network. Behaviour that can
+The unit suite needs no network: it covers the pure functions (planners,
+matchers, formatters, parsers) plus a set of documentation guards that assert
+this README still matches the code — every default key binding appears in the
+tables below, every table key is really bound, every profile field is
+documented, and the `keys.json` example names real actions. Behaviour that can
 only be observed against a real server — that restoring a version *adds* one
-rather than rewinding, that a storage-class change preserves metadata, that a
-prefix-like key is refused — lives in a tag-gated integration suite:
+rather than rewinding, that a storage-class change preserves metadata, that an
+uploaded object's stored Content-Type is the derived one, that a checksum
+round-trips and a tampered file is caught — lives in a tag-gated integration
+suite:
 
 ```
 make test-integration     # starts a throwaway MinIO in Docker, runs, tears down

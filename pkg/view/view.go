@@ -10,7 +10,7 @@ import (
 	"github.com/rivo/tview"
 )
 
-const versionText = "S3Duck 🦆 TUI v.0.9.0"
+const versionText = "S3Duck 🦆 TUI v.0.10.0"
 
 // View ...
 type View struct {
@@ -36,6 +36,24 @@ type View struct {
 	// getter in this version, and overlays that can outgrow the terminal (the
 	// hotkey list) have to know how tall they may be before they are laid out.
 	screenW, screenH atomic.Int32
+
+	// Frame chrome, held here because tview's Frame can only be rebuilt
+	// wholesale (Clear + re-AddText) and the three parts are set by different
+	// callers at different times: identity by the profile switch, status by
+	// the transfer ticker, help by every screen change. Header texts with
+	// different alignments share one row, so identity (left), version (centre)
+	// and status (right) cost no extra lines.
+	chromeIdentity string
+	chromeWarn     bool
+	chromeStatus   string
+	chromeHelp     string
+
+	// screen is the tcell screen as of the last draw. This tview version
+	// exposes no getter for it, and the terminal bell (used when a
+	// backgrounded transfer finishes) has to go through the screen rather
+	// than through a raw write, which would land in the middle of the
+	// rendered frame.
+	screen atomic.Value
 }
 
 // frameChromeRows is what the Frame keeps for itself around Pages: a blank
@@ -189,6 +207,7 @@ func NewView() *View {
 		w, h := screen.Size()
 		v.screenW.Store(int32(w))
 		v.screenH.Store(int32(h))
+		v.screen.Store(screen)
 		return false // carry on with the draw
 	})
 
@@ -203,12 +222,62 @@ func (v *View) NewErrorMessageQ(header string, details string) *tview.Modal {
 	return errorQ
 }
 
+// SetFrameText sets the footer hotkey line and redraws the frame chrome.
 func (v *View) SetFrameText(helpText string) {
-	v.Frame.Clear()
-	v.SetHeaderVersionText(versionText)
-	v.Frame.AddText(helpText, false, tview.AlignCenter, tcell.ColorWhite)
+	v.chromeHelp = helpText
+	v.redrawChrome()
 }
 
+// SetIdentity names the profile (and endpoint) currently open, shown at the
+// top left. warn paints it red — used for a read-only profile, where the
+// point is that the user notices.
+func (v *View) SetIdentity(label string, warn bool) {
+	v.chromeIdentity = label
+	v.chromeWarn = warn
+	v.redrawChrome()
+}
+
+// Beep rings the terminal bell, if the terminal has one. Used to announce a
+// backgrounded transfer finishing — the user asked to be told later, and
+// "later" is when they are looking at something else.
+func (v *View) Beep() {
+	if s, ok := v.screen.Load().(tcell.Screen); ok && s != nil {
+		_ = s.Beep()
+	}
+}
+
+// SetStatus sets the top-right status field: the background-transfer badge.
+func (v *View) SetStatus(status string) {
+	v.chromeStatus = status
+	v.redrawChrome()
+}
+
+// Status returns the current status field, so a caller can avoid a redraw
+// when nothing changed.
+func (v *View) Status() string { return v.chromeStatus }
+
+// redrawChrome rebuilds the frame's texts. Identity, version and status share
+// the header's single row (one per alignment); the help line is the footer.
+func (v *View) redrawChrome() {
+	v.Frame.Clear()
+	if v.chromeIdentity != "" {
+		colour := tcell.ColorAqua
+		if v.chromeWarn {
+			colour = tcell.ColorRed
+		}
+		v.Frame.AddText(v.chromeIdentity, true, tview.AlignLeft, colour)
+	}
+	v.Frame.AddText(versionText, true, tview.AlignCenter, tcell.ColorGreen)
+	if v.chromeStatus != "" {
+		v.Frame.AddText(v.chromeStatus, true, tview.AlignRight, tcell.ColorYellow)
+	}
+	if v.chromeHelp != "" {
+		v.Frame.AddText(v.chromeHelp, false, tview.AlignCenter, tcell.ColorWhite)
+	}
+}
+
+// SetHeaderVersionText is kept for the initial layout, which adds the version
+// line before any screen has set its help text.
 func (v *View) SetHeaderVersionText(version string) {
 	v.Frame.AddText(version, true, tview.AlignCenter, tcell.ColorGreen)
 }
@@ -256,6 +325,89 @@ func (v *View) NewInputForm(header, label, value string) *tview.Form {
 	})
 	return form
 }
+
+// Profile options are a second form rather than more rows on the connection
+// form, and deliberately so: the connection form is already as tall as a small
+// terminal can show, and tview's Form does not scroll. Splitting by *kind* of
+// setting — how to reach the storage, versus how this app should behave
+// against it — also keeps each form readable.
+const (
+	FieldOptAWSProfile = "AWS profile (delegate credentials)"
+	FieldOptReadOnly   = "Read-only (refuse every write)"
+	FieldOptTrash      = "Safe delete (move to trash instead)"
+	FieldOptTrashPfx   = "Trash prefix"
+	FieldOptMime       = "Detect Content-Type on upload"
+	FieldOptSSE        = "Encrypt on write (SSE)"
+	FieldOptKMSKey     = "SSE-KMS key id"
+	FieldOptChecksum   = "Checksum on write"
+	FieldOptVerify     = "Verify downloads against the checksum"
+)
+
+// ProfileOptions is the value the options form edits, kept as a plain struct
+// so the view stays free of the config package.
+type ProfileOptions struct {
+	AWSProfile  string
+	ReadOnly    bool
+	Trash       bool
+	TrashPrefix string
+	DetectMime  bool
+	SSE         string
+	KMSKey      string
+	Checksum    string
+	Verify      bool
+}
+
+// NewProfileOptionsForm builds the per-profile behaviour form. Rows are read
+// back by label (never by index) so inserting one later cannot silently
+// misread another — the trap the connection form already sprang once.
+func (v *View) NewProfileOptionsForm(name string, opts ProfileOptions, sseChoices, checksumChoices []string) *tview.Form {
+	indexOf := func(list []string, want string) int {
+		for i, s := range list {
+			if s == want {
+				return i
+			}
+		}
+		return 0
+	}
+
+	form := tview.NewForm()
+	form.SetTitle(fmt.Sprintf(" Options: %s ", name))
+	form.AddInputField(FieldOptAWSProfile, opts.AWSProfile, 40, nil, nil)
+	form.AddCheckbox(FieldOptReadOnly, opts.ReadOnly, nil)
+	form.AddCheckbox(FieldOptTrash, opts.Trash, nil)
+	form.AddInputField(FieldOptTrashPfx, opts.TrashPrefix, 40, nil, nil)
+	form.AddCheckbox(FieldOptMime, opts.DetectMime, nil)
+	form.AddDropDown(FieldOptSSE, sseLabels(sseChoices), indexOf(sseChoices, opts.SSE), nil)
+	form.AddInputField(FieldOptKMSKey, opts.KMSKey, 40, nil, nil)
+	form.AddDropDown(FieldOptChecksum, sseLabels(checksumChoices), indexOf(checksumChoices, opts.Checksum), nil)
+	form.AddCheckbox(FieldOptVerify, opts.Verify, nil)
+	form.SetBorder(true)
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEsc {
+			v.Pages.RemovePage("modal")
+		}
+		return event
+	})
+	return form
+}
+
+// sseLabels renders a choice list where the empty option needs a name — a
+// blank dropdown row reads as a bug rather than as "leave it to the bucket".
+func sseLabels(choices []string) []string {
+	out := make([]string, 0, len(choices))
+	for _, c := range choices {
+		if c == "" {
+			out = append(out, "(none)")
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// ProfileOptionsHeight sizes the options dialog: one row per field plus the
+// buttons and the border.
+const ProfileOptionsHeight = 17
 
 // NewSearchForm builds the recursive-search form: a query input (item 0) and an
 // "All buckets" checkbox (item 1). Esc closes the "modal" page.
@@ -327,6 +479,12 @@ const (
 	FieldSyncDstBucket = "Dest bucket (remote → remote)"
 	FieldSyncDstPrefix = "Dest prefix (remote → remote)"
 	FieldSyncDelete    = "Delete extraneous at destination"
+	// FieldSyncChecksum turns on content comparison. Named "slower" in the
+	// label because it is: one extra request per object on the remote side
+	// and a full read of every candidate on the local side.
+	FieldSyncChecksum = "Compare content by checksum (slower)"
+	// FieldSyncExclude filters both sides before the diff.
+	FieldSyncExclude = "Exclude (comma-separated globs)"
 )
 
 // NewSyncForm builds the sync dialog. The current bucket+prefix shown in the
@@ -350,6 +508,8 @@ func (v *View) NewSyncForm(current, localDir string, directions, buckets []strin
 	form.AddDropDown(FieldSyncDstBucket, buckets, initialBucket, nil)
 	form.AddInputField(FieldSyncDstPrefix, dstPrefix, 56, nil, nil)
 	form.AddCheckbox(FieldSyncDelete, false, nil)
+	form.AddCheckbox(FieldSyncChecksum, false, nil)
+	form.AddInputField(FieldSyncExclude, "", 56, nil, nil)
 	form.SetBorder(true)
 	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
 		if event.Key() == tcell.KeyEsc {
@@ -493,6 +653,7 @@ const helpProfiles = `
     Ctrl+N        Create new profile
     Ctrl+I        Import profile from ~/.aws (incl. session token)
     Ctrl+Y        Copy profile
+    o             Per-profile options (read-only, trash, SSE, checksums)
     Ctrl+E        Edit profile
     Ctrl+V        Verify profile (test connection)
     Del           Delete profile
@@ -503,52 +664,32 @@ const helpProfiles = `
     Ctrl+Q        Quit
 `
 
+// helpBrowser is the fallback body, used only when the caller has no keymap to
+// render (the browser always has one). It lists what the keymap cannot rebind
+// — the keys the list widget itself handles — and points at the real list.
 const helpBrowser = `
   [::b]Navigation[::-]
     [↓,↑]         Down / up
-    Enter         Open folder / select
+    Enter         Open folder / bucket
     Backspace     Up ([..])
-    [ / ]         History back / forward (also Alt+left/right)
-    Ctrl+O        Toggle dual-pane
-    Tab           Switch active pane (dual-pane)
-    Ctrl+B        Bookmarks (go / add / remove)
-    Ctrl+K        Command palette (abort uploads, bucket config, log…)
-    Ctrl+P        Show Profiles
+    PgUp/PgDn     Page through the listing
 
-  [::b]Actions[::-]
-    Ctrl+N        Create bucket / folder
-    Ctrl+D        Download file/folder (for files and folders)
-    Ctrl+R        Rename (pattern rename when >1 marked)
-    Ctrl+Y        Copy selected/marked to a destination bucket/prefix
-    Ctrl+T        Move selected/marked to a destination bucket/prefix
-    Ctrl+G        Bucket/folder summary
-    Ctrl+L        File properties (size, ETag, link)
-    v             Version history (restore / download / delete)
-    m             Edit metadata & object tags
-    c             Storage class / Glacier restore
-    Ctrl+W        Copy presigned (time-limited) share link
-    Ctrl+U        Open local file manager (for upload)
-    Ctrl+E        Sync: local ⇄ this prefix, or this prefix → another
-    =             Compare the two panes (dual-pane, read-only)
-    D             Find duplicates under this prefix (size + ETag)
-    e             Edit object in $EDITOR (small text objects)
-    >             Copy marked items to another profile
-    y / x / p     Clipboard: copy / cut / paste objects
-    u             Undo last move/rename
-    t             Transfers panel (background jobs)
-    /             Filter the current listing (live)
-    s / S         Sort: cycle name/size/date / reverse direction
-    r / F5        Refresh the current listing
-    Ctrl+F        Recursive search (checkbox: all buckets)
-    Space         Select object for download
-    Ctrl+S        Select all objects for download
-    Ctrl+X        Unselect all objects for download
-    Del           Delete marked/highlighted (recursive for dirs)
+  [::b]Everything else[::-]
+    Ctrl+H        Reopen this panel for the generated key list
+` + helpBrowserNotes
 
-  [::b]Misc[::-]
-    Ctrl+H        This help
-    Ctrl+A        Show About
-    Ctrl+Q        Quit
+// helpBrowserNotes is what the generated key list cannot say for itself: the
+// modes, the second namespace, and where the rest of the app lives.
+const helpBrowserNotes = `
+  [::b]Notes[::-]
+    Enter/↑↓      Navigate; Enter opens a folder or a bucket
+    ,             Leader key: press it, then one of the keys it lists
+    Ctrl+K        Command palette — every action, searchable
+    /             Filter accepts text, *.glob or re:regex
+    Esc           Stops a long listing (a partial listing stays browsable)
+    l             Points the other pane at a local directory; Ctrl+Y then
+                  uploads from it (the local pane never deletes)
+    keys.json     ~/.config/s3duck-tui/keys.json rebinds any of the above
 `
 
 // scrollHint is the footer under the hotkey list: it names the scroll keys and,
@@ -572,10 +713,17 @@ func scrollHint(offset, visible, total int) string {
 // terminal, so the panel scrolls (arrows, PgUp/PgDn, Home/End, j/k) and is
 // clamped to the terminal height rather than being cut off at a hard-coded 44
 // rows. onClose is called when the user dismisses it.
-func (v *View) HotkeysModal(profiles bool, onClose func()) tview.Primitive {
+// HotkeysModal renders the hotkey panel. For the browser screen the body is
+// built from the live keymap (lines), so a rebound key is described correctly
+// and a panel can never drift from the bindings the way a hard-coded list
+// does. The profiles screen still has a static list: its keys are not
+// configurable.
+func (v *View) HotkeysModal(profiles bool, lines []string, onClose func()) tview.Primitive {
 	text := helpBrowser
 	if profiles {
 		text = helpProfiles
+	} else if len(lines) > 0 {
+		text = "\n  [::b]Keys (from your keymap)[::-]\n" + strings.Join(lines, "\n") + "\n" + helpBrowserNotes
 	}
 	total := strings.Count(text, "\n")
 
@@ -631,12 +779,14 @@ func (v *View) AboutModal() *tview.TextView {
                     _  [dim](quack)[-]
 				 __( )>
 				 \__\      [::b]Features[::-]
-							• Profiles, incl. ~/.aws import
-							• Walking dirs, filter, search
-							• Download / upload files & dirs
-							• Copy / move / rename / delete
+							• Profiles, incl. ~/.aws (SSO/role) import
+							• Dual pane, one side can be local
+							• Filter & search: text, glob or regex
+							• Download / upload, verified by checksum
+							• Copy / move / rename / delete / trash
 							• Directory sync (dry run first)
-                            • Summary view support
+							• Preview, versions & diff, usage browser
+							• Rebindable keys (~/.config/s3duck-tui)
          [dim]Press any key to close.[-]
 			`
 

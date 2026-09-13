@@ -255,6 +255,9 @@ func (m *Model) copyMultipart(ctx context.Context, sp copySpec, size int64, attr
 	if tagging, err := getObjectTagging(ctx, m.Client, sp.srcBucket, sp.srcKey, sp.srcVersion); err == nil && tagging != "" {
 		create.Tagging = aws.String(tagging)
 	}
+	// A bare multipart upload also loses the encryption the single-request
+	// path would have inherited, so the profile's choice is re-applied here.
+	m.writeOpts().applyCreateMultipart(create)
 
 	started, err := m.Client.CreateMultipartUpload(ctx, create)
 	if err != nil {

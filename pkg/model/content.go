@@ -3,14 +3,18 @@ package model
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3t "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 )
 
 // ObjectContent is a whole small object in memory, together with every
@@ -163,6 +167,98 @@ func (m *Model) GetObjectContent(ctx context.Context, bucket *Object, key string
 	return content, nil
 }
 
+// GetObjectHead reads the first n bytes of an object with a ranged GET, for
+// the preview. A range is the whole point: previewing a 40 GiB log has to cost
+// one small request, not a download, and S3 answers a Range on any object
+// whatever its size.
+//
+// A backend that ignores the Range header (some S3-compatible ones do) would
+// otherwise stream the whole body into memory, so the read is capped
+// independently of what was asked for — the same belt-and-braces the editor's
+// loader uses.
+func (m *Model) GetObjectHead(ctx context.Context, bucket *Object, key string, n int64) (data []byte, contentType string, err error) {
+	if bucket == nil || bucket.Key == nil {
+		return nil, "", fmt.Errorf("bucket is nil")
+	}
+	if key == "" {
+		return nil, "", fmt.Errorf("key is empty")
+	}
+	if n <= 0 {
+		return nil, "", fmt.Errorf("n must be positive")
+	}
+	out, err := m.Client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(*bucket.Key),
+		Key:    aws.String(key),
+		Range:  aws.String(fmt.Sprintf("bytes=0-%d", n-1)),
+	})
+	if err != nil {
+		// A zero-byte object has no satisfiable range at all, so S3 answers
+		// this with 416 InvalidRange. An empty object previews as empty; it
+		// is not an error to report to the user.
+		if isInvalidRange(err) {
+			return nil, "", nil
+		}
+		return nil, "", err
+	}
+	defer out.Body.Close()
+
+	data, err = io.ReadAll(io.LimitReader(out.Body, n))
+	if err != nil {
+		return nil, "", err
+	}
+	return data, aws.ToString(out.ContentType), nil
+}
+
+// isInvalidRange reports whether err is S3 refusing a byte range as
+// unsatisfiable. Both the typed status and the bare code are matched: the
+// S3-compatible backends do not agree on which they return.
+func isInvalidRange(err error) bool {
+	var re *awshttp.ResponseError
+	if errors.As(err, &re) && re.HTTPStatusCode() == http.StatusRequestedRangeNotSatisfiable {
+		return true
+	}
+	var api smithy.APIError
+	if errors.As(err, &api) {
+		switch api.ErrorCode() {
+		case "InvalidRange", "RequestedRangeNotSatisfiable", "416":
+			return true
+		}
+	}
+	return false
+}
+
+// GetVersionContent is GetObjectContent for one specific version, which is
+// what a version diff needs: the current body is one GET, the old body is the
+// same GET with a VersionId.
+func (m *Model) GetVersionContent(ctx context.Context, bucket *Object, key, versionID string, maxSize int64) ([]byte, error) {
+	if bucket == nil || bucket.Key == nil {
+		return nil, fmt.Errorf("bucket is nil")
+	}
+	in := &s3.GetObjectInput{
+		Bucket: aws.String(*bucket.Key),
+		Key:    aws.String(key),
+	}
+	if versionID != "" {
+		in.VersionId = aws.String(versionID)
+	}
+	out, err := m.Client.GetObject(ctx, in)
+	if err != nil {
+		return nil, err
+	}
+	defer out.Body.Close()
+	if out.ContentLength > maxSize {
+		return nil, fmt.Errorf("version is %d bytes, over the %d-byte cap", out.ContentLength, maxSize)
+	}
+	data, err := io.ReadAll(io.LimitReader(out.Body, maxSize+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxSize {
+		return nil, fmt.Errorf("version body exceeds the %d-byte cap", maxSize)
+	}
+	return data, nil
+}
+
 // CurrentETag returns the object's ETag right now (quotes trimmed), via a
 // HEAD. The editor flow compares it against the ETag captured at download
 // time so a save can refuse to overwrite a concurrent modification.
@@ -197,6 +293,10 @@ func (m *Model) PutBytes(ctx context.Context, bucket *Object, key string, data [
 		Body:   bytes.NewReader(data),
 	}
 	applyAttrs(in, attrs, true)
+	// applyAttrs already carried the object's own Content-Type across, so
+	// applyPut only fills one in when the object never had one, and always
+	// applies the profile's encryption/checksum choice.
+	m.writeOpts().applyPut(in, key)
 	_, err := m.Client.PutObject(ctx, in)
 	return err
 }
@@ -256,6 +356,10 @@ func CrossCopy(ctx context.Context, src *Model, srcBucket *Object, srcKey string
 		Body:   reader,
 	}
 	applyAttrs(in, attrs, false)
+	// The destination profile's rules apply, not the source's: encryption is
+	// a property of where the bytes land. The source's Content-Type rides
+	// along in attrs, so the derivation here only fills a gap.
+	dst.writeOpts().applyPut(in, dstKey)
 
 	if _, err := newUploader(dst.Client).Upload(ctx, in); err != nil {
 		return fmt.Errorf("writing %s: %w", dstKey, err)

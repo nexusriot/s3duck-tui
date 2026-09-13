@@ -158,6 +158,9 @@ func (c *Controller) askOverwriteBlocking(title string, conflicts []string, cand
 // plannedCopyKeys is the plan function for a copy/move/rename: the exact
 // destination keys of every item, folders expanded at the source.
 func plannedCopyKeys(mdl *model.Model, srcBucket, dstBucket *model.Object, items []copyMoveItem, dstPrefix string) func() ([]string, error) {
+	// The plan runs on a background goroutine behind the overwrite scan's
+	// modal; it inherits no cancellation of its own yet, so it is explicit
+	// about using the background context rather than hiding a TODO.
 	return func() ([]string, error) {
 		var keys []string
 		for _, it := range items {
@@ -165,7 +168,7 @@ func plannedCopyKeys(mdl *model.Model, srcBucket, dstBucket *model.Object, items
 			if it.isFolder {
 				dstKey += "/"
 			}
-			planned, err := mdl.PlannedCopyKeys(srcBucket, dstBucket, it.srcKey, dstKey, it.isFolder)
+			planned, err := mdl.PlannedCopyKeys(context.Background(), srcBucket, dstBucket, it.srcKey, dstKey, it.isFolder)
 			if err != nil {
 				return nil, err
 			}

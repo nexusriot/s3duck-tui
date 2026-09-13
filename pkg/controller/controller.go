@@ -72,6 +72,14 @@ type downloadSummary struct {
 
 	skippedPaths []string
 	failedItems  []string
+	// verified / unverified count post-transfer checksum comparisons: how
+	// many files were confirmed byte-for-byte, and how many could not be
+	// (a multipart object with no whole-object checksum).
+	verified   int
+	unverified int
+	// failures is the complete ledger: failedItems is capped at 8 for the
+	// report text, but a retry has to know about every one of them.
+	failures []opFailure
 }
 
 func (s *downloadSummary) addSkipped(p string) {
@@ -86,6 +94,33 @@ func (s *downloadSummary) addFailed(key string, err error) {
 	if len(s.failedItems) < 8 {
 		s.failedItems = append(s.failedItems, fmt.Sprintf("%s: %v", key, err))
 	}
+	s.failures = append(s.failures, opFailure{item: retryItem{label: key}, err: err})
+}
+
+// addFailedTarget is addFailed for a unit that can be retried: the download
+// target is kept alongside the message so the report can offer to fetch just
+// the objects that failed.
+func (s *downloadSummary) addFailedTarget(t model.DownloadTarget, err error) {
+	key := t.Key
+	if key == "" {
+		key = "<nil-key>"
+	}
+	s.failed++
+	if len(s.failedItems) < 8 {
+		s.failedItems = append(s.failedItems, fmt.Sprintf("%s: %v", key, err))
+	}
+	s.failures = append(s.failures, opFailure{item: retryItem{label: key, target: t}, err: err})
+}
+
+// retryTargets returns the download targets that failed, for a re-run.
+func (s *downloadSummary) retryTargets() []model.DownloadTarget {
+	out := make([]model.DownloadTarget, 0, len(s.failures))
+	for _, f := range s.failures {
+		if t, ok := f.item.target.(model.DownloadTarget); ok {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 func (s *downloadSummary) text(totalBytes int64, canceled bool) string {
@@ -103,6 +138,13 @@ func (s *downloadSummary) text(totalBytes int64, canceled bool) string {
 	fmt.Fprintf(&b, "Skipped: %d\n", s.skipped)
 	fmt.Fprintf(&b, "Overwritten: %d\n", s.overwritten)
 	fmt.Fprintf(&b, "Failed: %d\n", s.failed)
+	if s.verified > 0 || s.unverified > 0 {
+		fmt.Fprintf(&b, "Verified: %d", s.verified)
+		if s.unverified > 0 {
+			fmt.Fprintf(&b, " (%d not verifiable)", s.unverified)
+		}
+		b.WriteString("\n")
+	}
 	fmt.Fprintf(&b, "Bytes: %s / %s\n",
 		humanize.IBytes(uint64(s.bytesDone)),
 		humanize.IBytes(uint64(totalBytes)),
@@ -189,6 +231,23 @@ type Controller struct {
 	// hist is the back/forward navigation history for this pane.
 	hist histStack
 
+	// localDir makes this pane a local-filesystem browser instead of a remote
+	// one when non-empty. Part of the swapped pane state, like currentBucket.
+	localDir string
+
+	// keys is the resolved keymap (defaults plus ~/.config/s3duck-tui/keys.json).
+	keys keymap
+	// leaderArmed is true between the leader key and the key it prefixes. UI
+	// goroutine only, like every other input-handler field.
+	leaderArmed bool
+
+	// listing tracks the in-flight navigation listing so Esc can cancel it.
+	listing listingState
+	// partial records that this pane's object map is incomplete (the listing
+	// was cancelled or hit listCap), so the title can say so. Per-pane, like
+	// the objects it describes.
+	partial bool
+
 	// Dual-pane state. The controller's live per-location fields above ARE the
 	// active pane; panes[inactive] snapshots the other pane. active is 0 or 1;
 	// dual is whether both panes are shown; pane1Init guards one-time pane-1
@@ -201,6 +260,8 @@ type Controller struct {
 	// activity is a capped, in-session log of operations shown via the palette.
 	activity   []activityEntry
 	activityMu sync.Mutex
+	// auditPath is the persistent operation log. Empty disables it.
+	auditPath string
 
 	// clip is the object clipboard (yank/cut → paste).
 	clip clipboard
@@ -214,8 +275,13 @@ type Controller struct {
 	// jobSem caps concurrent byte-transfer phases at 2 (aggregate bandwidth is
 	// separately capped by model.Limiter). transfersList/transfersOpen back the
 	// live panel; all touched on the UI goroutine except job fields (own mutex).
-	jobs          []*transferJob
-	jobsMu        sync.Mutex
+	jobs   []*transferJob
+	jobsMu sync.Mutex
+	// notice / noticeUntil hold the transient header message announcing a
+	// finished background transfer. Guarded by jobsMu, which already covers
+	// everything the status ticker reads.
+	notice        string
+	noticeUntil   time.Time
 	nextJobID     int
 	jobSem        chan struct{}
 	transfersList *tview.List
@@ -244,6 +310,8 @@ type paneState struct {
 	filter          string
 	selectedByScope map[string]map[string]bool
 	hist            histStack
+	partial         bool
+	localDir        string
 }
 
 // activityEntry is one line in the in-session operation log.
@@ -278,6 +346,8 @@ func NewController() *Controller {
 	// writes to a nil map after a swap.
 	c.panes[1].selectedByScope = make(map[string]map[string]bool)
 	c.jobSem = make(chan struct{}, 2) // at most 2 concurrent byte transfers
+	c.keys = loadKeymap(KeysPath(params.HomeDir))
+	c.auditPath = AuditPath(params.HomeDir)
 	c.wireFilter(v.PaneFilter(0))
 	c.wireFilter(v.PaneFilter(1))
 	return c
@@ -360,6 +430,11 @@ func (c *Controller) askOverwrite(path string) overwriteDecision {
 }
 
 func (c *Controller) scopeKey() string {
+	if c.localDir != "" {
+		// A local pane needs a scope of its own: sharing the empty one with
+		// the buckets screen would make its marks leak between the two.
+		return localPaneScope(c.localDir)
+	}
 	if c.currentBucket == nil || c.currentBucket.Key == nil {
 		return ""
 	}
@@ -474,29 +549,6 @@ func objKey(o *model.Object) string {
 	return *o.FullPath
 }
 
-func (c *Controller) makeObjectMap() error {
-	var list []*model.Object
-	var err error
-	dirs := make(map[string]*model.Object)
-
-	if c.currentBucket == nil {
-		list, err = c.model.ListBuckets()
-		if err != nil {
-			return err
-		}
-	} else {
-		list, err = c.model.List(c.currentPath, c.currentBucket)
-	}
-	if err != nil {
-		return err
-	}
-	for _, obj := range list {
-		dirs[objKey(obj)] = obj
-	}
-	c.setObjs(dirs)
-	return nil
-}
-
 // localDownloadPath maps an S3 key onto its local destination path. It errors
 // on keys whose cleaned path would escape destPath — see model.SafeLocalPath.
 func localDownloadPath(currentPath, destPath, s3Key string) (string, error) {
@@ -580,6 +632,11 @@ func (c *Controller) getSelectedObjectName() string {
 
 func (c *Controller) Profiles() {
 	c.browsing = false
+	// Leaving a profile is also a good moment to record where it was.
+	c.rememberLocation()
+	c.persistProfiles()
+	c.activeConfig = nil
+	c.showIdentity()
 	c.resetPanes() // collapse to single-pane; the filter box is inert here
 	// The browser's column captions have no meaning over the profile list.
 	c.view.Header.SetText("")
@@ -647,6 +704,12 @@ func (c *Controller) Delete() {
 	if c.view.List.GetItemCount() == 0 {
 		return
 	}
+	if c.remoteOnly("Delete") {
+		return
+	}
+	if c.readOnlyBlocked("delete objects") {
+		return
+	}
 
 	names := c.selectedNames()
 	if len(names) == 0 {
@@ -680,12 +743,20 @@ func (c *Controller) Delete() {
 		return
 	}
 
-	scanning := tview.NewModal().SetText("Calculating delete size...")
-	c.view.Pages.AddPage("progress", scanning, true, true)
+	// The scan is a recursive listing per folder target, which on a large
+	// prefix is the slowest part of the whole flow — so it is cancellable,
+	// and cancelling it abandons the delete rather than confirming against
+	// half-counted totals.
+	_, scanCtx, scanCancel := c.cancellableWait("progress", "Calculating delete size...")
 
 	bucket := c.currentBucket
 	mdl := c.model
 	go func() {
+		// The cancel belongs to the scan, not to Delete: deferring it in the
+		// caller tore the context down the moment Delete returned — which is
+		// immediately — so every folder scan failed with context.Canceled and
+		// the confirmation always claimed the totals were incomplete.
+		defer scanCancel()
 		for i := range targets {
 			if !targets[i].isFolder && !targets[i].isBucket {
 				continue
@@ -699,7 +770,7 @@ func (c *Controller) Delete() {
 				b := targets[i].key
 				scanBucket = &model.Object{Key: &b, Ot: model.Bucket}
 			}
-			objs, err := mdl.ListObjects(key, scanBucket)
+			objs, err := mdl.ListObjects(scanCtx, key, scanBucket)
 			if err != nil {
 				targets[i].scanErr = err
 				continue
@@ -708,6 +779,15 @@ func (c *Controller) Delete() {
 				targets[i].objects++
 				targets[i].bytes += o.Size
 			}
+		}
+
+		// Cancelling the sizing abandons the delete: a confirmation built on
+		// half-counted totals is not one the user can answer.
+		if scanCtx.Err() != nil {
+			c.view.App.QueueUpdateDraw(func() {
+				c.view.Pages.RemovePage("progress").SwitchToPage("main")
+			})
+			return
 		}
 
 		c.view.App.QueueUpdateDraw(func() {
@@ -729,37 +809,52 @@ func (c *Controller) Delete() {
 // runDelete executes the confirmed deletes sequentially behind a progress
 // modal, then refreshes the listing and reports any failures.
 func (c *Controller) runDelete(targets []deleteTarget, bucket *model.Object) {
-	progress := tview.NewModal().SetText("Deleting...")
-	c.view.Pages.AddPage("progress", progress, true, true)
+	// A folder delete lists recursively before it removes anything, so a
+	// delete over a big prefix is long enough to want out of. Cancelling
+	// stops before the next target: the ones already removed are reported,
+	// not silently forgotten.
+	progress, ctx, cancel := c.cancellableWait("progress", "Deleting...")
 
 	mdl := c.model
+	trash := c.trashPrefix()
 	go func() {
-		var failed []string
-		okCount := 0
+		defer cancel()
+		res := newOpResult("Delete")
+		canceled := false
 
 		for i, t := range targets {
+			if ctx.Err() != nil {
+				canceled = true
+				break
+			}
+			i, t := i, t
 			c.view.App.QueueUpdateDraw(func() {
 				progress.SetText(fmt.Sprintf("Deleting\n%d/%d\n%s", i+1, len(targets), t.key))
 			})
 
 			var err error
-			if t.isBucket {
+			switch {
+			case t.isBucket:
 				// The confirm promised the bucket's objects would go, and S3
 				// only deletes empty buckets — so empty it first.
 				name := t.key
 				b := &model.Object{Key: &name, Ot: model.Bucket}
-				if err = mdl.EmptyBucket(b); err == nil {
+				if err = mdl.EmptyBucket(ctx, b); err == nil {
 					err = mdl.DeleteBucket(&name)
 				}
-			} else {
+			case trash != "":
+				// Safe delete: move the object (or the whole prefix) under the
+				// profile's trash prefix instead of removing it.
+				err = c.trashTarget(ctx, mdl, bucket, t, trash)
+			default:
 				key := t.key
-				err = mdl.Delete(&key, bucket)
+				err = mdl.Delete(ctx, &key, bucket)
 			}
 			if err != nil {
-				failed = append(failed, fmt.Sprintf("%s: %v", t.key, err))
+				res.fail(retryItem{label: t.key, target: t}, err)
 				continue
 			}
-			okCount++
+			res.ok()
 
 			// Drop the deleted item from the selection set so the
 			// "Selected: N" count and markers stay accurate.
@@ -770,25 +865,21 @@ func (c *Controller) runDelete(targets []deleteTarget, bucket *model.Object) {
 			c.mu.Unlock()
 		}
 
-		c.logActivity("Delete: %d ok, %d failed", okCount, len(failed))
-
-		c.view.App.QueueUpdateDraw(func() {
-			status := "Delete complete."
-			if len(failed) > 0 {
-				status = "Delete finished with errors."
+		verb := "Delete"
+		if trash != "" {
+			verb = "Trash"
+		}
+		c.logActivity("%s: %d ok, %d failed", verb, res.okCount, len(res.failures))
+		c.reportOpResult(progress, res, canceled, func(items []retryItem) {
+			retry := make([]deleteTarget, 0, len(items))
+			for _, it := range items {
+				if t, ok := it.target.(deleteTarget); ok {
+					retry = append(retry, t)
+				}
 			}
-			msg := fmt.Sprintf("%s\n\nDeleted: %d\nFailed: %d", status, okCount, len(failed))
-			for _, f := range failed {
-				msg += "\n  - " + f
+			if len(retry) > 0 {
+				c.runDelete(retry, bucket)
 			}
-			msg += "\n\nPress Done to return."
-
-			progress.SetText(msg)
-			progress.AddButtons([]string{"Done"})
-			progress.SetDoneFunc(func(_ int, _ string) {
-				c.view.Pages.RemovePage("progress").SwitchToPage("main")
-			})
-			c.view.App.SetFocus(progress)
 		})
 
 		c.updateList()
@@ -819,6 +910,9 @@ func (c *Controller) resolveDownloadDir() string {
 }
 
 func (c *Controller) Download() {
+	if c.remoteOnly("Download") {
+		return
+	}
 	if c.view.List.GetItemCount() == 0 || c.currentBucket == nil {
 		return
 	}
@@ -854,15 +948,16 @@ func (c *Controller) Download() {
 	// Folder resolution pages through the whole prefix over the network.
 	// Behind a modal, off the UI goroutine — inline it used to freeze the
 	// entire TUI for the length of the listing, and swallow its errors.
-	resolving := tview.NewModal().SetText("Resolving objects...")
-	c.view.Pages.AddPage("progress", resolving, true, true)
+	_, resolveCtx, resolveCancel := c.cancellableWait("progress", "Resolving objects...")
 
 	go func() {
+		defer resolveCancel()
 		var allObjects []model.DownloadTarget
 		var totalSize int64
 		for _, val := range sel {
 			key := *val.FullPath
 			objs, size, err := mdl.ResolveDownloadObjects(
+				resolveCtx,
 				key,
 				val.Ot == model.Folder,
 				val.Size,
@@ -870,7 +965,10 @@ func (c *Controller) Download() {
 			)
 			if err != nil {
 				c.view.App.QueueUpdateDraw(func() { c.view.Pages.RemovePage("progress") })
-				c.error("Download: resolving objects failed", err)
+				// A cancel is the user's own decision, not an error to report.
+				if resolveCtx.Err() == nil {
+					c.error("Download: resolving objects failed", err)
+				}
 				return
 			}
 			allObjects = append(allObjects, objs...)
@@ -885,11 +983,14 @@ func (c *Controller) Download() {
 			proceed := func(cwd string) {
 				c.runDownload(mdl, srcBucket, srcPath, len(names), allObjects, totalSize, cwd)
 			}
-			// If the active profile defines a download directory, use it
-			// directly; otherwise let the user pick one.
-			if c.activeConfig != nil && strings.TrimSpace(c.activeConfig.DownloadDir) != "" {
+			switch {
+			case c.otherPaneLocalDir() != "":
+				// A local pane is open: land the files where the user is
+				// looking rather than in the profile's download directory.
+				proceed(c.otherPaneLocalDir() + string(os.PathSeparator))
+			case c.activeConfig != nil && strings.TrimSpace(c.activeConfig.DownloadDir) != "":
 				proceed(c.resolveDownloadDir())
-			} else {
+			default:
 				c.chooseDir(c.params.HomeDir, proceed)
 			}
 		})
@@ -899,6 +1000,10 @@ func (c *Controller) Download() {
 // runDownload confirms and executes the byte phase for already-resolved
 // objects. Runs on the UI goroutine.
 func (c *Controller) runDownload(mdl *model.Model, srcBucket *model.Object, srcPath string, selectedCount int, allObjects []model.DownloadTarget, totalSize int64, cwd string) {
+	// Read the profile's verify setting here, on the UI goroutine, and carry
+	// it into the transfer: a profile switch mid-download must not change the
+	// rules a running transfer is playing by.
+	verifyAfter := c.verifyDownloads()
 	{
 		confirm := c.view.NewConfirm()
 		confirm.SetText(fmt.Sprintf(
@@ -1042,19 +1147,53 @@ func (c *Controller) runDownload(mdl *model.Model, srcBucket *model.Object, srcP
 					if reportTotal == 0 {
 						reportTotal = totalSize
 					}
+					sumMu.Lock()
+					retryTargets := sum.retryTargets()
+					ledger := &opResult{name: "Download", okCount: sum.downloaded, failures: sum.failures}
+					sumMu.Unlock()
+
 					c.view.App.QueueUpdateDraw(func() {
 						report := sum.text(reportTotal, isCanceled)
 
+						buttons := []string{"Done", "Copy report"}
+						if len(retryTargets) > 0 {
+							buttons = append(buttons, fmt.Sprintf("Retry failed (%d)", len(retryTargets)))
+						}
+						if ledger.failed() > 0 {
+							buttons = append(buttons, "Export list")
+						}
 						progress.ClearButtons()
-						progress.AddButtons([]string{"Done", "Copy report"})
+						progress.AddButtons(buttons)
 						progress.SetText(report)
 
 						progress.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
-							switch buttonLabel {
-							case "Copy report":
+							switch {
+							case buttonLabel == "Copy report":
 								u.CopyToClipboard(report)
 								go c.success("Download report copied")
-							case "Done":
+							case strings.HasPrefix(buttonLabel, "Retry failed"):
+								// Re-fetch only the objects that failed. Their
+								// sizes are known, so the retry gets a real
+								// progress total without re-resolving anything.
+								var bytes int64
+								for _, t := range retryTargets {
+									bytes += t.Size
+								}
+								c.view.Pages.RemovePage("progress").SwitchToPage("main")
+								// Inline: runDownload builds the confirmation
+								// page and reads the profile's verify setting
+								// on the UI goroutine, which this button
+								// handler already is. Spawning it raced the
+								// draw loop over those widgets.
+								c.runDownload(mdl, srcBucket, srcPath, len(retryTargets), retryTargets, bytes, cwd)
+							case buttonLabel == "Export list":
+								path, err := ledger.writeFailureReport(c.resolveDownloadDir(), time.Now())
+								if err != nil {
+									go c.error("Export failed", err)
+									return
+								}
+								progress.SetText(report + "\nWritten to " + path)
+							default:
 								c.view.Pages.RemovePage("progress").SwitchToPage("main")
 							}
 						})
@@ -1255,9 +1394,35 @@ func (c *Controller) runDownload(mdl *model.Model, srcBucket *model.Object, srcP
 						}
 						if err != nil {
 							sumMu.Lock()
-							sum.addFailed(keyStr, err)
+							sum.addFailedTarget(ri.object, err)
 							sumMu.Unlock()
 							return
+						}
+						// Post-transfer verify: the bytes are on disk, so
+						// compare them against the object's own checksum
+						// before calling the download a success. A mismatch
+						// is counted as a failure — a silently corrupt file
+						// is the worst outcome of the three.
+						if verifyAfter {
+							if vr, verr := c.verifyDownloaded(ctx, mdl, srcBucket, ri.object, srcPath, cwd); verr != nil {
+								sumMu.Lock()
+								sum.addFailedTarget(ri.object, fmt.Errorf("downloaded, but verification failed: %w", verr))
+								sumMu.Unlock()
+								return
+							} else if vr.Mismatch {
+								sumMu.Lock()
+								sum.addFailedTarget(ri.object, fmt.Errorf("downloaded, but %s", vr.String()))
+								sumMu.Unlock()
+								return
+							} else if !vr.Verified {
+								sumMu.Lock()
+								sum.unverified++
+								sumMu.Unlock()
+							} else {
+								sumMu.Lock()
+								sum.verified++
+								sumMu.Unlock()
+							}
 						}
 						sumMu.Lock()
 						sum.downloaded++
@@ -1330,10 +1495,30 @@ func (c *Controller) updateList() error {
 	c.refreshMu.Lock()
 	defer c.refreshMu.Unlock()
 
-	if err := c.makeObjectMap(); err != nil {
+	if c.localMode() {
+		// A local listing is one ReadDir: no pagination, no cancellation to
+		// arrange, nothing to stream.
+		if err := c.makeLocalObjectMap(); err != nil {
+			go c.error("Cannot read the directory", err)
+			return err
+		}
+		c.setPartial(false)
+		c.renderList()
+		return nil
+	}
+
+	ctx := c.listing.begin()
+	defer c.listing.end(ctx)
+
+	// The pane and title base are captured before the fetch: a Tab during a
+	// slow listing must not redirect the progress counter into the other pane.
+	target, base := c.view.List, c.listTitleBase()
+	partial, err := c.makeObjectMap(ctx, c.listProgressReporter(target, base))
+	if err != nil {
 		go c.error("Failed to fetch folder", err)
 		return err
 	}
+	c.setPartial(partial)
 	c.renderList()
 	return nil
 }
@@ -1444,22 +1629,51 @@ func (c *Controller) renderList() {
 	})
 }
 
+// listTitleBase is the location part of the list title, without the volatile
+// decorations (selection count, filter, sort, listing progress). The listing
+// progress reporter needs it to rewrite the title while a fetch is running.
+func (c *Controller) listTitleBase() string {
+	if c.localMode() {
+		return c.localTitle()
+	}
+	if c.currentBucket == nil {
+		return "(buckets)"
+	}
+	return fmt.Sprintf("(%s)/%s", *c.currentBucket.Key, c.currentPath)
+}
+
 // listChrome builds the list title and the frame help line for the current
 // screen (buckets vs objects), including the selection count and active filter.
 func (c *Controller) listChrome() (title, fText string) {
 	var suff string
-	if c.currentBucket == nil {
-		title = "(buckets)"
-	} else {
-		base := fmt.Sprintf("(%s)/%s", *c.currentBucket.Key, c.currentPath)
+	title = c.listTitleBase()
+	if c.localMode() {
 		if n := c.selectedCount(); n > 0 {
-			base = fmt.Sprintf("%s  [green]Selected: %d", base, n)
+			title = fmt.Sprintf("%s  [green]Selected: %d", title, n)
 		}
-		title = base
+		if f := c.getFilter(); f != "" {
+			m := mustMatcher(f)
+			title = fmt.Sprintf("%s  [yellow]filter:%s (%s)", title, f, m.matchLabel())
+		}
+		return title, localBrowseHelp()
+	}
+	if c.currentBucket != nil {
+		if n := c.selectedCount(); n > 0 {
+			title = fmt.Sprintf("%s  [green]Selected: %d", title, n)
+		}
 		suff = "[::b][Ctrl+D[][::-]Download [::b][Ctrl+U[][::-]Upload [::b][Ctrl+F][::-]Search "
 	}
+	title += partialNote(c.getPartial(), len(c.objsSnapshot()))
 	if f := c.getFilter(); f != "" {
-		title = fmt.Sprintf("%s  [yellow]filter:%s", title, f)
+		// Naming the mode is what makes the three-dialect query legible: a
+		// user who typed "*.log" can see it was read as a glob, and a
+		// half-finished "re:[" says so instead of just emptying the list.
+		m := mustMatcher(f)
+		colour := "yellow"
+		if m.broken() {
+			colour = "red"
+		}
+		title = fmt.Sprintf("%s  [%s]filter:%s (%s)", title, colour, f, m.matchLabel())
 	}
 	title = fmt.Sprintf("%s  [blue]%s", title, sortLabel(c.getSort()))
 	fText = fmt.Sprintf("[::b][↓,↑][::-]D/U [::b][Ent/Bck][::-]L/U %s[::b][/][::-]Filter [::b][Del[][::-]Delete [::b][Ctrl+N][::-]Create [::b][Ctrl+P][::-]Profiles [::b][Ctrl+L][::-]Properties [::b][Ctrl+H][::-]Hotkeys [::b][Ctrl+Q][::-]Quit", suff)
@@ -1476,6 +1690,20 @@ func sortLabel(key sortKey, desc bool) string {
 }
 
 // getFilter / setFilter guard access to c.filter (see the field comment).
+// setPartial / getPartial record whether the current pane's listing is
+// incomplete. Guarded by mu like the object map they describe.
+func (c *Controller) setPartial(p bool) {
+	c.mu.Lock()
+	c.partial = p
+	c.mu.Unlock()
+}
+
+func (c *Controller) getPartial() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.partial
+}
+
 func (c *Controller) getFilter() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1524,13 +1752,17 @@ func (c *Controller) Refresh() {
 // keeps its navigable shape. An empty filter returns every object. The input
 // slice is not mutated.
 func filterSortObjects(objs []*model.Object, filter string, key sortKey, desc bool) []*model.Object {
-	f := strings.ToLower(strings.TrimSpace(filter))
+	// A broken pattern degrades to matching nothing rather than to matching
+	// everything: an empty listing with "bad pattern" in the title is honest,
+	// while silently ignoring the query would look like the filter had been
+	// applied and found everything.
+	m := mustMatcher(filter)
 	out := make([]*model.Object, 0, len(objs))
 	for _, o := range objs {
 		if o == nil || o.Key == nil {
 			continue
 		}
-		if f != "" && !strings.Contains(strings.ToLower(*o.Key), f) {
+		if !m.empty() && !m.match(*o.Key) {
 			continue
 		}
 		out = append(out, o)
@@ -1589,8 +1821,8 @@ func lessBySortKey(a, b *model.Object, key sortKey) (less, tie bool) {
 // reported rather than swallowed — silently returning nil made a transient
 // error look like navigation being dead. Both callers run on background
 // goroutines, so c.error is called directly.
-func (c *Controller) findBucketByName(name string) *model.Object {
-	list, err := c.model.ListBuckets()
+func (c *Controller) findBucketByName(ctx context.Context, name string) *model.Object {
+	list, err := c.model.ListBuckets(ctx)
 	if err != nil {
 		c.error("Failed to list buckets", err)
 		return nil
@@ -1607,6 +1839,10 @@ func (c *Controller) findBucketByName(name string) *model.Object {
 // Down enters the bucket or folder identified by name (a unique objKey: the
 // bucket name when on the buckets screen, otherwise the full folder prefix).
 func (c *Controller) Down(name string) {
+	if c.localMode() {
+		c.localDown(name)
+		return
+	}
 	c.view.Details.Clear()
 	c.clearFilterUI() // a filter is scoped to one listing; reset on navigation
 	c.recordHistory()
@@ -1616,7 +1852,7 @@ func (c *Controller) Down(name string) {
 		// GetBucketLocation); run them off the UI goroutine so the TUI
 		// doesn't freeze on a slow or unreachable endpoint.
 		go func() {
-			bucket := c.findBucketByName(name)
+			bucket := c.findBucketByName(context.Background(), name)
 			if bucket == nil {
 				return
 			}
@@ -1636,6 +1872,10 @@ func (c *Controller) Down(name string) {
 }
 
 func (c *Controller) Up() {
+	if c.localMode() {
+		c.localUp()
+		return
+	}
 	c.view.Details.Clear()
 	c.clearFilterUI() // a filter is scoped to one listing; reset on navigation
 	c.recordHistory()
@@ -1662,6 +1902,11 @@ func (c *Controller) Up() {
 }
 
 func (c *Controller) Stop() {
+	// Record where this profile was before the process goes away, so the
+	// next run reopens here.
+	c.rememberLocation()
+	c.persistProfiles()
+	c.logActivity("session ended")
 	c.view.App.Stop()
 }
 
@@ -1847,6 +2092,13 @@ func awsProfileConfig(p cfg.AWSProfile, existing []*cfg.Config) cfg.Config {
 		SecretKey:    p.SecretKey,
 		SessionToken: p.SessionToken,
 	}
+	// A delegating profile stores no key material at all: only the name of
+	// the ~/.aws profile the SDK should resolve each time, which is what makes
+	// SSO and assume-role work here — and keeps working when they expire.
+	if p.Delegates != "" {
+		conf.AWSProfile = p.Name
+		conf.AccessKey, conf.SecretKey, conf.SessionToken = "", "", ""
+	}
 	if p.Region != "" {
 		region := p.Region
 		conf.Region = &region
@@ -1860,10 +2112,7 @@ func awsProfileRow(p cfg.AWSProfile) (primary, secondary string) {
 	if !p.Usable() {
 		return fmt.Sprintf("[gray]%s  (%s)", p.Name, p.Err), p.Name
 	}
-	kind := "long-lived key"
-	if p.SessionToken != "" {
-		kind = "temporary credentials"
-	}
+	kind := p.Kind()
 	region := p.Region
 	if region == "" {
 		region = "no region"
@@ -1920,6 +2169,12 @@ func (c *Controller) ImportAWSProfiles() {
 }
 
 func (c *Controller) create(isBucket bool) {
+	if c.remoteOnly("Create") {
+		return
+	}
+	if c.readOnlyBlocked("create buckets or folders") {
+		return
+	}
 	var oTp string
 	var disableBool bool
 	if isBucket {
@@ -1996,8 +2251,12 @@ func (c *Controller) CheckProfile() {
 	// A throwaway client: verifying a profile must never replace c.model —
 	// a queued/backgrounded transfer that reads the model later would run
 	// against the verified profile's endpoint instead of its own.
-	mCf := model.NewConfig(cf.BaseUrl, cf.Region, cf.AccessKey, cf.SecretKey, cf.SessionToken, !cf.IgnoreSsl, cf.MaxBytesPerSec)
-	probe, err := model.NewModel(mCf)
+	//
+	// Built through modelConfigFor, not field by field: a profile that
+	// delegates to an AWS named profile has no static keys, so a hand-rolled
+	// config checked the default credential chain instead of the profile the
+	// user was pointing at — a pass or a failure that said nothing about it.
+	probe, err := model.NewModel(modelConfigFor(cf))
 	if err != nil {
 		go c.error(fmt.Sprintf("error checking profile %s", cf.Name), err)
 		return
@@ -2006,7 +2265,7 @@ func (c *Controller) CheckProfile() {
 	// ListBuckets is a network round-trip; run it off the UI goroutine so a
 	// slow or unreachable endpoint can't freeze the TUI.
 	go func() {
-		if _, err := probe.ListBuckets(); err != nil {
+		if _, err := probe.ListBuckets(context.Background()); err != nil {
 			c.error(fmt.Sprintf("error checking profile %s", cf.Name), err)
 		} else {
 			c.success(fmt.Sprintf("successfully checked profile %s", cf.Name))
@@ -2101,6 +2360,12 @@ func (c *Controller) currentObject() (string, *model.Object, bool) {
 // Rename renames within the current folder. With two or more marked items it
 // opens the batch/pattern form; otherwise it renames the highlighted object.
 func (c *Controller) Rename() {
+	if c.remoteOnly("Rename") {
+		return
+	}
+	if c.readOnlyBlocked("rename objects") {
+		return
+	}
 	if c.currentBucket == nil {
 		return
 	}
@@ -2366,7 +2631,9 @@ func (c *Controller) runBatchRename(ops []renameOp, skip map[string]bool) {
 	bucket := c.currentBucket
 	mdl := c.model
 	go func() {
-		var failed []string
+		// failures keep the item descriptor, so the report can re-run exactly
+		// the ones that failed instead of the whole selection.
+		var failed []opFailure
 		var moved []transferPair
 		okCount := 0
 		canceled := false
@@ -2385,7 +2652,7 @@ func (c *Controller) runBatchRename(ops []renameOp, skip map[string]bool) {
 			})
 			n, err := mdl.MoveKeys(ctx, bucket, bucket, op.srcKey, op.dstKey, op.isFolder, skip, nil)
 			if err != nil {
-				failed = append(failed, fmt.Sprintf("%s: %v", op.label, err))
+				failed = append(failed, opFailure{item: retryItem{label: op.label, target: op}, err: err})
 				continue
 			}
 			if n == 0 {
@@ -2409,23 +2676,17 @@ func (c *Controller) runBatchRename(ops []renameOp, skip map[string]bool) {
 		}
 		c.clearSelected()
 
-		c.view.App.QueueUpdateDraw(func() {
-			status := "Rename complete."
-			if len(failed) > 0 {
-				status = "Rename finished with errors."
+		res := &opResult{name: "Rename", okCount: okCount, failures: failed}
+		c.reportOpResult(progress, res, false, func(items []retryItem) {
+			again := make([]renameOp, 0, len(items))
+			for _, it := range items {
+				if op, ok := it.target.(renameOp); ok {
+					again = append(again, op)
+				}
 			}
-			msg := fmt.Sprintf("%s\n\nOK: %d\nFailed: %d", status, okCount, len(failed))
-			for _, f := range failed {
-				msg += "\n  - " + f
+			if len(again) > 0 {
+				c.runBatchRename(again, skip)
 			}
-			msg += "\n\nPress Done to return."
-			progress.ClearButtons()
-			progress.AddButtons([]string{"Done"})
-			progress.SetText(msg)
-			progress.SetDoneFunc(func(_ int, _ string) {
-				c.view.Pages.RemovePage("progress").SwitchToPage("main")
-			})
-			c.view.App.SetFocus(progress)
 		})
 		c.updateList()
 	}()
@@ -2496,6 +2757,27 @@ func (c *Controller) takeUndo() *undoOp {
 // The destination bucket defaults to the current one but may be any bucket
 // (cross-bucket transfer).
 func (c *Controller) copyOrMove(isMove bool) {
+	// With a local pane, the copy keys read in the direction the panes point:
+	// from the local side they upload, from the remote side with a local
+	// pane opposite they download. A move is not offered across the boundary
+	// — deleting the source after a transfer is a different promise, and one
+	// the local pane deliberately does not make.
+	if c.localMode() {
+		if isMove {
+			go c.error("Move", fmt.Errorf(
+				"the local pane does not delete: use Ctrl+Y to upload, then remove the local copy yourself"))
+			return
+		}
+		c.uploadFromLocalPane()
+		return
+	}
+	if !isMove && c.otherPaneLocalDir() != "" {
+		c.Download()
+		return
+	}
+	if c.readOnlyBlocked("copy or move objects") {
+		return
+	}
 	if c.currentBucket == nil || c.view.List.GetItemCount() == 0 {
 		return
 	}
@@ -2550,7 +2832,7 @@ func (c *Controller) copyOrMove(isMove bool) {
 	// only so same-bucket copy/move keeps working.
 	go func() {
 		bucketNames := []string{srcBucketName}
-		if list, err := c.model.ListBuckets(); err == nil {
+		if list, err := c.model.ListBuckets(context.Background()); err == nil {
 			bucketNames = bucketNames[:0]
 			seen := false
 			for _, b := range list {
@@ -2620,7 +2902,9 @@ func (c *Controller) runCopyOrMove(isMove bool, title string, items []copyMoveIt
 	c.view.Pages.AddPage("progress", progress, true, true)
 
 	go func() {
-		var failed []string
+		// failures keep the copy/move item, so a retry re-runs exactly what
+		// failed rather than the whole selection.
+		var failed []opFailure
 		var moved []transferPair
 		okCount := 0
 		// objCount counts objects actually written, which is not the item
@@ -2662,7 +2946,7 @@ func (c *Controller) runCopyOrMove(isMove bool, title string, items []copyMoveIt
 				n, err = mdl.CopyKeys(ctx, srcBucket, dstBucket, srcKey, dstKey, it.isFolder, skip, cb)
 			}
 			if err != nil {
-				failed = append(failed, fmt.Sprintf("%s: %v", it.shortName, err))
+				failed = append(failed, opFailure{item: retryItem{label: it.shortName, target: it}, err: err})
 				continue
 			}
 			okCount++
@@ -2690,28 +2974,18 @@ func (c *Controller) runCopyOrMove(isMove bool, title string, items []copyMoveIt
 			return
 		}
 
-		c.view.App.QueueUpdateDraw(func() {
-			status := title + " complete."
-			if len(failed) > 0 {
-				status = title + " finished with errors."
+		res := &opResult{name: title, okCount: okCount, failures: failed, skipped: len(skip),
+			note: fmt.Sprintf("Objects written: %d", objCount)}
+		c.reportOpResult(progress, res, false, func(retryItems []retryItem) {
+			again := make([]copyMoveItem, 0, len(retryItems))
+			for _, ri := range retryItems {
+				if it, ok := ri.target.(copyMoveItem); ok {
+					again = append(again, it)
+				}
 			}
-			msg := fmt.Sprintf("%s\n\nItems: %d\nObjects written: %d\nFailed: %d",
-				status, okCount, objCount, len(failed))
-			if len(skip) > 0 {
-				msg += fmt.Sprintf("\nKept existing: %d", len(skip))
+			if len(again) > 0 {
+				c.runCopyOrMove(isMove, title, again, srcBucket, dstBucket, dstBucketName, dstPrefix, srcScope, afterMove, skip)
 			}
-			for _, f := range failed {
-				msg += "\n  - " + f
-			}
-			msg += "\n\nPress Done to return."
-
-			progress.ClearButtons()
-			progress.AddButtons([]string{"Done"})
-			progress.SetText(msg)
-			progress.SetDoneFunc(func(_ int, _ string) {
-				c.view.Pages.RemovePage("progress").SwitchToPage("main")
-			})
-			c.view.App.SetFocus(progress)
 		})
 
 		if isMove {
@@ -2744,6 +3018,9 @@ func clipItems(objs []*model.Object) []copyMoveItem {
 // yank fills the clipboard from the marked set (or the highlighted item). op is
 // "copy" or "cut".
 func (c *Controller) yank(op string) {
+	if c.remoteOnly("Yank") {
+		return
+	}
 	if c.currentBucket == nil {
 		return
 	}
@@ -2776,6 +3053,12 @@ func (c *Controller) yank(op string) {
 // paste copies (or moves, for a cut) the clipboard into the current location,
 // reusing the copy/move runner with the clipboard's origin as the source.
 func (c *Controller) paste() {
+	if c.remoteOnly("Paste") {
+		return
+	}
+	if c.readOnlyBlocked("paste objects") {
+		return
+	}
 	if c.currentBucket == nil || c.clip.bucket == nil || len(c.clip.items) == 0 {
 		return
 	}
@@ -2804,6 +3087,12 @@ func (c *Controller) paste() {
 
 // Undo reverses the last move/rename (one step) after a confirmation.
 func (c *Controller) Undo() {
+	if c.remoteOnly("Undo") {
+		return
+	}
+	if c.readOnlyBlocked("undo (it writes objects back)") {
+		return
+	}
 	op := c.takeUndo()
 	if op == nil {
 		go c.success("Nothing to undo")
@@ -2913,7 +3202,7 @@ func (c *Controller) setConfigInput() {
 			c.ImportAWSProfiles()
 			return nil
 		case tcell.KeyCtrlH:
-			help := c.view.HotkeysModal(true, func() {
+			help := c.view.HotkeysModal(true, nil, func() {
 				c.view.Pages.RemovePage("modal-help")
 			})
 			c.view.Pages.AddPage("modal-help", help, true, true)
@@ -2921,6 +3210,11 @@ func (c *Controller) setConfigInput() {
 		case tcell.KeyCtrlV:
 			c.CheckProfile()
 			return nil
+		case tcell.KeyRune:
+			if event.Rune() == 'o' {
+				c.EditProfileOptions()
+				return nil
+			}
 		case tcell.KeyCtrlA:
 			about := c.view.AboutModal()
 			about.SetInputCapture(func(_ *tcell.EventKey) *tcell.EventKey {
@@ -2937,6 +3231,9 @@ func (c *Controller) setConfigInput() {
 
 // ShowSummaryModal opens graphical bucket/folder summary.
 func (c *Controller) ShowSummaryModal() {
+	if c.remoteOnly("The size summary") {
+		return
+	}
 	var bucket *model.Object
 	prefix := c.currentPath
 
@@ -2979,10 +3276,18 @@ func (c *Controller) showSummaryModalFor(bucket *model.Object, prefix string) {
 		scopeLabel = fmt.Sprintf("%s/%s", *bucket.Key, strings.TrimSuffix(prefix, "/"))
 	}
 
+	// The scan is a full recursive listing, so it gets a wait modal it can be
+	// cancelled from rather than an unexplained pause.
+	_, ctx, cancel := c.cancellableWait("progress", fmt.Sprintf("Scanning %s ...", scopeLabel))
+
 	go func() {
-		objects, err := c.model.ListObjects(prefix, bucket)
+		defer cancel()
+		objects, err := c.model.ListObjects(ctx, prefix, bucket)
+		c.view.App.QueueUpdateDraw(func() { c.view.Pages.RemovePage("progress") })
 		if err != nil {
-			c.error("Failed to build summary", err)
+			if ctx.Err() == nil {
+				c.error("Failed to build summary", err)
+			}
 			return
 		}
 
@@ -3095,13 +3400,30 @@ func buildSummary(objs []s3t.Object, prefix string) (total int64, cats []view.Su
 		return groups[i].Bytes > groups[j].Bytes
 	})
 
-	// Top 10
-	if len(groups) > 10 {
-		groups = groups[:10]
+	// Top 10, but disclosed: the truncation used to be silent, so a bucket
+	// with a hundred prefixes showed ten of them and looked complete. The
+	// usage browser (Ctrl+G's sibling, see usage.go) is the un-truncated
+	// view; this row says so rather than leaving the gap unexplained.
+	if len(groups) > summaryGroupRows {
+		var rest int64
+		var restN int
+		for _, g := range groups[summaryGroupRows:] {
+			rest += g.Bytes
+			restN++
+		}
+		groups = groups[:summaryGroupRows]
+		groups = append(groups, view.SummaryRow{
+			Name:  fmt.Sprintf("(%d more prefixes)", restN),
+			Bytes: rest,
+		})
 	}
 
 	return total, cats, groups
 }
+
+// summaryGroupRows is how many prefixes the summary graph names before
+// rolling the rest into one disclosed row.
+const summaryGroupRows = 10
 
 func detectCategory(key string) string {
 	ext := strings.ToLower(strings.TrimPrefix(path.Ext(key), "."))
@@ -3170,160 +3492,154 @@ func (c *Controller) wireListChanged(list *tview.List) {
 	})
 }
 
-// listInputCapture is the shared browser-pane key handler.
+// actionTable maps every action to what it does. Separating this from the
+// bindings is what makes the keymap configurable: the table is the app's
+// vocabulary, keymap.go decides which keys speak it, and the palette and the
+// hotkey panel are both generated from the pair.
+func (c *Controller) actionTable() map[actionID]func() {
+	return map[actionID]func(){
+		actUp:             c.Up,
+		actToggleSelect:   c.ToggleSelectCurrent,
+		actSelectAll:      c.SelectAllVisible,
+		actClearSelection: c.ClearSelection,
+		actFilter:         c.focusFilter,
+		actRefresh:        c.Refresh,
+		actRefreshAlt:     c.Refresh,
+		actSortKey:        c.CycleSort,
+		actSortDir:        c.ToggleSortDir,
+		actDownload:       c.Download,
+		actUpload:         func() { c.ShowLocalFSModal(c.params.HomeDir) },
+		actDelete:         c.Delete,
+		actCreate:         c.Create,
+		actRename:         c.Rename,
+		actCopy:           func() { c.copyOrMove(false) },
+		actMove:           func() { c.copyOrMove(true) },
+		actYank:           func() { c.yank("copy") },
+		actCut:            func() { c.yank("cut") },
+		actPaste:          c.paste,
+		actUndo:           c.Undo,
+		actSearch:         c.RecursiveSearch,
+		actProperties:     func() { c.ShowFileProperties(c.getSelectedObjectName()) },
+		actPresign:        func() { c.PresignLink(c.getSelectedObjectName()) },
+		actSummary:        c.ShowSummaryModal,
+		actUsage:          c.ShowUsage,
+		actPreview:        c.Preview,
+		actVerify:         c.VerifyObject,
+		actVersions:       c.ShowVersions,
+		actMeta:           c.EditObjectMeta,
+		actStorageClass:   c.ChangeStorageClass,
+		actEdit:           c.EditObject,
+		actDuplicates:     c.FindDuplicates,
+		actSync:           c.Sync,
+		actCompare:        c.ComparePanes,
+		actCrossCopy:      c.CopyToProfile,
+		actBookmarks:      c.Bookmarks,
+		actPalette:        c.CommandPalette,
+		actTransfers:      c.ShowTransfers,
+		actHistoryBack:    c.HistoryBack,
+		actHistoryFwd:     c.HistoryForward,
+		actHistoryBackAlt: c.HistoryBack,
+		actHistoryFwdAlt:  c.HistoryForward,
+		actDualPane:       c.ToggleDualPane,
+		actLocalPane:      c.ToggleLocalPane,
+		actTrashRestore:   c.RestoreFromTrash,
+		actTrashEmpty:     c.EmptyTrash,
+		actProfiles:       c.Profiles,
+		actActivityLog:    c.ShowActivityLog,
+		actBucketConfig:   c.BucketDashboard,
+		actAbortUploads:   c.AbortMultipartUploads,
+		actHotkeys:        c.ShowHotkeys,
+		actAbout:          c.ShowAbout,
+		actQuit:           c.Stop,
+		// Actions whose behaviour depends on pane state rather than on a
+		// single method.
+		actSwapPane: func() {
+			if c.dual {
+				c.swapAndFocus()
+			}
+		},
+		actCancelListing: func() { c.CancelListing() },
+	}
+}
+
+// ShowHotkeys opens the hotkey panel for the browser screen.
+func (c *Controller) ShowHotkeys() {
+	help := c.view.HotkeysModal(false, c.keys.helpLines(), func() {
+		c.view.Pages.RemovePage("modal-help")
+	})
+	c.view.Pages.AddPage("modal-help", help, true, true)
+}
+
+// ShowAbout opens the about panel.
+func (c *Controller) ShowAbout() {
+	about := c.view.AboutModal()
+	about.SetInputCapture(func(_ *tcell.EventKey) *tcell.EventKey {
+		c.view.Pages.RemovePage("modal-about")
+		return nil
+	})
+	c.view.Pages.AddPage("modal-about", c.view.ModalEdit(about, 70, 19), true, true)
+}
+
+// listInputCapture is the shared browser-pane key handler: it resolves the
+// event through the keymap and runs the action, leaving anything unbound to
+// the list widget (arrows, Enter, page keys).
+//
+// Esc is a special case worth naming: it cancels a running listing when there
+// is one, and otherwise falls through, so it keeps working as "get out of
+// here" for the widgets underneath.
 func (c *Controller) listInputCapture(event *tcell.EventKey) *tcell.EventKey {
-	switch event.Key() {
-	case tcell.KeyTab:
-		if c.dual {
-			c.swapAndFocus()
-		}
-		return nil
-	case tcell.KeyCtrlO:
-		c.ToggleDualPane()
-		return nil
-	case tcell.KeyRune:
-		switch event.Rune() {
-		case ' ': // Space
-			c.ToggleSelectCurrent()
-			return nil
-		case '/':
-			c.focusFilter()
-			return nil
-		case '[':
-			c.HistoryBack()
-			return nil
-		case ']':
-			c.HistoryForward()
-			return nil
-		case 'y':
-			c.yank("copy")
-			return nil
-		case 'x':
-			c.yank("cut")
-			return nil
-		case 'p':
-			c.paste()
-			return nil
-		case 'u':
-			c.Undo()
-			return nil
-		case 't':
-			c.ShowTransfers()
-			return nil
-		case 's':
-			c.CycleSort()
-			return nil
-		case 'S':
-			c.ToggleSortDir()
-			return nil
-		case 'r':
-			c.Refresh()
-			return nil
-		case 'v':
-			c.ShowVersions()
-			return nil
-		case 'm':
-			c.EditObjectMeta()
-			return nil
-		case 'c':
-			c.ChangeStorageClass()
-			return nil
-		case '=':
-			c.ComparePanes()
-			return nil
-		case 'D':
-			c.FindDuplicates()
-			return nil
-		case 'e':
-			c.EditObject()
-			return nil
-		case '>':
-			c.CopyToProfile()
+	table := c.actionTable()
+
+	// A leader press arms the second namespace; the next key resolves there.
+	if c.leaderArmed {
+		c.leaderArmed = false
+		c.view.SetStatus("")
+		if id, ok := c.keys.lookupLeader(event); ok {
+			if run, ok := table[id]; ok {
+				run()
+			}
 			return nil
 		}
-	case tcell.KeyLeft:
-		if event.Modifiers()&tcell.ModAlt != 0 {
-			c.HistoryBack()
+		// An unknown key after the leader does nothing rather than falling
+		// through: "," then a typo should not delete anything.
+		return nil
+	}
+	if c.keys.isLeader(event) {
+		c.leaderArmed = true
+		c.view.SetStatus(c.leaderHint())
+		return nil
+	}
+
+	id, ok := c.keys.lookup(event)
+	if !ok {
+		return event
+	}
+	if id == actCancelListing {
+		if c.CancelListing() {
 			return nil
 		}
-	case tcell.KeyRight:
-		if event.Modifiers()&tcell.ModAlt != 0 {
-			c.HistoryForward()
-			return nil
-		}
-	case tcell.KeyF5:
-		c.Refresh()
-		return nil
-	case tcell.KeyCtrlE:
-		c.Sync()
-		return nil
-	case tcell.KeyCtrlF:
-		c.RecursiveSearch()
-		return nil
-	case tcell.KeyCtrlB:
-		c.Bookmarks()
-		return nil
-	case tcell.KeyCtrlK:
-		c.CommandPalette()
-		return nil
-	case tcell.KeyDelete:
-		c.Delete()
-		return nil
-	case tcell.KeyBackspace2:
-		c.Up()
-		return nil
-	case tcell.KeyCtrlN:
-		c.Create()
-		return nil
-	case tcell.KeyCtrlD:
-		c.Download()
-		return nil
-	case tcell.KeyCtrlP:
-		c.Profiles()
-		return nil
-	case tcell.KeyCtrlL:
-		c.ShowFileProperties(c.getSelectedObjectName())
-		return nil
-	case tcell.KeyCtrlW:
-		c.PresignLink(c.getSelectedObjectName())
-		return nil
-	case tcell.KeyCtrlU:
-		c.ShowLocalFSModal(c.params.HomeDir)
-		return nil
-	case tcell.KeyCtrlG:
-		c.ShowSummaryModal()
-		return nil
-	case tcell.KeyCtrlX:
-		c.ClearSelection()
-		return nil
-	case tcell.KeyCtrlS:
-		c.SelectAllVisible()
-		return nil
-	case tcell.KeyCtrlR:
-		c.Rename()
-		return nil
-	case tcell.KeyCtrlY:
-		c.copyOrMove(false)
-		return nil
-	case tcell.KeyCtrlT:
-		c.copyOrMove(true)
-		return nil
-	case tcell.KeyCtrlH:
-		help := c.view.HotkeysModal(false, func() {
-			c.view.Pages.RemovePage("modal-help")
-		})
-		c.view.Pages.AddPage("modal-help", help, true, true)
-		return nil
-	case tcell.KeyCtrlA:
-		about := c.view.AboutModal()
-		about.SetInputCapture(func(_ *tcell.EventKey) *tcell.EventKey {
-			c.view.Pages.RemovePage("modal-about")
-			return nil
-		})
-		c.view.Pages.AddPage("modal-about", c.view.ModalEdit(about, 70, 19), true, true)
+		return event
+	}
+	if run, ok := table[id]; ok {
+		run()
 		return nil
 	}
 	return event
+}
+
+// leaderHint lists what the leader namespace offers, in the status field, so
+// the second namespace is discoverable by pressing the key rather than by
+// reading the docs.
+func (c *Controller) leaderHint() string {
+	chords := make([]string, 0, len(c.keys.leader))
+	for chord, id := range c.keys.leader {
+		name := string(id)
+		if i := strings.Index(chord, "r:"); i >= 0 {
+			chords = append(chords, chord[i+2:]+" "+name)
+		}
+	}
+	sort.Strings(chords)
+	return " " + strings.Join(chords, " · ") + " "
 }
 
 // swapPane snapshots the active pane into panes[active], loads the other pane,
@@ -3338,6 +3654,8 @@ func (c *Controller) swapPane() {
 		bucketPos:       c.bucketPos,
 		restoreNext:     c.restoreNext,
 		filter:          c.filter,
+		partial:         c.partial,
+		localDir:        c.localDir,
 		selectedByScope: c.selectedByScope,
 		hist:            c.hist,
 	}
@@ -3350,6 +3668,8 @@ func (c *Controller) swapPane() {
 	c.bucketPos = p.bucketPos
 	c.restoreNext = p.restoreNext
 	c.filter = p.filter
+	c.partial = p.partial
+	c.localDir = p.localDir
 	c.selectedByScope = p.selectedByScope
 	c.hist = p.hist
 	c.mu.Unlock()
@@ -3399,6 +3719,9 @@ func (c *Controller) resetPanes() {
 	c.dual = false
 	c.active = 0
 	c.pane1Init = false
+	// A local pane must not survive a profile switch either: its selection
+	// scope and history belong to the session that opened it.
+	c.localDir = ""
 	c.view.List = c.view.PaneList(0)
 	c.view.Filter = c.view.PaneFilter(0)
 	c.view.Header = c.view.PaneHeader(0)
@@ -3436,6 +3759,23 @@ func (c *Controller) fillConfigDetails(cur string) {
 			fmt.Fprintf(c.view.Details, "[blue] Region: [white] %s\n", *item.Region)
 		}
 		fmt.Fprintf(c.view.Details, "[blue] Ssl: [white] %v\n", !item.IgnoreSsl)
+		// The options are what decide whether this profile can be written to
+		// at all, so they belong where the profile is chosen — not only
+		// behind the form that edits them.
+		fmt.Fprintf(c.view.Details, "[blue] Credentials: [white] %s\n",
+			modelConfigFor(item).CredentialSource())
+		if item.ReadOnly {
+			fmt.Fprintf(c.view.Details, "[red] READ-ONLY[white] — every write is refused\n")
+		}
+		fmt.Fprintf(c.view.Details, "[blue] Safe delete: [white] %s\n", trashSummaryLine(item))
+		fmt.Fprintf(c.view.Details, "[blue] Writes: [white] %s\n",
+			modelConfigFor(item).Write.WriteSummary())
+		if item.VerifyDownloads {
+			fmt.Fprintf(c.view.Details, "[blue] Downloads: [white] verified against the object checksum\n")
+		}
+		if item.LastBucket != "" {
+			fmt.Fprintf(c.view.Details, "[blue] Reopens at: [white] %s/%s\n", item.LastBucket, item.LastPrefix)
+		}
 	}
 }
 
@@ -3455,10 +3795,10 @@ func (c *Controller) fillConfigData() {
 			i := c.view.List.GetCurrentItem()
 			conf := c.params.Config[i]
 			c.activeConfig = conf
-			c.Duck(conf.BaseUrl, conf.Region, conf.AccessKey, conf.SecretKey, !conf.IgnoreSsl)
+			c.Duck()
 		})
 	}
-	c.view.SetFrameText("[::b][↓,↑][::-]Down/Up [::b][Enter[][::-]Use [::b][Ctrl+N[][::-]New [::b][Ctrl+I[][::-]Import AWS [::b][Ctrl+Y[][::-]Yank(Copy) [::b][Ctrl+E[][::-]Edit [::b][Ctrl+V[][::-]Verify [::b][Del[][::-]Delete [::b][Ctrl+H[][::-]Hotkeys [::b][Ctrl+Q][::-]Quit")
+	c.view.SetFrameText("[::b][↓,↑][::-]Down/Up [::b][Enter[][::-]Use [::b][Ctrl+N[][::-]New [::b][Ctrl+I[][::-]Import AWS [::b][Ctrl+Y[][::-]Yank(Copy) [::b][Ctrl+E[][::-]Edit [::b][o[][::-]Options [::b][Ctrl+V[][::-]Verify [::b][Del[][::-]Delete [::b][Ctrl+H[][::-]Hotkeys [::b][Ctrl+Q][::-]Quit")
 }
 
 func (c *Controller) fillDetails(key string) {
@@ -3494,17 +3834,14 @@ func (c *Controller) fillDetails(key string) {
 	}
 }
 
-func (c *Controller) Duck(url string, region *string, acc string, sec string, ssl bool) {
-	// Throughput cap and session token come from the profile being opened
-	// (activeConfig is set by the caller just before Duck).
-	var maxBps int64
-	var token string
-	if c.activeConfig != nil {
-		maxBps = c.activeConfig.MaxBytesPerSec
-		token = c.activeConfig.SessionToken
+// Duck opens the profile in c.activeConfig for browsing. Every connection
+// option (credentials, throughput cap, write options) is read from that
+// profile through modelConfigFor rather than passed in piecemeal.
+func (c *Controller) Duck() {
+	if c.activeConfig == nil {
+		return
 	}
-	mCf := model.NewConfig(url, region, acc, sec, token, ssl, maxBps)
-	mdl, err := model.NewModel(mCf)
+	mdl, err := model.NewModel(modelConfigFor(c.activeConfig))
 	if err != nil {
 		go c.error("Cannot open profile", err)
 		return
@@ -3517,19 +3854,38 @@ func (c *Controller) Duck(url string, region *string, acc string, sec string, ss
 	c.clip = clipboard{}
 	c.setUndo(nil)
 	c.browsing = true // the browser owns the shared list widget from here on
+	c.showIdentity()  // the header now names the account being browsed
 	c.resetPanes()    // fresh single-pane browser for this profile
 	c.wireListChanged(c.view.PaneList(0))
 	c.currentBucket = nil
 	c.currentPath = ""
 	c.bucketPos = 0
 	c.setInput()
+	c.logActivity("opened profile %s (%s)", c.activeConfig.Name,
+		modelConfigFor(c.activeConfig).CredentialSource())
+	// Land where this profile was last browsing, if it remembers.
+	if c.restoreLocation() {
+		return
+	}
 	go c.updateList()
 }
 
 func (c *Controller) Run() error {
 	c.Profiles()
+	c.runStatusTicker()
+	c.logActivity("session started")
+	// A keys.json the app could not honour is reported once here rather than
+	// leaving the user to guess why a rebinding did nothing.
+	for _, w := range c.keys.warnings {
+		c.logActivity("keymap: %s", w)
+	}
 	// A missing/corrupt config no longer crashes startup; surface it as a
 	// modal over the (empty) profiles screen so the user can recover.
+	if len(c.keys.warnings) > 0 && c.params.LoadErr == nil {
+		msg := c.view.NewErrorMessageQ("Keymap", strings.Join(c.keys.warnings, "; "))
+		msg.SetDoneFunc(func(int, string) { c.view.Pages.RemovePage("modal") })
+		c.view.Pages.AddPage("modal", c.view.ModalEdit(msg, 90, 10), true, true)
+	}
 	if c.params.LoadErr != nil {
 		errMsg := c.view.NewErrorMessageQ("Config error", c.params.LoadErr.Error())
 		errMsg.SetDoneFunc(func(buttonIndex int, buttonLabel string) {
@@ -3809,6 +4165,9 @@ func (c *Controller) ShowLocalFSModal(startPath string) {
 }
 
 func (c *Controller) Upload(localPath string) {
+	if c.readOnlyBlocked("upload") {
+		return
+	}
 	// Capture the destination now, on the UI goroutine. The byte phase starts
 	// only after a jobSem slot frees, which can be minutes later — reading
 	// c.currentBucket then would panic on the buckets screen, or silently
@@ -4154,25 +4513,34 @@ type searchHit struct {
 	size   int64
 }
 
-// searchMatch reports whether a full object key matches query (case-insensitive
-// substring). Folder-marker keys (ending in "/") never match; search targets
-// real objects.
+// searchMatch reports whether a full object key matches query. The query is a
+// substring, a glob or an "re:" regex (see match.go); matching is against the
+// whole key, so a glob's "*" has to cross "/". Folder-marker keys (ending in
+// "/") never match; search targets real objects.
 func searchMatch(key, query string) bool {
+	return matchKey(mustMatcher(query), key)
+}
+
+// matchKey applies a pre-compiled matcher to a full object key, skipping
+// folder markers. Compiling once outside the loop matters: a recursive search
+// runs this over every key in the prefix.
+func matchKey(m matcher, key string) bool {
 	if key == "" || strings.HasSuffix(key, "/") {
 		return false
 	}
-	return strings.Contains(strings.ToLower(key), strings.ToLower(query))
+	return m.match(key)
 }
 
 // computeHits filters a recursive object listing to those matching query,
 // returning at most max hits and whether more were dropped (max <= 0: no cap).
 func computeHits(objs []s3t.Object, query string, max int) (hits []searchHit, truncated bool) {
+	m := mustMatcher(query)
 	for _, o := range objs {
 		if o.Key == nil {
 			continue
 		}
 		k := *o.Key
-		if !searchMatch(k, query) {
+		if !matchKey(m, k) {
 			continue
 		}
 		if max > 0 && len(hits) >= max {
@@ -4201,6 +4569,9 @@ func parentPrefix(key string) string {
 // prefix (recursively) whose key matches, in a results modal. Enter on a result
 // reveals it (navigates to its folder and highlights it).
 func (c *Controller) RecursiveSearch() {
+	if c.remoteOnly("Recursive search") {
+		return
+	}
 	if c.currentBucket == nil {
 		return // only meaningful inside a bucket
 	}
@@ -4215,6 +4586,13 @@ func (c *Controller) RecursiveSearch() {
 		if q == "" {
 			return
 		}
+		// A regex that does not compile is reported here rather than silently
+		// finding nothing: unlike the live filter, a search is a deliberate
+		// one-shot request and an empty result set would read as "no matches".
+		if _, err := newMatcher(q); err != nil {
+			go c.error("Invalid search pattern", err)
+			return
+		}
 		if allBuckets {
 			c.runAllBucketsSearch(q)
 			return
@@ -4225,69 +4603,127 @@ func (c *Controller) RecursiveSearch() {
 	c.view.Pages.AddPage("modal", c.view.ModalEdit(form, 65, 9), true, true)
 }
 
-// runAllBucketsSearch lists every bucket recursively (off the UI goroutine) and
-// collects matches tagged with their bucket, capped at searchMaxResults total.
-// Buckets that can't be listed (e.g. a different region on the shared client)
-// are skipped.
+// runAllBucketsSearch searches every bucket recursively (off the UI
+// goroutine), collecting matches tagged with their bucket and capped at
+// searchMaxResults total. Buckets that can't be listed (a different region on
+// the shared client, a denied permission) are skipped.
+//
+// Matching happens page by page rather than after a full listing: an
+// all-buckets scan can page through millions of keys, and accumulating them
+// only to throw nearly all of them away cost memory proportional to the
+// account rather than to the result set.
 func (c *Controller) runAllBucketsSearch(query string) {
-	searching := tview.NewModal().SetText(fmt.Sprintf("Searching all buckets for %q ...", query))
-	c.view.Pages.AddPage("searching", searching, true, true)
+	searching, ctx, cancel := c.cancellableWait("searching", fmt.Sprintf("Searching all buckets for %q ...", query))
 
 	go func() {
-		buckets, err := c.model.ListBuckets()
+		defer cancel()
+		buckets, err := c.model.ListBuckets(ctx)
 		if err != nil {
 			c.view.App.QueueUpdateDraw(func() { c.view.Pages.RemovePage("searching") })
-			c.error("Search failed", err)
+			if ctx.Err() == nil {
+				c.error("Search failed", err)
+			}
 			return
 		}
+		m := mustMatcher(query)
 		var hits []searchHit
 		truncated := false
+		progress := c.searchProgress(searching, query)
+		scanned := 0
+
 		for _, b := range buckets {
-			if b == nil || b.Key == nil {
+			if b == nil || b.Key == nil || ctx.Err() != nil {
 				continue
 			}
 			if len(hits) >= searchMaxResults {
 				truncated = true
 				break
 			}
-			objs, err := c.model.ListObjects("", b)
-			if err != nil {
-				continue // skip buckets we can't list (region/permission)
-			}
-			bh, tr := computeHits(objs, query, searchMaxResults-len(hits))
-			for _, h := range bh {
-				hits = append(hits, searchHit{bucket: *b.Key, key: h.key, size: h.size})
-			}
-			if tr {
-				truncated = true
+			name := *b.Key
+			err := c.model.ListObjectsStream(ctx, "", b, func(page []s3t.Object, _ int) bool {
+				scanned += len(page)
+				progress(scanned, len(hits))
+				for _, o := range page {
+					if o.Key == nil || !matchKey(m, *o.Key) {
+						continue
+					}
+					if len(hits) >= searchMaxResults {
+						truncated = true
+						return false
+					}
+					hits = append(hits, searchHit{bucket: name, key: *o.Key, size: o.Size})
+				}
+				return true
+			})
+			if err != nil && ctx.Err() != nil {
+				break // canceled: report what was found so far
 			}
 		}
+		partial := ctx.Err() != nil
 		c.view.App.QueueUpdateDraw(func() {
 			c.view.Pages.RemovePage("searching")
-			c.presentSearchResults(query, hits, truncated)
+			c.presentSearchResults(query, hits, truncated || partial)
 		})
 	}()
 }
 
-// runRecursiveSearch lists the prefix recursively off the UI goroutine, then
-// shows the matches (or an error / "no matches" note).
+// runRecursiveSearch searches the current prefix recursively off the UI
+// goroutine, streaming pages so a huge prefix reports progress and can be
+// stopped, then shows the matches (or an error / "no matches" note).
 func (c *Controller) runRecursiveSearch(bucket *model.Object, prefix, query string) {
-	searching := tview.NewModal().SetText(fmt.Sprintf("Searching for %q ...", query))
-	c.view.Pages.AddPage("searching", searching, true, true)
+	searching, ctx, cancel := c.cancellableWait("searching", fmt.Sprintf("Searching for %q ...", query))
 
 	go func() {
-		objs, err := c.model.ListObjects(prefix, bucket)
-		if err != nil {
+		defer cancel()
+		m := mustMatcher(query)
+		var hits []searchHit
+		truncated := false
+		progress := c.searchProgress(searching, query)
+		scanned := 0
+
+		err := c.model.ListObjectsStream(ctx, prefix, bucket, func(page []s3t.Object, _ int) bool {
+			scanned += len(page)
+			progress(scanned, len(hits))
+			for _, o := range page {
+				if o.Key == nil || !matchKey(m, *o.Key) {
+					continue
+				}
+				if len(hits) >= searchMaxResults {
+					truncated = true
+					return false
+				}
+				hits = append(hits, searchHit{key: *o.Key, size: o.Size})
+			}
+			return true
+		})
+		canceled := ctx.Err() != nil
+		if err != nil && !canceled {
 			c.view.App.QueueUpdateDraw(func() { c.view.Pages.RemovePage("searching") })
 			c.error("Search failed", err)
 			return
 		}
-		hits, truncated := computeHits(objs, query, searchMaxResults)
 		c.view.App.QueueUpdateDraw(func() {
 			c.view.Pages.RemovePage("searching")
-			c.presentSearchResults(query, hits, truncated)
+			c.presentSearchResults(query, hits, truncated || canceled)
 		})
 	}()
+}
+
+// searchProgress builds a throttled "scanned N, M hits" updater for the search
+// wait modal. Without it a scan of a large prefix is indistinguishable from a
+// hang, which is what made the uncancellable version feel broken.
+func (c *Controller) searchProgress(m *tview.Modal, query string) func(scanned, hits int) {
+	var last time.Time
+	return func(scanned, hits int) {
+		if time.Since(last) < listProgressEvery {
+			return
+		}
+		last = time.Now()
+		c.view.App.QueueUpdateDraw(func() {
+			m.SetText(fmt.Sprintf("Searching for %q ...\n\nscanned %s keys, %d match(es)",
+				query, humanCount(scanned), hits))
+		})
+	}
 }
 
 // presentSearchResults builds the results list (or a "no matches" note) and
@@ -4375,7 +4811,7 @@ func (c *Controller) jumpTo(bucketName, prefix, selectKey string) {
 	c.view.Details.Clear()
 	c.recordHistory()
 	go func() {
-		bucket := c.findBucketByName(bucketName)
+		bucket := c.findBucketByName(context.Background(), bucketName)
 		if bucket == nil {
 			c.error("Jump", fmt.Errorf("bucket %q not found", bucketName))
 			return
@@ -4398,6 +4834,9 @@ func (c *Controller) jumpTo(bucketName, prefix, selectKey string) {
 // Bookmarks opens the per-profile bookmark manager: Enter jumps to a bookmark,
 // the first row adds the current location, Del removes, Esc closes.
 func (c *Controller) Bookmarks() {
+	if c.remoteOnly("Bookmarks") {
+		return
+	}
 	if c.activeConfig == nil {
 		return
 	}
@@ -4638,6 +5077,13 @@ func (c *Controller) paletteActions() []paletteAction {
 		{"Edit in $EDITOR", c.EditObject},
 		{"Copy to another profile…", c.CopyToProfile},
 		{"Transfers", c.ShowTransfers},
+		{"Preview (read-only)", c.Preview},
+		{"Usage browser (du)", c.ShowUsage},
+		{"Verify local copy against object", c.VerifyObject},
+		{c.localPaneLabel(), c.ToggleLocalPane},
+		{"Upload from the local pane", c.uploadFromLocalPane},
+		{"Restore from trash", c.RestoreFromTrash},
+		{"Empty the trash", c.EmptyTrash},
 		{"Filter listing", c.focusFilter},
 		{"Refresh listing", c.Refresh},
 		{"Sort: cycle name/size/date", c.CycleSort},
@@ -4733,9 +5179,19 @@ const activityMax = 200
 // logActivity records a one-line, timestamped operation entry. Safe from any
 // goroutine.
 func (c *Controller) logActivity(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	now := time.Now()
 	c.activityMu.Lock()
-	c.activity = appendCapped(c.activity, activityEntry{when: time.Now(), msg: fmt.Sprintf(format, args...)}, activityMax)
+	c.activity = appendCapped(c.activity, activityEntry{when: now, msg: msg}, activityMax)
 	c.activityMu.Unlock()
+
+	// Also to disk, tagged with the profile: the in-session ring answers
+	// "what just happened", the file answers "what did I do yesterday".
+	// An unwritable log must never interrupt the operation it describes, so
+	// the error is deliberately dropped.
+	if c.auditPath != "" {
+		_ = appendAudit(c.auditPath, auditLine(now, c.auditProfile(), msg), auditMaxBytes)
+	}
 }
 
 // ShowActivityLog displays the operation log, newest first.
@@ -4771,6 +5227,12 @@ func (c *Controller) ShowActivityLog() {
 // AbortMultipartUploads lists the current bucket's incomplete multipart uploads
 // and lets the user abort them (Del = selected, a = all).
 func (c *Controller) AbortMultipartUploads() {
+	if c.remoteOnly("Aborting uploads") {
+		return
+	}
+	if c.readOnlyBlocked("abort uploads") {
+		return
+	}
 	if c.currentBucket == nil {
 		return
 	}
@@ -4891,6 +5353,9 @@ func (c *Controller) presentMultipartUploads(bucket *model.Object, ups []model.M
 
 // BucketDashboard shows the current bucket's configuration (read-only).
 func (c *Controller) BucketDashboard() {
+	if c.remoteOnly("The bucket dashboard") {
+		return
+	}
 	if c.currentBucket == nil {
 		return
 	}
@@ -4990,12 +5455,16 @@ type jobView struct {
 	total, done              int64
 	count, doneCount, failed int
 	start                    time.Time
+	// bg is whether the job was sent to the background. Only a backgrounded
+	// job is announced when it finishes: a foreground one still owns its
+	// progress modal, which reports the outcome itself.
+	bg bool
 }
 
 func (j *transferJob) view() jobView {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	return jobView{j.id, j.kind, j.desc, j.status, j.total, j.done, j.count, j.doneCount, j.failed, j.start}
+	return jobView{j.id, j.kind, j.desc, j.status, j.total, j.done, j.count, j.doneCount, j.failed, j.start, j.bg}
 }
 
 // addJob registers a new running job and returns it.
@@ -5012,6 +5481,8 @@ func (c *Controller) addJob(kind, desc string, total int64, count int, cancel co
 }
 
 // finalizeJob sets a job's terminal status from its outcome and logs it.
+// finalizeJob records a job's terminal state and announces it if it was
+// running in the background.
 func (c *Controller) finalizeJob(j *transferJob, canceled bool, failed int) {
 	j.mu.Lock()
 	j.failed = failed
@@ -5026,6 +5497,7 @@ func (c *Controller) finalizeJob(j *transferJob, canceled bool, failed int) {
 	st := j.status
 	j.mu.Unlock()
 	c.logActivity("%s %s: %s", j.kind, j.desc, st)
+	c.announceJob(j.view())
 }
 
 func (c *Controller) jobSnapshot() []jobView {

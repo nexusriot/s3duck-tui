@@ -77,7 +77,7 @@ func freshBucket(t *testing.T, m *model.Model, name string) *model.Object {
 	_ = m.CreateBucket(&name, false)
 	bucket := &model.Object{Key: &name, Ot: model.Bucket}
 
-	objs, err := m.ListObjects("", bucket)
+	objs, err := m.ListObjects(ctx, "", bucket)
 	if err != nil {
 		t.Fatalf("listing %s: %v", name, err)
 	}
@@ -148,7 +148,7 @@ func TestIntegrationTransferRoundTrip(t *testing.T) {
 		}
 	}
 
-	remote, err := m.ListRemoteEntries("tree", bucket)
+	remote, err := m.ListRemoteEntries(ctx, "tree", bucket)
 	if err != nil {
 		t.Fatalf("ListRemoteEntries: %v", err)
 	}
@@ -212,7 +212,7 @@ func TestIntegrationTransferRoundTrip(t *testing.T) {
 		if err := m.DeleteKey(ctx, prefix+"a.txt", bucket); err != nil {
 			t.Fatalf("DeleteKey: %v", err)
 		}
-		after, _ := m.ListRemoteEntries("tree", bucket)
+		after, _ := m.ListRemoteEntries(ctx, "tree", bucket)
 		if len(after) != 2 {
 			t.Errorf("got %d objects, want 2", len(after))
 		}
@@ -220,7 +220,7 @@ func TestIntegrationTransferRoundTrip(t *testing.T) {
 		if err := m.DeleteKey(ctx, prefix, bucket); err == nil {
 			t.Error("a prefix-like key must be refused")
 		}
-		still, _ := m.ListRemoteEntries("tree", bucket)
+		still, _ := m.ListRemoteEntries(ctx, "tree", bucket)
 		if len(still) != 2 {
 			t.Errorf("the refused delete removed %d objects", 2-len(still))
 		}
@@ -231,12 +231,13 @@ func TestIntegrationSessionTokenReachesTheWire(t *testing.T) {
 	// The only way to prove the session token is actually sent: a bogus one must
 	// be rejected while the same credentials without one succeed.
 	endpoint, region, access, secret := testCreds(t)
+	ctx := context.Background()
 
 	good, err := model.NewModel(model.NewConfig(endpoint, &region, access, secret, "", true, 0))
 	if err != nil {
 		t.Fatalf("NewModel: %v", err)
 	}
-	if _, err := good.ListBuckets(); err != nil {
+	if _, err := good.ListBuckets(ctx); err != nil {
 		t.Fatalf("baseline ListBuckets failed: %v", err)
 	}
 
@@ -244,7 +245,7 @@ func TestIntegrationSessionTokenReachesTheWire(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewModel: %v", err)
 	}
-	if _, err := bad.ListBuckets(); err == nil {
+	if _, err := bad.ListBuckets(ctx); err == nil {
 		t.Error("a garbage session token was accepted; the token is not being sent")
 	}
 }
@@ -439,11 +440,11 @@ func TestIntegrationRemoteToRemote(t *testing.T) {
 	putObject(t, m, dst, dstPrefix+"changed.txt", "old")
 	putObject(t, m, dst, dstPrefix+"extra.txt", "should go")
 
-	srcEntries, err := m.ListRemoteEntries(srcPrefix, src)
+	srcEntries, err := m.ListRemoteEntries(ctx, srcPrefix, src)
 	if err != nil {
 		t.Fatal(err)
 	}
-	dstEntries, err := m.ListRemoteEntries(dstPrefix, dst)
+	dstEntries, err := m.ListRemoteEntries(ctx, dstPrefix, dst)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -471,7 +472,7 @@ func TestIntegrationRemoteToRemote(t *testing.T) {
 		}
 	}
 
-	after, _ := m.ListRemoteEntries(dstPrefix, dst)
+	after, _ := m.ListRemoteEntries(ctx, dstPrefix, dst)
 	if got, want := relNames(after), relNames(srcEntries); !slices.Equal(got, want) {
 		t.Errorf("destination = %v, want it to match the source %v", got, want)
 	}
@@ -486,7 +487,7 @@ func TestIntegrationRemoteToRemote(t *testing.T) {
 	}
 
 	t.Run("the source is untouched", func(t *testing.T) {
-		again, _ := m.ListRemoteEntries(srcPrefix, src)
+		again, _ := m.ListRemoteEntries(ctx, srcPrefix, src)
 		if len(again) != 3 {
 			t.Errorf("source now has %d objects, want its original 3", len(again))
 		}
@@ -528,13 +529,14 @@ func TestIntegrationPlusInKeys(t *testing.T) {
 
 func TestIntegrationDeleteNonEmptyBucket(t *testing.T) {
 	m := testModel(t)
+	ctx := context.Background()
 	bucket := freshBucket(t, m, "s3duck-it-delbucket")
 	putObject(t, m, bucket, "keep/a.txt", "x")
 	putObject(t, m, bucket, "b.txt", "y")
 
 	// The delete flow promises the objects go too: EmptyBucket then
 	// DeleteBucket must succeed on a non-empty (unversioned) bucket.
-	if err := m.EmptyBucket(bucket); err != nil {
+	if err := m.EmptyBucket(ctx, bucket); err != nil {
 		t.Fatalf("EmptyBucket: %v", err)
 	}
 	if err := m.DeleteBucket(bucket.Key); err != nil {
@@ -586,7 +588,7 @@ func TestIntegrationEmptyDirUpload(t *testing.T) {
 	if err := m.Upload(ctx, empty, "", bucket, nil, nil); err != nil {
 		t.Fatalf("Upload of an empty dir: %v", err)
 	}
-	objs, err := m.ListObjects("", bucket)
+	objs, err := m.ListObjects(ctx, "", bucket)
 	if err != nil || len(objs) != 1 {
 		t.Fatalf("objs = %d, err = %v; want exactly the folder marker", len(objs), err)
 	}
@@ -600,13 +602,14 @@ func TestIntegrationDuplicateETags(t *testing.T) {
 	// identical single-part uploads share an ETag (it is the body MD5), while
 	// different content differs. Assert both against a real endpoint.
 	m := testModel(t)
+	ctx := context.Background()
 	bucket := freshBucket(t, m, "s3duck-it-dups")
 
 	putObject(t, m, bucket, "a/copy1.bin", "identical duplicate content")
 	putObject(t, m, bucket, "b/copy2.bin", "identical duplicate content")
 	putObject(t, m, bucket, "c/other.bin", "completely different content!")
 
-	objs, err := m.ListObjects("", bucket)
+	objs, err := m.ListObjects(ctx, "", bucket)
 	if err != nil {
 		t.Fatalf("ListObjects: %v", err)
 	}
@@ -1016,7 +1019,7 @@ func TestIntegrationConflicts(t *testing.T) {
 		putObject(t, m, bucket, "src/tree/one.txt", "1")
 		putObject(t, m, bucket, "src/tree/sub/two.txt", "2")
 
-		planned, err := m.PlannedCopyKeys(bucket, bucket, "src/tree/", "dst/tree/", true)
+		planned, err := m.PlannedCopyKeys(ctx, bucket, bucket, "src/tree/", "dst/tree/", true)
 		if err != nil {
 			t.Fatalf("PlannedCopyKeys: %v", err)
 		}
