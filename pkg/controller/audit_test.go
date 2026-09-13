@@ -29,6 +29,31 @@ func TestAuditLine(t *testing.T) {
 	}
 }
 
+func TestAppendAuditTightensAnExistingLog(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "activity.log")
+	if err := os.WriteFile(path, []byte("old\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := appendAudit(path, "new\n", 1<<20); err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	fi, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := fi.Mode().Perm(); perm != 0600 {
+		t.Errorf("log mode = %v, want an existing log tightened to 0600", perm)
+	}
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(body) != "old\nnew\n" {
+		t.Errorf("log = %q, want the existing content kept", body)
+	}
+}
+
 func TestAppendAuditCreatesRotatesAndAppends(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "nested", "activity.log")

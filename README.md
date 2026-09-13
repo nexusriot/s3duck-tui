@@ -44,7 +44,7 @@ Features
 32. **Cross-profile copy** (`>`) — copy the marked objects or folders to a bucket in a *different profile*, streamed through the client (GET here → PUT there), so the two sides can be entirely different endpoints (MinIO → AWS, provider migration). Content headers, metadata and tags ride along (storage class deliberately not — class names aren't portable across providers); runs as a cancellable background transfer
 33. **Duplicate finder** (`D`) — scan the current prefix recursively and browse groups of identical objects (matched by size + ETag), ordered by wasted bytes; reveal any copy in the browser or delete it with a confirmation. The oldest copy is marked as the likely original
 34. **Pane comparison** (`=`) — read-only diff of the two dual-pane locations (left-only / differs / right-only), answering "are these two prefixes actually the same?" without transferring anything
-35. **Overwrite confirmation for remote writes** — rename, batch rename, copy, move, paste, upload and cross-profile copy all check the destination first and name exactly what they would replace, offering **Overwrite**, **Skip existing** (when that still leaves something to do) or **Cancel**. Skipping a destination on a *move* leaves the source in place too, so nothing is ever deleted without having been written somewhere. Sync is exempt: its dry-run plan already lists every update before anything moves
+35. **Overwrite confirmation for remote writes** — rename, batch rename, copy, move, paste, upload, cross-profile copy and restore-from-trash all check the destination first and name exactly what they would replace, offering **Overwrite**, **Skip existing** (when that still leaves something to do) or **Cancel**. Skipping a destination on a *move* leaves the source in place too, so nothing is ever deleted without having been written somewhere. Sync is exempt: its dry-run plan already lists every update before anything moves
 36. **Copies above 5 GiB** — copy, move, rename, storage-class changes, metadata saves and version restores fall back to a concurrent multipart part-copy past the size where a single-request S3 copy is rejected, carrying content headers, metadata and tags across
 37. Custom endpoints and self-signed TLS support (`ignore_ssl`)
 38. **Local pane** (`l`) — point one dual-pane side at a directory and browse it with the same columns, sort, filter and multi-select as a bucket; `Ctrl+Y` then uploads the marked files, and a download lands in that directory. The local pane never deletes, renames or creates: it is a transfer endpoint, not a file manager
@@ -52,7 +52,7 @@ Features
 40. **Preview** (`P`) — read-only look at the head of any object through a **ranged GET**, so previewing a 40 GiB log costs one small request; binary content is shown as a hexdump, and `e` hands the object to the editor
 41. **Version diff** (`D` in the version browser) — unified diff of any old version against the current one
 42. **Read-only profiles** — a per-profile flag that refuses every mutating action, and a header that always names the open profile, its endpoint and its read-only state, so "which account is this?" is answerable without leaving the browser
-43. **Safe delete (trash)** — a per-profile mode where delete becomes a server-side move into `.s3duck-trash/<timestamp>/`; `R` restores objects to the keys they came from, and emptying the trash is the one delete that is never diverted
+43. **Safe delete (trash)** — a per-profile mode where delete becomes a server-side move into `.s3duck-trash/<timestamp>/`; `R` restores objects to the keys they came from — through the same overwrite confirmation as any other remote write, since the original key may hold something newer by then — and emptying the trash is the one delete that is never diverted
 44. **Checksums** — ask S3 to verify a `CRC32C` / `CRC32` / `SHA256` / `SHA1` checksum on every write, verify a downloaded file against it automatically or on demand (`V`), and get a straight answer for multipart objects, whose ETag can never be compared. Optional per-upload **server-side encryption** (SSE-S3 / SSE-KMS)
 45. **Retry failed / export list** — every multi-item operation (download, sync, copy, move, rename, delete) keeps its failures with enough context to re-run exactly those units, and can write the full list to a file instead of showing the first eight and forgetting the rest
 46. **Background transfer notices** — a header badge while transfers run, plus a transient notice and a terminal bell when a backgrounded one finishes; no modal steals focus from what you moved on to
@@ -204,7 +204,8 @@ already as tall as a small terminal can show:
   work, and the header shows `[READ-ONLY]` in red.
 - **`trash`** turns delete into a server-side move under `trash_prefix`
   (default `.s3duck-trash/`), inside a timestamped folder that preserves the
-  original key. `R` restores; emptying the trash deletes for real.
+  original key. `R` restores, asking first if the original key is occupied
+  again; emptying the trash deletes for real.
 - **`no_mime_detect`** switches off Content-Type derivation on upload, for
   buckets whose types are managed elsewhere.
 - **`sse`** / **`sse_kms_key_id`** encrypt every object this app creates

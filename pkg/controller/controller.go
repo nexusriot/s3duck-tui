@@ -748,11 +748,15 @@ func (c *Controller) Delete() {
 	// and cancelling it abandons the delete rather than confirming against
 	// half-counted totals.
 	_, scanCtx, scanCancel := c.cancellableWait("progress", "Calculating delete size...")
-	defer scanCancel()
 
 	bucket := c.currentBucket
 	mdl := c.model
 	go func() {
+		// The cancel belongs to the scan, not to Delete: deferring it in the
+		// caller tore the context down the moment Delete returned — which is
+		// immediately — so every folder scan failed with context.Canceled and
+		// the confirmation always claimed the totals were incomplete.
+		defer scanCancel()
 		for i := range targets {
 			if !targets[i].isFolder && !targets[i].isBucket {
 				continue
@@ -775,6 +779,15 @@ func (c *Controller) Delete() {
 				targets[i].objects++
 				targets[i].bytes += o.Size
 			}
+		}
+
+		// Cancelling the sizing abandons the delete: a confirmation built on
+		// half-counted totals is not one the user can answer.
+		if scanCtx.Err() != nil {
+			c.view.App.QueueUpdateDraw(func() {
+				c.view.Pages.RemovePage("progress").SwitchToPage("main")
+			})
+			return
 		}
 
 		c.view.App.QueueUpdateDraw(func() {
@@ -1167,7 +1180,12 @@ func (c *Controller) runDownload(mdl *model.Model, srcBucket *model.Object, srcP
 									bytes += t.Size
 								}
 								c.view.Pages.RemovePage("progress").SwitchToPage("main")
-								go c.runDownload(mdl, srcBucket, srcPath, len(retryTargets), retryTargets, bytes, cwd)
+								// Inline: runDownload builds the confirmation
+								// page and reads the profile's verify setting
+								// on the UI goroutine, which this button
+								// handler already is. Spawning it raced the
+								// draw loop over those widgets.
+								c.runDownload(mdl, srcBucket, srcPath, len(retryTargets), retryTargets, bytes, cwd)
 							case buttonLabel == "Export list":
 								path, err := ledger.writeFailureReport(c.resolveDownloadDir(), time.Now())
 								if err != nil {
@@ -2233,8 +2251,12 @@ func (c *Controller) CheckProfile() {
 	// A throwaway client: verifying a profile must never replace c.model —
 	// a queued/backgrounded transfer that reads the model later would run
 	// against the verified profile's endpoint instead of its own.
-	mCf := model.NewConfig(cf.BaseUrl, cf.Region, cf.AccessKey, cf.SecretKey, cf.SessionToken, !cf.IgnoreSsl, cf.MaxBytesPerSec)
-	probe, err := model.NewModel(mCf)
+	//
+	// Built through modelConfigFor, not field by field: a profile that
+	// delegates to an AWS named profile has no static keys, so a hand-rolled
+	// config checked the default credential chain instead of the profile the
+	// user was pointing at — a pass or a failure that said nothing about it.
+	probe, err := model.NewModel(modelConfigFor(cf))
 	if err != nil {
 		go c.error(fmt.Sprintf("error checking profile %s", cf.Name), err)
 		return

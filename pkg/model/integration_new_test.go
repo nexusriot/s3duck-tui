@@ -225,6 +225,18 @@ func TestIntegrationRangedPreviewReadsOnlyTheHead(t *testing.T) {
 	if len(data) != len(body) {
 		t.Errorf("read %d bytes, want the whole %d-byte object", len(data), len(body))
 	}
+
+	// A zero-byte object has no satisfiable range at all: the server answers
+	// 416, and the preview has to read that as an empty object rather than
+	// showing the user an InvalidRange error.
+	putObject(t, m, bucket, "empty.txt", "")
+	data, _, err = m.GetObjectHead(ctx, bucket, "empty.txt", 100)
+	if err != nil {
+		t.Fatalf("GetObjectHead on a zero-byte object: %v", err)
+	}
+	if len(data) != 0 {
+		t.Errorf("read %d bytes from a zero-byte object, want 0", len(data))
+	}
 }
 
 func TestIntegrationVersionContentForDiff(t *testing.T) {

@@ -161,8 +161,13 @@ const defaultLeader = ","
 type keymap struct {
 	direct map[string]actionID
 	leader map[string]actionID
-	// leaderChord is the chord that arms the leader namespace.
+	// leaderChord is the chord that arms the leader namespace, normalized for
+	// lookup ("r:," for a comma).
 	leaderChord string
+	// leaderSpec is the same key as the user writes it, for the help panel:
+	// the normalized form is a map key, and printing it put "r:, a" in front
+	// of the user instead of ", a".
+	leaderSpec string
 	// help is the rendered key/description list for the hotkey panel.
 	help []keyHelp
 	// warnings records overrides that could not be parsed, surfaced once at
@@ -204,6 +209,7 @@ func loadKeymap(path string) keymap {
 		direct:      map[string]actionID{},
 		leader:      map[string]actionID{},
 		leaderChord: normalizeChord(defaultLeader),
+		leaderSpec:  defaultLeader,
 	}
 
 	overrides := keysFile{}
@@ -218,6 +224,7 @@ func loadKeymap(path string) keymap {
 			km.warnings = append(km.warnings, fmt.Sprintf("leader %q: %v", overrides.Leader, err))
 		} else {
 			km.leaderChord = normalizeChord(overrides.Leader)
+			km.leaderSpec = overrides.Leader
 		}
 	}
 
@@ -302,7 +309,7 @@ func (k *keymap) bind(leader bool, chord string, id actionID, help string) {
 	c := normalizeChord(chord)
 	if leader {
 		k.leader[c] = id
-		k.help = append(k.help, keyHelp{Chord: k.leaderChord + " " + chord, Help: help})
+		k.help = append(k.help, keyHelp{Chord: k.leaderSpec + " " + chord, Help: help})
 		return
 	}
 	k.direct[c] = id

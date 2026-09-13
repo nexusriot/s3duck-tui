@@ -154,6 +154,20 @@ func TestDisplayDir(t *testing.T) {
 	if got := DisplayDir("/etc", "/home/u"); got != "/etc" {
 		t.Errorf("DisplayDir = %q, want /etc", got)
 	}
+	if got := DisplayDir("/home/u", "/home/u"); got != "~" {
+		t.Errorf("DisplayDir = %q, want ~", got)
+	}
+	// A sibling of home is not inside home: prefix matching alone turned
+	// /home/u2 into "~2".
+	if got := DisplayDir("/home/u2", "/home/u"); got != "/home/u2" {
+		t.Errorf("DisplayDir = %q, want /home/u2", got)
+	}
+	if got := DisplayDir("/home/u2/x", "/home/u"); got != "/home/u2/x" {
+		t.Errorf("DisplayDir = %q, want /home/u2/x", got)
+	}
+	if got := DisplayDir("/home/u/x", "/home/u/"); got != "~/x" {
+		t.Errorf("DisplayDir with a trailing separator = %q, want ~/x", got)
+	}
 	if got := DisplayDir("/etc", ""); got != "/etc" {
 		t.Errorf("no home should change nothing: %q", got)
 	}

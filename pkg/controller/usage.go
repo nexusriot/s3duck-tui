@@ -43,6 +43,15 @@ func newUsageNode(name, fullPath string, isDir bool) *usageNode {
 // without a bucket.
 func buildUsageTree(objs []s3t.Object, prefix string) *usageNode {
 	root := newUsageNode(prefix, prefix, true)
+	addUsageObjects(root, objs, prefix)
+	return root
+}
+
+// addUsageObjects folds one page of a listing into an existing tree, so the
+// scan can accumulate the tree instead of every object it was built from — a
+// prefix with millions of objects is a tree of a few thousand nodes and a
+// slice the size of the whole bucket.
+func addUsageObjects(root *usageNode, objs []s3t.Object, prefix string) {
 	for _, o := range objs {
 		if o.Key == nil {
 			continue
@@ -85,13 +94,19 @@ func buildUsageTree(objs []s3t.Object, prefix string) *usageNode {
 				child = newUsageNode(seg, path, isDir)
 				node.children[seg] = child
 			}
+			// S3 lets "foo" and "foo/bar" both exist, in either order. The
+			// node has to end up a directory whichever arrived first, or the
+			// browser refuses to open it and everything under it is invisible.
+			if isDir && !child.isDir {
+				child.isDir = true
+				child.fullPath = path
+			}
 			child.bytes += size
 			child.objects++
 			child.classes[class] += size
 			node = child
 		}
 	}
-	return root
 }
 
 // sortedChildren returns a node's children largest first, with directories and
@@ -214,9 +229,12 @@ func (c *Controller) ShowUsage() {
 	go func() {
 		defer cancel()
 		progress := c.searchProgress(scanning, "usage")
-		var objs []s3t.Object
+		// Fold each page into the tree as it arrives: the tree is all the UI
+		// ever reads, and holding the whole listing as well doubled the cost
+		// of the one screen that exists for buckets too big to eyeball.
+		root := newUsageNode(prefix, prefix, true)
 		err := mdl.ListObjectsStream(ctx, prefix, bucket, func(page []s3t.Object, total int) bool {
-			objs = append(objs, page...)
+			addUsageObjects(root, page, prefix)
 			progress(total, 0)
 			return true
 		})
@@ -227,7 +245,6 @@ func (c *Controller) ShowUsage() {
 			}
 			return
 		}
-		root := buildUsageTree(objs, prefix)
 		c.view.App.QueueUpdateDraw(func() {
 			c.view.Pages.RemovePage("progress")
 			if root.objects == 0 {

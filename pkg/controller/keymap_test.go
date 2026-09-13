@@ -243,8 +243,18 @@ func TestHelpLinesCoverTheBindings(t *testing.T) {
 		}
 	}
 	// Leader bindings are shown with their prefix, so the panel explains how
-	// to reach them.
-	if !strings.Contains(joined, ", a") {
+	// to reach them — spelled the way the user types it, not as the
+	// normalized lookup key ("r:,").
+	found := false
+	for _, h := range km.help {
+		if strings.Contains(h.Chord, "r:") {
+			t.Errorf("help chord %q leaks the normalized form", h.Chord)
+		}
+		if h.Chord == ", a" {
+			found = true
+		}
+	}
+	if !found {
 		t.Errorf("leader bindings are not shown with the leader key:\n%s", joined)
 	}
 }

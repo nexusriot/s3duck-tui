@@ -50,10 +50,20 @@ func appendAudit(path, line string, maxBytes int64) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		return err
 	}
-	if fi, err := os.Stat(path); err == nil && maxBytes > 0 && fi.Size()+int64(len(line)) > maxBytes {
-		// One generation only: two files is enough to answer "what happened
-		// recently", and unbounded rotation is a disk-space surprise.
-		_ = os.Rename(path, path+".1")
+	if fi, err := os.Stat(path); err == nil {
+		// O_CREATE below applies 0600 only to a file it creates, so a log left
+		// behind by an older version — or restored from a backup — keeps
+		// whatever mode it arrived with. It holds the profile names, buckets
+		// and keys this install has touched, so tighten it here; doing it
+		// before the rename means the rotated generation is tightened too.
+		if fi.Mode().Perm() != 0600 {
+			_ = os.Chmod(path, 0600)
+		}
+		if maxBytes > 0 && fi.Size()+int64(len(line)) > maxBytes {
+			// One generation only: two files is enough to answer "what happened
+			// recently", and unbounded rotation is a disk-space surprise.
+			_ = os.Rename(path, path+".1")
+		}
 	}
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
 	if err != nil {

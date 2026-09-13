@@ -12,6 +12,66 @@ func usageObj(key string, size int64, class string) s3t.Object {
 	return s3t.Object{Key: &k, Size: size, StorageClass: s3t.ObjectStorageClass(class)}
 }
 
+// S3 happily holds both "foo" and "foo/bar". Whichever order they are listed
+// in, the node has to end up a directory: the browser only opens directories,
+// so a file node with children hides everything beneath it.
+func TestBuildUsageTreeKeyThatIsAlsoAPrefix(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		objs []s3t.Object
+	}{
+		{"file first", []s3t.Object{usageObj("foo", 10, ""), usageObj("foo/bar", 30, "")}},
+		{"prefix first", []s3t.Object{usageObj("foo/bar", 30, ""), usageObj("foo", 10, "")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := buildUsageTree(tc.objs, "")
+			foo := root.children["foo"]
+			if foo == nil {
+				t.Fatal("foo is missing from the tree")
+			}
+			if !foo.isDir {
+				t.Error("foo has children, so it must be openable as a directory")
+			}
+			if foo.fullPath != "foo/" {
+				t.Errorf("foo.fullPath = %q, want foo/ so drilling in lands on the prefix", foo.fullPath)
+			}
+			if foo.bytes != 40 || foo.objects != 2 {
+				t.Errorf("foo = %d bytes / %d objects, want 40/2", foo.bytes, foo.objects)
+			}
+			bar := foo.children["bar"]
+			if bar == nil || bar.bytes != 30 {
+				t.Fatalf("foo/bar = %+v, want a 30-byte leaf", bar)
+			}
+		})
+	}
+}
+
+// A streamed scan folds page by page; the tree must come out the same as a
+// single-shot build over the whole listing.
+func TestAddUsageObjectsMatchesPagedBuild(t *testing.T) {
+	objs := []s3t.Object{
+		usageObj("logs/a.txt", 5, "STANDARD"),
+		usageObj("logs/b.txt", 7, "GLACIER"),
+		usageObj("logs/deep/c.txt", 11, "STANDARD"),
+	}
+	whole := buildUsageTree(objs, "")
+
+	paged := newUsageNode("", "", true)
+	for _, o := range objs {
+		addUsageObjects(paged, []s3t.Object{o}, "")
+	}
+	if paged.bytes != whole.bytes || paged.objects != whole.objects {
+		t.Fatalf("paged root = %d/%d, whole = %d/%d",
+			paged.bytes, paged.objects, whole.bytes, whole.objects)
+	}
+	if got, want := paged.children["logs"].children["deep"].bytes, whole.children["logs"].children["deep"].bytes; got != want {
+		t.Errorf("paged logs/deep = %d bytes, want %d", got, want)
+	}
+	if got, want := len(paged.classes), len(whole.classes); got != want {
+		t.Errorf("paged classes = %d, want %d", got, want)
+	}
+}
+
 func TestBuildUsageTreeAccumulatesUpTheTree(t *testing.T) {
 	objs := []s3t.Object{
 		usageObj("data/2024/a.bin", 100, "STANDARD"),

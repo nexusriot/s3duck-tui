@@ -285,6 +285,12 @@ between the scan and the write is still overwritten silently — S3 offers no
 transaction to close that window, and the download flow has always had the same
 gap.
 
+Restoring from the trash goes through it too, and has to: a restore writes
+back to the key the object was deleted from, which is exactly the key most
+likely to have been written again since. Declining leaves that item in the
+trash — `MoveKeys` deletes only what it copied — and the report counts it as
+skipped rather than restored.
+
 Two paths deliberately stay unprompted: **sync**, whose mandatory dry-run plan
 already lists every update before anything moves, and **undo**, which has its
 own confirmation and restores objects to where they were moments ago.

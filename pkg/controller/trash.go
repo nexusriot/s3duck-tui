@@ -143,6 +143,13 @@ func (c *Controller) EmptyTrash() {
 	}()
 }
 
+// restoreOp is one item on its way back out of the trash: where it lives now
+// and the key it was deleted from.
+type restoreOp struct {
+	src, dst string
+	isFolder bool
+}
+
 // RestoreFromTrash moves the marked items (or the highlighted one) out of the
 // trash and back to the keys they were deleted from.
 func (c *Controller) RestoreFromTrash() {
@@ -159,10 +166,6 @@ func (c *Controller) RestoreFromTrash() {
 		if n := c.getSelectedObjectName(); n != "" && n != ".." {
 			names = []string{n}
 		}
-	}
-	type restoreOp struct {
-		src, dst string
-		isFolder bool
 	}
 	var ops []restoreOp
 	for _, n := range names {
@@ -184,6 +187,32 @@ func (c *Controller) RestoreFromTrash() {
 
 	bucket := c.currentBucket
 	mdl := c.model
+	// A restore writes back to the key the object was deleted from, and
+	// nothing stops that key from holding a newer object by now. It goes
+	// through the same destination check as every other remote write rather
+	// than overwriting the live object on the way out of the trash.
+	c.confirmOverwrites(mdl, bucket, "Restore",
+		func() ([]string, error) {
+			var keys []string
+			for _, op := range ops {
+				planned, err := mdl.PlannedCopyKeys(context.Background(), bucket, bucket, op.src, op.dst, op.isFolder)
+				if err != nil {
+					return nil, err
+				}
+				keys = append(keys, planned...)
+			}
+			return keys, nil
+		},
+		func(skip map[string]bool) {
+			c.runTrashRestore(mdl, bucket, ops, skip)
+		})
+}
+
+// runTrashRestore executes the confirmed restores behind a progress modal.
+// Runs on the UI goroutine; skip holds the destination keys the user chose to
+// leave alone when the overwrite check found them already occupied. (Not to be
+// confused with runRestore, which is the Glacier one.)
+func (c *Controller) runTrashRestore(mdl *model.Model, bucket *model.Object, ops []restoreOp, skip map[string]bool) {
 	progress, ctx, cancel := c.cancellableWait("progress", "Restoring from trash...")
 	go func() {
 		defer cancel()
@@ -198,8 +227,16 @@ func (c *Controller) RestoreFromTrash() {
 			c.view.App.QueueUpdateDraw(func() {
 				progress.SetText(fmt.Sprintf("Restoring\n%d/%d\n%s", i+1, len(ops), op.dst))
 			})
-			if _, err := mdl.MoveKeys(ctx, bucket, bucket, op.src, op.dst, op.isFolder, nil, nil); err != nil {
+			moved, err := mdl.MoveKeys(ctx, bucket, bucket, op.src, op.dst, op.isFolder, skip, nil)
+			if err != nil {
 				res.fail(retryItem{label: op.src}, err)
+				continue
+			}
+			// Nothing moved with a skip list in force means the user declined
+			// this one: it stays in the trash, and reporting it as restored
+			// would be a lie about where the object is.
+			if moved == 0 && len(skip) > 0 {
+				res.skip()
 				continue
 			}
 			res.ok()

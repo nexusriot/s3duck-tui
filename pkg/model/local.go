@@ -165,9 +165,19 @@ func isEmptyDir(path string) bool {
 
 // DisplayDir shortens a path for a pane title, replacing the home directory
 // with "~" so a deep path still fits a narrow pane.
+//
+// Only the home directory itself and paths inside it abbreviate: a plain
+// prefix match makes a sibling like /home/user2 read as "~2".
 func DisplayDir(dir, home string) string {
-	if home != "" && strings.HasPrefix(dir, home) {
-		return "~" + strings.TrimPrefix(dir, home)
+	home = strings.TrimSuffix(home, string(os.PathSeparator))
+	if home == "" {
+		return dir
+	}
+	if dir == home {
+		return "~"
+	}
+	if strings.HasPrefix(dir, home+string(os.PathSeparator)) {
+		return "~" + dir[len(home):]
 	}
 	return dir
 }

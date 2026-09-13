@@ -3,14 +3,18 @@ package model
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3t "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 )
 
 // ObjectContent is a whole small object in memory, together with every
@@ -188,6 +192,12 @@ func (m *Model) GetObjectHead(ctx context.Context, bucket *Object, key string, n
 		Range:  aws.String(fmt.Sprintf("bytes=0-%d", n-1)),
 	})
 	if err != nil {
+		// A zero-byte object has no satisfiable range at all, so S3 answers
+		// this with 416 InvalidRange. An empty object previews as empty; it
+		// is not an error to report to the user.
+		if isInvalidRange(err) {
+			return nil, "", nil
+		}
 		return nil, "", err
 	}
 	defer out.Body.Close()
@@ -197,6 +207,24 @@ func (m *Model) GetObjectHead(ctx context.Context, bucket *Object, key string, n
 		return nil, "", err
 	}
 	return data, aws.ToString(out.ContentType), nil
+}
+
+// isInvalidRange reports whether err is S3 refusing a byte range as
+// unsatisfiable. Both the typed status and the bare code are matched: the
+// S3-compatible backends do not agree on which they return.
+func isInvalidRange(err error) bool {
+	var re *awshttp.ResponseError
+	if errors.As(err, &re) && re.HTTPStatusCode() == http.StatusRequestedRangeNotSatisfiable {
+		return true
+	}
+	var api smithy.APIError
+	if errors.As(err, &api) {
+		switch api.ErrorCode() {
+		case "InvalidRange", "RequestedRangeNotSatisfiable", "416":
+			return true
+		}
+	}
+	return false
 }
 
 // GetVersionContent is GetObjectContent for one specific version, which is
