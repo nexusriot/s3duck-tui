@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/nexusriot/s3duck-tui/pkg/controller"
+	"github.com/nexusriot/s3duck-tui/internal/controller"
 )
 
 func main() {

@@ -135,12 +135,10 @@ DESIGN.md, and the new limitations they carry are in its table.
 
 From the 2026-08 functional reviews; the fixed ones are listed in DESIGN.md's history.
 
-- **Navigation race, dual-pane variant** — `Down`/`jumpTo`/`navigateTo` goroutines write
-  the live pane fields without synchronization; Tab during a slow bucket-open lands the
-  navigation in the other pane. Proper fix: navigation state passed through the refresh
-  path instead of mutated in place. (The streamed listing narrowed the window — the
-  progress counter and the render target are captured before the fetch — but the
-  underlying mutation is unchanged.)
+- ~~**Navigation race, dual-pane variant**~~ — **fixed.** Pane state moved into
+  `session.Pane`; the controller addresses `panes[active]` instead of mirroring the
+  live pane into its own fields, and every navigation captures its `*Pane` before
+  spawning and writes the location through `Pane.Enter` under the pane's lock.
 - **`RefreshClient` mutates the shared model mid-transfer** — entering a bucket rebuilds
   `m.Client`/`m.Downloader` in place, so a running transfer *on the same profile* can
   see the region swap under it (cross-profile retargeting is fixed — clients are

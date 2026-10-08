@@ -1,0 +1,957 @@
+package widgets
+
+import (
+	"fmt"
+	"strings"
+	"sync/atomic"
+
+	"github.com/dustin/go-humanize"
+	"github.com/gdamore/tcell/v2"
+	"github.com/rivo/tview"
+)
+
+const versionText = "S3Duck 🦆 TUI v.0.10.0"
+
+// View ...
+type View struct {
+	App       *tview.Application
+	Frame     *tview.Frame
+	Pages     *tview.Pages
+	List      *tview.List       // the active pane's list (repointed on pane switch)
+	Filter    *tview.InputField // the active pane's filter
+	Header    *tview.TextView   // the active pane's column header
+	Details   *tview.TextView
+	ModalEdit func(p tview.Primitive, width, height int) tview.Primitive
+
+	// Dual-pane widgets. Pane i always owns lists[i]/filters[i]/cols[i]; the
+	// active pane's widgets are mirrored into List/Filter. main is the root
+	// content flex, rebuilt when toggling single/dual layout.
+	lists   [2]*tview.List
+	filters [2]*tview.InputField
+	headers [2]*tview.TextView
+	cols    [2]*tview.Flex
+	main    *tview.Flex
+
+	// Terminal size as of the last draw. tview's Application exposes no size
+	// getter in this version, and overlays that can outgrow the terminal (the
+	// hotkey list) have to know how tall they may be before they are laid out.
+	screenW, screenH atomic.Int32
+
+	// Frame chrome, held here because tview's Frame can only be rebuilt
+	// wholesale (Clear + re-AddText) and the three parts are set by different
+	// callers at different times: identity by the profile switch, status by
+	// the transfer ticker, help by every screen change. Header texts with
+	// different alignments share one row, so identity (left), version (centre)
+	// and status (right) cost no extra lines.
+	chromeIdentity string
+	chromeWarn     bool
+	chromeStatus   string
+	chromeHelp     string
+
+	// screen is the tcell screen as of the last draw. This tview version
+	// exposes no getter for it, and the terminal bell (used when a
+	// backgrounded transfer finishes) has to go through the screen rather
+	// than through a raw write, which would land in the middle of the
+	// rendered frame.
+	screen atomic.Value
+}
+
+// frameChromeRows is what the Frame keeps for itself around Pages: a blank
+// line plus the version line at the top, the hotkey line plus a blank line at
+// the bottom, and one separator row on each side (Frame's header/footer).
+const frameChromeRows = 6
+
+// ContentSize returns the space a page has to work with: the terminal size as
+// of the last draw, minus the frame chrome. It is (0, 0) before the first draw.
+func (v *View) ContentSize() (int, int) {
+	w, h := int(v.screenW.Load()), int(v.screenH.Load())
+	if w == 0 || h == 0 {
+		return 0, 0
+	}
+	return w - 2, h - frameChromeRows
+}
+
+// ModalClamped centers p like ModalEdit, but shrinks it to fit the terminal
+// instead of letting it run off the bottom. Anything scrollable stays reachable
+// by scrolling; anything else at least keeps its borders on screen.
+func (v *View) ModalClamped(p tview.Primitive, width, height int) tview.Primitive {
+	w, h := v.clampToContent(width, height)
+	return centerModal(p, w, h)
+}
+
+// centerModal centers p at a fixed size over whatever is behind it. It backs
+// the ModalEdit field, which is what the rest of the app calls.
+func centerModal(p tview.Primitive, width, height int) tview.Primitive {
+	return tview.NewFlex().
+		AddItem(nil, 0, 1, false).
+		AddItem(tview.NewFlex().SetDirection(tview.FlexRow).
+			AddItem(nil, 0, 1, false).
+			AddItem(p, height, 1, true).
+			AddItem(nil, 0, 1, false), width, 1, true).
+		AddItem(nil, 0, 1, false)
+}
+
+// clampToContent shrinks a requested overlay size to what the terminal can
+// show. Before the first draw the size is unknown and the request stands.
+func (v *View) clampToContent(width, height int) (int, int) {
+	aw, ah := v.ContentSize()
+	if aw <= 0 || ah <= 0 {
+		return width, height
+	}
+	return min(width, aw), min(height, ah)
+}
+
+// newPaneColumn builds one browser pane: a column-header line above a bordered
+// list above a one-line filter box.
+func newPaneColumn() (*tview.List, *tview.InputField, *tview.TextView, *tview.Flex) {
+	header := tview.NewTextView()
+	header.SetDynamicColors(true)
+	header.SetTextColor(tcell.ColorGray)
+
+	list := tview.NewList().ShowSecondaryText(false)
+	list.SetBorder(true).SetTitleAlign(tview.AlignLeft)
+	list.SetSelectedBackgroundColor(tcell.ColorBlue)
+	list.SetSelectedTextColor(tcell.ColorWhite)
+
+	filter := tview.NewInputField()
+	filter.SetLabel(" Filter: ")
+	filter.SetPlaceholder("press / to filter, Enter to keep, Esc to clear")
+	filter.SetFieldWidth(0)
+	filter.SetFieldBackgroundColor(tcell.ColorBlack)
+	filter.SetPlaceholderTextColor(tcell.ColorGray)
+
+	col := tview.NewFlex().SetDirection(tview.FlexRow)
+	col.AddItem(header, 1, 0, false)
+	col.AddItem(list, 0, 1, true)
+	col.AddItem(filter, 1, 0, false)
+	return list, filter, header, col
+}
+
+// PaneList / PaneFilter / PaneHeader expose a specific pane's widgets to the
+// controller.
+func (v *View) PaneList(i int) *tview.List         { return v.lists[i] }
+func (v *View) PaneFilter(i int) *tview.InputField { return v.filters[i] }
+func (v *View) PaneHeader(i int) *tview.TextView   { return v.headers[i] }
+
+// ShowSinglePane lays out the primary pane beside the details panel (the
+// classic layout).
+func (v *View) ShowSinglePane() {
+	v.main.Clear()
+	v.main.AddItem(v.cols[0], 0, 4, true)
+	v.main.AddItem(v.Details, 0, 3, false)
+	v.lists[0].SetBorderColor(tcell.ColorWhite)
+}
+
+// ShowDualPane lays out the two panes side by side (details hidden), MC-style.
+func (v *View) ShowDualPane() {
+	v.main.Clear()
+	v.main.AddItem(v.cols[0], 0, 1, true)
+	v.main.AddItem(v.cols[1], 0, 1, false)
+}
+
+// SetActivePane highlights the active pane's border (dual-pane only).
+func (v *View) SetActivePane(active int) {
+	for i, l := range v.lists {
+		if i == active {
+			l.SetBorderColor(tcell.ColorGreen)
+		} else {
+			l.SetBorderColor(tcell.ColorGray)
+		}
+	}
+}
+
+// NewView ...
+func NewView() *View {
+	app := tview.NewApplication()
+
+	list0, filter0, header0, col0 := newPaneColumn()
+	list1, filter1, header1, col1 := newPaneColumn()
+
+	tv := tview.NewTextView().
+		SetDynamicColors(true).
+		SetRegions(true).
+		SetWordWrap(true).
+		SetChangedFunc(func() {
+			app.Draw()
+		})
+	tv.SetBorder(true)
+
+	// Start in single-pane layout: primary pane beside the details panel.
+	main := tview.NewFlex()
+	main.AddItem(col0, 0, 4, true)
+	main.AddItem(tv, 0, 3, false)
+
+	pages := tview.NewPages().
+		AddPage("main", main, true, true)
+
+	frame := tview.NewFrame(pages)
+	app.SetRoot(frame, true)
+
+	v := &View{
+		App:       app,
+		Frame:     frame,
+		Pages:     pages,
+		List:      list0,
+		Filter:    filter0,
+		Header:    header0,
+		Details:   tv,
+		ModalEdit: centerModal,
+		lists:     [2]*tview.List{list0, list1},
+		filters:   [2]*tview.InputField{filter0, filter1},
+		headers:   [2]*tview.TextView{header0, header1},
+		cols:      [2]*tview.Flex{col0, col1},
+		main:      main,
+	}
+
+	app.SetBeforeDrawFunc(func(screen tcell.Screen) bool {
+		w, h := screen.Size()
+		v.screenW.Store(int32(w))
+		v.screenH.Store(int32(h))
+		v.screen.Store(screen)
+		return false // carry on with the draw
+	})
+
+	return v
+}
+
+func (v *View) NewErrorMessageQ(header string, details string) *tview.Modal {
+	errorQ := tview.NewModal()
+	errorQ.SetText(header + ": " + details).
+		SetBackgroundColor(tcell.ColorRed).
+		AddButtons([]string{"ok"})
+	return errorQ
+}
+
+// SetFrameText sets the footer hotkey line and redraws the frame chrome.
+func (v *View) SetFrameText(helpText string) {
+	v.chromeHelp = helpText
+	v.redrawChrome()
+}
+
+// SetIdentity names the profile (and endpoint) currently open, shown at the
+// top left. warn paints it red — used for a read-only profile, where the
+// point is that the user notices.
+func (v *View) SetIdentity(label string, warn bool) {
+	v.chromeIdentity = label
+	v.chromeWarn = warn
+	v.redrawChrome()
+}
+
+// Beep rings the terminal bell, if the terminal has one. Used to announce a
+// backgrounded transfer finishing — the user asked to be told later, and
+// "later" is when they are looking at something else.
+func (v *View) Beep() {
+	if s, ok := v.screen.Load().(tcell.Screen); ok && s != nil {
+		_ = s.Beep()
+	}
+}
+
+// SetStatus sets the top-right status field: the background-transfer badge.
+func (v *View) SetStatus(status string) {
+	v.chromeStatus = status
+	v.redrawChrome()
+}
+
+// Status returns the current status field, so a caller can avoid a redraw
+// when nothing changed.
+func (v *View) Status() string { return v.chromeStatus }
+
+// redrawChrome rebuilds the frame's texts. Identity, version and status share
+// the header's single row (one per alignment); the help line is the footer.
+func (v *View) redrawChrome() {
+	v.Frame.Clear()
+	if v.chromeIdentity != "" {
+		colour := tcell.ColorAqua
+		if v.chromeWarn {
+			colour = tcell.ColorRed
+		}
+		v.Frame.AddText(v.chromeIdentity, true, tview.AlignLeft, colour)
+	}
+	v.Frame.AddText(versionText, true, tview.AlignCenter, tcell.ColorGreen)
+	if v.chromeStatus != "" {
+		v.Frame.AddText(v.chromeStatus, true, tview.AlignRight, tcell.ColorYellow)
+	}
+	if v.chromeHelp != "" {
+		v.Frame.AddText(v.chromeHelp, false, tview.AlignCenter, tcell.ColorWhite)
+	}
+}
+
+// SetHeaderVersionText is kept for the initial layout, which adds the version
+// line before any screen has set its help text.
+func (v *View) SetHeaderVersionText(version string) {
+	v.Frame.AddText(version, true, tview.AlignCenter, tcell.ColorGreen)
+}
+
+func (v *View) NewConfirm() *tview.Modal {
+	return tview.NewModal().AddButtons([]string{"OK", "Cancel"})
+}
+
+func (v *View) NewCreateProfileForm(header string) *tview.Form {
+	form := tview.NewForm()
+
+	form.SetTitle(header)
+	form.AddInputField("Name", "", 52, nil, nil)
+	form.AddInputField("Url", "", 52, nil, nil)
+	form.AddInputField("Region", "", 52, nil, nil)
+	form.AddInputField("Access key", "", 52, nil, nil)
+	form.AddPasswordField("Secret key", "", 52, '*', nil)
+	form.AddPasswordField("Session token (optional)", "", 52, '*', nil)
+	form.AddInputField("Download dir", "", 52, nil, nil)
+	form.AddCheckbox("Disable ssl check", false, func(bool) {})
+	form.AddInputField("Max bytes/sec (0=unltd)", "", 52, nil, nil)
+	form.SetBorder(true)
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEsc:
+			v.Pages.RemovePage("modal")
+		}
+		return event
+	})
+	return form
+}
+
+// NewInputForm builds a single-field form pre-filled with value, used by
+// rename. Esc closes the "modal" page.
+func (v *View) NewInputForm(header, label, value string) *tview.Form {
+	form := tview.NewForm()
+	form.SetTitle(header)
+	form.AddInputField(label, value, 50, nil, nil)
+	form.SetBorder(true)
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEsc {
+			v.Pages.RemovePage("modal")
+		}
+		return event
+	})
+	return form
+}
+
+// Profile options are a second form rather than more rows on the connection
+// form, and deliberately so: the connection form is already as tall as a small
+// terminal can show, and tview's Form does not scroll. Splitting by *kind* of
+// setting — how to reach the storage, versus how this app should behave
+// against it — also keeps each form readable.
+const (
+	FieldOptAWSProfile = "AWS profile (delegate credentials)"
+	FieldOptReadOnly   = "Read-only (refuse every write)"
+	FieldOptTrash      = "Safe delete (move to trash instead)"
+	FieldOptTrashPfx   = "Trash prefix"
+	FieldOptMime       = "Detect Content-Type on upload"
+	FieldOptSSE        = "Encrypt on write (SSE)"
+	FieldOptKMSKey     = "SSE-KMS key id"
+	FieldOptChecksum   = "Checksum on write"
+	FieldOptVerify     = "Verify downloads against the checksum"
+)
+
+// ProfileOptions is the value the options form edits, kept as a plain struct
+// so the view stays free of the config package.
+type ProfileOptions struct {
+	AWSProfile  string
+	ReadOnly    bool
+	Trash       bool
+	TrashPrefix string
+	DetectMime  bool
+	SSE         string
+	KMSKey      string
+	Checksum    string
+	Verify      bool
+}
+
+// NewProfileOptionsForm builds the per-profile behaviour form. Rows are read
+// back by label (never by index) so inserting one later cannot silently
+// misread another — the trap the connection form already sprang once.
+func (v *View) NewProfileOptionsForm(name string, opts ProfileOptions, sseChoices, checksumChoices []string) *tview.Form {
+	indexOf := func(list []string, want string) int {
+		for i, s := range list {
+			if s == want {
+				return i
+			}
+		}
+		return 0
+	}
+
+	form := tview.NewForm()
+	form.SetTitle(fmt.Sprintf(" Options: %s ", name))
+	form.AddInputField(FieldOptAWSProfile, opts.AWSProfile, 40, nil, nil)
+	form.AddCheckbox(FieldOptReadOnly, opts.ReadOnly, nil)
+	form.AddCheckbox(FieldOptTrash, opts.Trash, nil)
+	form.AddInputField(FieldOptTrashPfx, opts.TrashPrefix, 40, nil, nil)
+	form.AddCheckbox(FieldOptMime, opts.DetectMime, nil)
+	form.AddDropDown(FieldOptSSE, sseLabels(sseChoices), indexOf(sseChoices, opts.SSE), nil)
+	form.AddInputField(FieldOptKMSKey, opts.KMSKey, 40, nil, nil)
+	form.AddDropDown(FieldOptChecksum, sseLabels(checksumChoices), indexOf(checksumChoices, opts.Checksum), nil)
+	form.AddCheckbox(FieldOptVerify, opts.Verify, nil)
+	form.SetBorder(true)
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEsc {
+			v.Pages.RemovePage("modal")
+		}
+		return event
+	})
+	return form
+}
+
+// sseLabels renders a choice list where the empty option needs a name — a
+// blank dropdown row reads as a bug rather than as "leave it to the bucket".
+func sseLabels(choices []string) []string {
+	out := make([]string, 0, len(choices))
+	for _, c := range choices {
+		if c == "" {
+			out = append(out, "(none)")
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// ProfileOptionsHeight sizes the options dialog: one row per field plus the
+// buttons and the border.
+const ProfileOptionsHeight = 17
+
+// NewSearchForm builds the recursive-search form: a query input (item 0) and an
+// "All buckets" checkbox (item 1). Esc closes the "modal" page.
+func (v *View) NewSearchForm(header string) *tview.Form {
+	form := tview.NewForm()
+	form.SetTitle(header)
+	form.AddInputField("Query", "", 50, nil, nil)
+	form.AddCheckbox("All buckets", false, nil)
+	form.SetBorder(true)
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEsc {
+			v.Pages.RemovePage("modal")
+		}
+		return event
+	})
+	return form
+}
+
+// NewBatchRenameForm builds the batch/pattern rename form: a pattern template
+// (item 0) with {name}/{ext}/{n} tokens, and an optional find (item 1) /
+// replacement (item 2) pair applied to the name. Esc closes the "modal" page.
+func (v *View) NewBatchRenameForm(header string) *tview.Form {
+	form := tview.NewForm()
+	form.SetTitle(header)
+	form.AddInputField("Pattern ({name} {ext} {n})", "{name}{ext}", 50, nil, nil)
+	form.AddInputField("Find (optional)", "", 50, nil, nil)
+	form.AddInputField("Replace with", "", 50, nil, nil)
+	form.SetBorder(true)
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEsc {
+			v.Pages.RemovePage("modal")
+		}
+		return event
+	})
+	return form
+}
+
+// NewCopyMoveForm builds the copy/move destination form: a bucket dropdown
+// (item 0, defaulting to currentBucket) plus a destination-prefix input
+// (item 1). Buckets other than the current one make the transfer cross-bucket.
+// Esc closes the "modal" page.
+func (v *View) NewCopyMoveForm(header string, buckets []string, currentBucket, prefix string) *tview.Form {
+	initial := 0
+	for i, b := range buckets {
+		if b == currentBucket {
+			initial = i
+			break
+		}
+	}
+
+	form := tview.NewForm()
+	form.SetTitle(header)
+	form.AddDropDown("Destination bucket", buckets, initial, nil)
+	form.AddInputField("Destination prefix", prefix, 50, nil, nil)
+	form.SetBorder(true)
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEsc {
+			v.Pages.RemovePage("modal")
+		}
+		return event
+	})
+	return form
+}
+
+// Field labels for the sync form, read back with GetFormItemByLabel.
+const (
+	FieldSyncDirection = "Direction"
+	FieldSyncLocalDir  = "Local directory"
+	FieldSyncDstBucket = "Dest bucket (remote → remote)"
+	FieldSyncDstPrefix = "Dest prefix (remote → remote)"
+	FieldSyncDelete    = "Delete extraneous at destination"
+	// FieldSyncChecksum turns on content comparison. Named "slower" in the
+	// label because it is: one extra request per object on the remote side
+	// and a full read of every candidate on the local side.
+	FieldSyncChecksum = "Compare content by checksum (slower)"
+	// FieldSyncExclude filters both sides before the diff.
+	FieldSyncExclude = "Exclude (comma-separated globs)"
+)
+
+// NewSyncForm builds the sync dialog. The current bucket+prefix shown in the
+// title is always one side of the transfer — the source, except for an upload.
+// The local-directory and destination-bucket rows are both always present:
+// which one applies follows from the direction, and hiding rows on selection
+// would mean rebuilding the form mid-interaction. Esc closes the "modal" page.
+func (v *View) NewSyncForm(current, localDir string, directions, buckets []string, dstBucket, dstPrefix string) *tview.Form {
+	initialBucket := 0
+	for i, b := range buckets {
+		if b == dstBucket {
+			initialBucket = i
+			break
+		}
+	}
+
+	form := tview.NewForm()
+	form.SetTitle(fmt.Sprintf(" Sync — this pane: %s ", current))
+	form.AddDropDown(FieldSyncDirection, directions, 0, nil)
+	form.AddInputField(FieldSyncLocalDir, localDir, 56, nil, nil)
+	form.AddDropDown(FieldSyncDstBucket, buckets, initialBucket, nil)
+	form.AddInputField(FieldSyncDstPrefix, dstPrefix, 56, nil, nil)
+	form.AddCheckbox(FieldSyncDelete, false, nil)
+	form.AddCheckbox(FieldSyncChecksum, false, nil)
+	form.AddInputField(FieldSyncExclude, "", 56, nil, nil)
+	form.SetBorder(true)
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEsc {
+			v.Pages.RemovePage("modal")
+		}
+		return event
+	})
+	return form
+}
+
+// Field labels for the metadata and storage-class forms. Both forms are read
+// back with GetFormItemByLabel rather than by index: they mix TextViews with
+// inputs, and a positional read silently returns the wrong widget the moment a
+// row is inserted (a trap the profile form already sprung once).
+const (
+	FieldContentType        = "Content-Type"
+	FieldCacheControl       = "Cache-Control"
+	FieldContentDisposition = "Content-Disposition"
+	FieldContentEncoding    = "Content-Encoding"
+	FieldUserMetadata       = "Metadata (key=value per line)"
+	FieldTags               = "Tags (key=value per line)"
+	FieldStorageClass       = "Storage class"
+	FieldRestoreDays        = "Restore for (days)"
+	FieldRestoreTier        = "Retrieval tier"
+)
+
+// NewObjectMetaForm builds the metadata + tags editor. Read its fields with
+// GetFormItemByLabel and the Field* constants above. tagsUnavailable notes a
+// backend that rejected GetObjectTagging, so the user knows an empty tag box
+// means "not supported" rather than "no tags". Esc closes the "modal" page.
+func (v *View) NewObjectMetaForm(key, summary string, tagsUnavailable bool) *tview.Form {
+	form := tview.NewForm()
+	form.SetTitle(fmt.Sprintf(" Metadata & tags — %s ", key))
+
+	form.AddTextView("", summary, 0, 2, true, false)
+	form.AddInputField(FieldContentType, "", 56, nil, nil)
+	form.AddInputField(FieldCacheControl, "", 56, nil, nil)
+	form.AddInputField(FieldContentDisposition, "", 56, nil, nil)
+	form.AddInputField(FieldContentEncoding, "", 56, nil, nil)
+	form.AddTextArea(FieldUserMetadata, "", 56, 5, 0, nil)
+	form.AddTextArea(FieldTags, "", 56, 5, 0, nil)
+	if tagsUnavailable {
+		form.AddTextView("", "[red]this endpoint reported no tagging support[-]", 0, 1, true, false)
+	}
+	form.SetBorder(true)
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEsc {
+			// The editor lives on its own page (see metaFormPage in the
+			// controller) so error modals can't replace it.
+			v.Pages.RemovePage("modal-meta")
+		}
+		return event
+	})
+	return form
+}
+
+// NewStorageClassForm builds the storage-class / restore dialog: a class
+// dropdown plus, only when the object is archived, restore days and a retrieval
+// tier. Read its fields with GetFormItemByLabel. Esc closes the "modal" page.
+func (v *View) NewStorageClassForm(key, summary string, classes []string, current string, tiers []string, archived bool) *tview.Form {
+	initial := 0
+	for i, cl := range classes {
+		if cl == current {
+			initial = i
+			break
+		}
+	}
+
+	form := tview.NewForm()
+	form.SetTitle(fmt.Sprintf(" Storage class — %s ", key))
+	form.AddTextView("", summary, 0, 2, true, false)
+	form.AddDropDown(FieldStorageClass, classes, initial, nil)
+	if archived {
+		form.AddInputField(FieldRestoreDays, "1", 8, tview.InputFieldInteger, nil)
+		form.AddDropDown(FieldRestoreTier, tiers, 0, nil)
+	}
+	form.SetBorder(true)
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyEsc {
+			v.Pages.RemovePage("modal")
+		}
+		return event
+	})
+	return form
+}
+
+func (v *View) NewCreateLocalFileListForm() (tview.Primitive, *tview.List) {
+	localList := tview.NewList().
+		ShowSecondaryText(false)
+
+	flex := tview.NewFlex().
+		SetDirection(tview.FlexRow).
+		AddItem(localList, 0, 2, true)
+	return flex, localList
+}
+
+func (v *View) NewSuccessMessageQ(header string) *tview.Modal {
+	successQ := tview.NewModal()
+	successQ.SetText(header).
+		SetBackgroundColor(tcell.ColorLime).
+		AddButtons([]string{"ok"})
+	return successQ
+}
+
+func (v *View) NewCreateForm(header string, disablePublic bool) *tview.Form {
+	form := tview.NewForm()
+
+	form.SetTitle(header)
+	form.AddInputField("Name", "", 52, nil, nil)
+	if disablePublic {
+		form.AddCheckbox("Public?", false, func(bool) {})
+	}
+	form.SetBorder(true)
+	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		switch event.Key() {
+		case tcell.KeyEsc:
+			v.Pages.RemovePage("modal")
+		}
+		return event
+	})
+	return form
+}
+
+// The hotkey panel is a fixed-width two-column layout: the key in the first 14
+// columns, one description per line, nothing wider than helpWidth. Word wrap is
+// off inside it, so a description that does not fit here would be clipped
+// rather than folded back to column zero (which is what the old text did).
+const (
+	helpWidth = 76 // panel width, borders included
+
+	// Rows the panel spends on chrome: the two border lines and the footer hint.
+	helpChromeRows = 3
+)
+
+const helpProfiles = `
+  [::b]Navigation[::-]
+    [↓,↑]         Down / up
+    Enter         Open selected profile
+
+  [::b]Actions[::-]
+    Ctrl+N        Create new profile
+    Ctrl+I        Import profile from ~/.aws (incl. session token)
+    Ctrl+Y        Copy profile
+    o             Per-profile options (read-only, trash, SSE, checksums)
+    Ctrl+E        Edit profile
+    Ctrl+V        Verify profile (test connection)
+    Del           Delete profile
+
+  [::b]Misc[::-]
+    Ctrl+H        This help
+    Ctrl+A        Show About
+    Ctrl+Q        Quit
+`
+
+// helpBrowser is the fallback body, used only when the caller has no keymap to
+// render (the browser always has one). It lists what the keymap cannot rebind
+// — the keys the list widget itself handles — and points at the real list.
+const helpBrowser = `
+  [::b]Navigation[::-]
+    [↓,↑]         Down / up
+    Enter         Open folder / bucket
+    Backspace     Up ([..])
+    PgUp/PgDn     Page through the listing
+
+  [::b]Everything else[::-]
+    Ctrl+H        Reopen this panel for the generated key list
+` + helpBrowserNotes
+
+// helpBrowserNotes is what the generated key list cannot say for itself: the
+// modes, the second namespace, and where the rest of the app lives.
+const helpBrowserNotes = `
+  [::b]Notes[::-]
+    Enter/↑↓      Navigate; Enter opens a folder or a bucket
+    ,             Leader key: press it, then one of the keys it lists
+    Ctrl+K        Command palette — every action, searchable
+    /             Filter accepts text, *.glob or re:regex
+    Esc           Stops a long listing (a partial listing stays browsable)
+    l             Points the other pane at a local directory; Ctrl+Y then
+                  uploads from it (the local pane never deletes)
+    keys.json     ~/.config/s3duck-tui/keys.json rebinds any of the above
+`
+
+// scrollHint is the footer under the hotkey list: it names the scroll keys and,
+// when the list does not fit, says which part of it is showing. A clipped list
+// with no footer looked complete, which is how the tail of it went unnoticed.
+func scrollHint(offset, visible, total int) string {
+	if visible <= 0 || total <= visible {
+		return "Esc / q closes"
+	}
+	if offset > total-visible {
+		offset = total - visible
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	return fmt.Sprintf("↑/↓ PgUp/PgDn scroll — lines %d-%d of %d — Esc / q closes",
+		offset+1, offset+visible, total)
+}
+
+// HotkeysModal builds the hotkey panel. The list is taller than a typical
+// terminal, so the panel scrolls (arrows, PgUp/PgDn, Home/End, j/k) and is
+// clamped to the terminal height rather than being cut off at a hard-coded 44
+// rows. onClose is called when the user dismisses it.
+// HotkeysModal renders the hotkey panel. For the browser screen the body is
+// built from the live keymap (lines), so a rebound key is described correctly
+// and a panel can never drift from the bindings the way a hard-coded list
+// does. The profiles screen still has a static list: its keys are not
+// configurable.
+func (v *View) HotkeysModal(profiles bool, lines []string, onClose func()) tview.Primitive {
+	text := helpBrowser
+	if profiles {
+		text = helpProfiles
+	} else if len(lines) > 0 {
+		text = "\n  [::b]Keys (from your keymap)[::-]\n" + strings.Join(lines, "\n") + "\n" + helpBrowserNotes
+	}
+	total := strings.Count(text, "\n")
+
+	tv := tview.NewTextView()
+	tv.SetDynamicColors(true)
+	tv.SetTextAlign(tview.AlignLeft)
+	tv.SetWrap(false)
+	tv.SetScrollable(true)
+	tv.SetText(text)
+	tv.ScrollToBeginning()
+
+	// Drawn straight to the screen rather than held in a TextView: the hint
+	// depends on the scroll offset, which is only final once the list above has
+	// drawn, and this way there is no widget state to update mid-draw.
+	footer := tview.NewBox()
+	footer.SetDrawFunc(func(screen tcell.Screen, x, y, width, height int) (int, int, int, int) {
+		offset, _ := tv.GetScrollOffset()
+		_, _, _, visible := tv.GetInnerRect()
+		tview.Print(screen, scrollHint(offset, visible, total), x, y, width, tview.AlignCenter, tcell.ColorGray)
+		return x, y, width, height
+	})
+
+	// Esc / Enter / Tab arrive as "done"; q and Ctrl+H are handled below.
+	// Everything else falls through to the text view so it can scroll — the
+	// panel used to close on *any* key, which is why it could not be scrolled.
+	tv.SetDoneFunc(func(tcell.Key) { onClose() })
+	tv.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
+		if event.Key() == tcell.KeyCtrlH || event.Rune() == 'q' {
+			onClose()
+			return nil
+		}
+		return event
+	})
+
+	panel := tview.NewFlex().SetDirection(tview.FlexRow)
+	panel.AddItem(tv, 0, 1, true)
+	panel.AddItem(footer, 1, 0, false)
+	panel.SetBorder(true)
+	panel.SetTitle(" Hotkeys ")
+
+	return v.ModalClamped(panel, helpWidth, total+helpChromeRows)
+}
+
+func (v *View) AboutModal() *tview.TextView {
+	about := `
+                         [::b]%s[::-]
+
+			A tiny TUI browser for S3-compatible object storage.
+			Github: https://github.com/nexusriot/s3duck-tui
+
+			(C)2023-2026 Vladislav Ananev
+
+                    _  [dim](quack)[-]
+				 __( )>
+				 \__\      [::b]Features[::-]
+							• Profiles, incl. ~/.aws (SSO/role) import
+							• Dual pane, one side can be local
+							• Filter & search: text, glob or regex
+							• Download / upload, verified by checksum
+							• Copy / move / rename / delete / trash
+							• Directory sync (dry run first)
+							• Preview, versions & diff, usage browser
+							• Rebindable keys (~/.config/s3duck-tui)
+         [dim]Press any key to close.[-]
+			`
+
+	tv := tview.NewTextView()
+	tv.SetDynamicColors(true)
+	tv.SetTextAlign(tview.AlignLeft)
+	tv.SetWordWrap(true)
+	tv.SetText(fmt.Sprintf(about, versionText))
+	tv.SetBorder(true)
+	tv.SetTitle(" About ")
+
+	// ensure redraw on content changes
+	tv.SetChangedFunc(func() { v.App.Draw() })
+
+	return tv
+}
+
+func HumanizeBytes(b int64) string {
+	if b < 0 {
+		b = 0
+	}
+	return humanize.Bytes(uint64(b))
+}
+
+// SummaryRow is a generic row for summary charts/tables.
+type SummaryRow struct {
+	Name  string
+	Bytes int64
+}
+
+// SummaryGraph holds primitives of a graphical summary modal.
+type SummaryGraph struct {
+	Root   tview.Primitive
+	Cats   *tview.Table
+	Groups *tview.Table
+}
+
+func (v *View) NewSummaryGraph(title string, scope string, total int64, categories []SummaryRow, groups []SummaryRow, onSelectGroup func(groupName string)) *SummaryGraph {
+	h := tview.NewTextView().
+		SetDynamicColors(true).
+		SetTextAlign(tview.AlignLeft).
+		SetWordWrap(true)
+	if title == "" {
+		title = " Summary "
+	}
+	h.SetBorder(true).SetTitle(title)
+	h.SetText(fmt.Sprintf("[::b]%s[::-]\nTotal: [::b]%s[::-] (%d bytes)\n\n[gray]Tab: switch focus • Enter: drill-down • Esc/q: close[::-]",
+		scope, HumanizeBytes(total), total))
+
+	catT := tview.NewTable().SetBorders(false).SetSelectable(true, false)
+	catT.SetBorder(true).SetTitle(" Categories ")
+	catT.SetFixed(1, 0)
+
+	catT.SetCell(0, 0, tview.NewTableCell("[::b]Type[::-]").SetSelectable(false))
+	catT.SetCell(0, 1, tview.NewTableCell("[::b]Size[::-]").SetSelectable(false).SetAlign(tview.AlignRight))
+	catT.SetCell(0, 2, tview.NewTableCell("[::b]%[::-]").SetSelectable(false).SetAlign(tview.AlignRight))
+	catT.SetCell(0, 3, tview.NewTableCell("[::b]Chart[::-]").SetSelectable(false))
+
+	style := map[string]tcell.Color{
+		"documents": tcell.ColorGreen,
+		"archives":  tcell.ColorYellow,
+		"media":     tcell.ColorBlue,
+		"other":     tcell.ColorGray,
+	}
+
+	for i, row := range categories {
+		r := i + 1
+		name := row.Name
+		key := strings.ToLower(name)
+		if strings.HasPrefix(key, "doc") {
+			key = "documents"
+		} else if strings.HasPrefix(key, "arch") {
+			key = "archives"
+		} else if strings.HasPrefix(key, "med") {
+			key = "media"
+		} else if strings.HasPrefix(key, "oth") {
+			key = "other"
+		}
+
+		pct := 0.0
+		if total > 0 {
+			pct = (float64(row.Bytes) / float64(total)) * 100.0
+		}
+
+		catT.SetCell(r, 0, tview.NewTableCell(name))
+		catT.SetCell(r, 1, tview.NewTableCell(HumanizeBytes(row.Bytes)).SetAlign(tview.AlignRight))
+		catT.SetCell(r, 2, tview.NewTableCell(fmt.Sprintf("%.1f", pct)).SetAlign(tview.AlignRight))
+		catT.SetCell(r, 3, tview.NewTableCell(renderColorBar(pct, style[key])).SetExpansion(1))
+	}
+
+	grpT := tview.NewTable().SetBorders(false).SetSelectable(true, false)
+	grpT.SetBorder(true).SetTitle(" Top groups ")
+	grpT.SetFixed(1, 0)
+
+	grpT.SetCell(0, 0, tview.NewTableCell("[::b]Group[::-]").SetSelectable(false))
+	grpT.SetCell(0, 1, tview.NewTableCell("[::b]Size[::-]").SetSelectable(false).SetAlign(tview.AlignRight))
+	grpT.SetCell(0, 2, tview.NewTableCell("[::b]%[::-]").SetSelectable(false).SetAlign(tview.AlignRight))
+
+	for i, row := range groups {
+		r := i + 1
+		pct := 0.0
+		if total > 0 {
+			pct = (float64(row.Bytes) / float64(total)) * 100.0
+		}
+		grpT.SetCell(r, 0, tview.NewTableCell(row.Name))
+		grpT.SetCell(r, 1, tview.NewTableCell(HumanizeBytes(row.Bytes)).SetAlign(tview.AlignRight))
+		grpT.SetCell(r, 2, tview.NewTableCell(fmt.Sprintf("%.1f", pct)).SetAlign(tview.AlignRight))
+	}
+
+	if onSelectGroup != nil {
+		grpT.SetSelectedFunc(func(row, _ int) {
+			if row <= 0 {
+				return
+			}
+			name := grpT.GetCell(row, 0).Text
+			onSelectGroup(name)
+		})
+	}
+
+	grid := tview.NewGrid().SetRows(5, 0).SetColumns(0, 0).SetBorders(false)
+	grid.AddItem(h, 0, 0, 1, 2, 0, 0, false)
+	grid.AddItem(catT, 1, 0, 1, 1, 0, 0, true)
+	grid.AddItem(grpT, 1, 1, 1, 1, 0, 0, false)
+
+	return &SummaryGraph{Root: grid, Cats: catT, Groups: grpT}
+}
+
+func renderColorBar(pct float64, col tcell.Color) string {
+	const cells = 26
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	filled := int((pct / 100.0) * float64(cells))
+	if filled < 0 {
+		filled = 0
+	}
+	if filled > cells {
+		filled = cells
+	}
+
+	tag := "white"
+	switch col {
+	case tcell.ColorGreen:
+		tag = "green"
+	case tcell.ColorYellow:
+		tag = "yellow"
+	case tcell.ColorBlue:
+		tag = "blue"
+	case tcell.ColorGray:
+		tag = "gray"
+	}
+
+	var b strings.Builder
+	b.WriteString("[")
+	b.WriteString(tag)
+	b.WriteString("]")
+	for i := 0; i < filled; i++ {
+		b.WriteRune('█')
+	}
+	b.WriteString("[-]")
+	for i := filled; i < cells; i++ {
+		b.WriteRune('░')
+	}
+	return b.String()
+}

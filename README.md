@@ -74,73 +74,72 @@ Screenshots
 Architecture
 -------------
 
-The project follows a classic **Model–View–Controller** layout. The controller is the only component aware of both the AWS SDK layer and the tview UI; the model is pure storage I/O, and the view is pure UI primitives.
+The project is layered by **testability seam**: what a package is allowed to
+depend on decides what can be asserted about it. `internal/session`, `internal/jobs`
+and `internal/ops` know nothing about the terminal; `internal/ui/*` is the only
+place that touches tview; `internal/model` is the only place that touches the
+network.
 
 ```
-                +-----------------------------+
-                |   cmd/s3duck-tui/main.go    |
-                |  controller.NewController() |
-                |          .Run()             |
-                +--------------+--------------+
-                               |
-                               v
-+------------------------------------------------------------+
-|                    pkg/controller                          |
-|  - app state: current bucket, path, selection, sort        |
-|  - action table + keymap, modals, forms, progress UI       |
-|  - orchestrates Model calls from goroutines, marshals      |
-|    UI updates back via App.QueueUpdateDraw                 |
-+----------+----------------------------+--------------------+
-           |                            |
-           v                            v
-+----------------------+    +----------------------------+
-|   pkg/view           |    |   pkg/model                |
-|  tview widgets:      |    |  AWS SDK v2 wrapper:       |
-|   - List / Frame     |    |   - ListBuckets/ListStream |
-|   - Details TextView |    |   - CreateBucket/Folder    |
-|   - Modals & Forms   |    |   - Delete (paged 1000)    |
-|   - Hotkeys / About  |    |   - Upload  (s3manager)    |
-|   - Local FS browser |    |   - DownloadTarget         |
-+----------------------+    |   - GetBucketLocation      |
-                            |   - PrepareUpload /        |
-                            |     ResolveDownloadObjects |
-                            |   - UploadFile / DeleteKey |
-                            |   - WalkLocal /            |
-                            |     ListRemoteEntries      |
-                            |   - progressReader /       |
-                            |     progressWriterAt       |
-                            |   - GetObjectHead (ranged) |
-                            |   - ObjectChecksum /       |
-                            |     VerifyLocalFile        |
-                            |   - WalkDir / LocalTargets |
-                            +-------------+--------------+
-                                          |
-                                          v
-                              +-------------------------+
-                              |    internal/config      |
-                              |  ~/.config/s3duck-tui/  |
-                              |       config.json       |
-                              |  Params.NewConfiguration|
-                              |  Copy / Delete / Write  |
-                              +-------------------------+
-                                          |
-                                          v
-                              +-------------------------+
-                              |    pkg/utils            |
-                              |  SplitFunc, RandStr,    |
-                              |  CopyToClipboard        |
-                              +-------------------------+
+                   +-----------------------------+
+                   |   cmd/s3duck-tui/main.go    |
+                   +--------------+--------------+
+                                  |
+                                  v
+       +--------------------------------------------------+
+       |              internal/controller                 |
+       |  screen wiring: keymap, action table, navigation |
+       |  (controller.go = browser, profiles.go = list)   |
+       +--+------------+------------+-------------+-------+
+          |            |            |             |
+          v            v            v             v
+   +-------------+ +---------+ +----------+ +--------------+
+   |   session   | |   ops   | |   jobs   | |  internal/ui |
+   |  Pane:      | | Download| | Queue,   | |  shell   -+  |
+   |  location,  | | Upload  | | badge,   | |  widgets  |  |
+   |  listing,   | | over    | | notices  | |  flows    |  |
+   |  selection, | | narrow  | |          | |  screens  |  |
+   |  history    | | ports   | |          | |           |  |
+   +-------------+ +----+----+ +----------+ +-----------+--+
+                        |                               |
+                        v                               v
+              +-------------------+            +-----------------+
+              |  internal/model   |            |      tview      |
+              |  AWS SDK v2 wrap  |            +-----------------+
+              +---------+---------+
+                        |
+                        v
+              +-------------------+     +------------------+
+              | internal/config   |     | internal/utils   |
+              | ~/.config/...     |     | SplitFunc,       |
+              |   config.json     |     | RandStr, clip    |
+              +-------------------+     +------------------+
 ```
+
+`internal/ops` holds the long-running operations (download, upload) as plain
+values over narrow interfaces, so their orchestration — overwrite decisions,
+the worker pool, cancellation, verification, the retry set — is unit-tested
+against a fake store rather than a live endpoint. `internal/ui/flows` holds the
+single runner that drives any of them: confirmation, job registration, the
+Background/Cancel modal, the progress throttle and the summary, written once.
+`internal/ui/shell` owns every overlay (handles, not page names) and the UI
+update queue that never blocks. See [REFACTOR.md](REFACTOR.md).
 
 ### Packages
 
 | Path | Responsibility |
 | --- | --- |
 | `cmd/s3duck-tui/main.go` | Thin entrypoint: instantiates the controller and runs the tview app loop. |
-| `pkg/controller` | Application state and event handling. Owns the action table, modal flows (create/edit profile, create bucket/folder, download, upload, overwrite prompt, summary, delete confirmation), listing order, selection scoping per `bucket:path`, and goroutine→UI marshalling. Split by feature: `sync.go` (directory sync), `objectmeta.go`, `versions.go`, `duplicates.go`, `crossprofile.go`, `columns.go`, `edit.go`, `overwrite.go`, plus `keymap.go` (bindings as data), `listing.go` (streamed, cancellable listings), `opresult.go` (the failure ledger behind Retry failed / Export list), `localpane.go` (the local-filesystem pane), `usage.go` (the du browser), `preview.go` (preview + version diff), `match.go` (the text/glob/regex query used by the filter, the search and sync excludes), `guard.go` (read-only and profile identity), `trash.go`, `verify.go`, `notify.go`, `audit.go` and `options.go`. |
-| `pkg/view` | Pure tview construction. Builds the main flex layout (object list + details panel), modal helper, profile form, local-file browser, hotkeys / about pop-ups. Contains the version string. |
-| `pkg/model` | S3 layer (`model.go` plus `sync.go`, `object.go`, `versions.go`, `copy.go`, `content.go`, `conflicts.go`, `write.go` for per-profile write options and MIME derivation, `checksum.go` for integrity, `local.go` for the local pane's listings and upload expansion). Wraps `s3.Client`, `s3manager.Downloader/Uploader`, custom endpoint resolver, static-credentials provider, and TLS skip-verify. Exposes high-level operations: `List` / `ListStream`, `ListBuckets`, `ListObjects` / `ListObjectsStream`, `DownloadTarget`, `Upload`, `PrepareUpload`, `HeadObject`, `PutObjectMeta`, `ObjectTags` / `PutObjectTags`, `SetStorageClass`, `RestoreObject`, `ListVersions`, `RestoreVersion`, `DeleteVersion`, `DownloadVersion`, `GetVersionContent`, `GetObjectHead`, `ObjectChecksum` / `VerifyLocalFile` / `LocalChecksum` / `RemoteChecksums`, `MimeForName` / `MimeForFile`, `WalkDir` / `LocalTargets`, `ResolveDownloadObjects`, `Delete`, `DeleteKey`, `DeleteBucket`, `UploadFile`, `WalkLocal`, `ListRemoteEntries`, `CreateBucket`, `CreateFolder`, `MakeBucketPublic`, `GetBucketLocation`, `RefreshClient`. Every operation that *paginates* or moves bytes takes a `context.Context` and can be cancelled; the single-request bucket-level calls (`CreateBucket`, `DeleteBucket`, `BucketConfig`, `GetBucketLocation`, `PresignGetURL`, the multipart-upload listing/abort) do not. Implements `progressReader` / `progressWriterAt` for live byte-count progress. |
-| `pkg/utils` | Small helpers: path-split rune predicate, random string, clipboard write. |
+| `internal/controller` | Application state and event handling. Owns the action table, modal flows (create/edit profile, create bucket/folder, download, upload, overwrite prompt, summary, delete confirmation), listing order, selection scoping per `bucket:path`, and goroutine→UI marshalling. Split by feature: `sync.go` (directory sync), `objectmeta.go`, `versions.go`, `duplicates.go`, `crossprofile.go`, `columns.go`, `edit.go`, `overwrite.go`, plus `keymap.go` (bindings as data), `listing.go` (streamed, cancellable listings), `opresult.go` (the failure ledger behind Retry failed / Export list), `localpane.go` (the local-filesystem pane), `usage.go` (the du browser), `preview.go` (preview + version diff), `match.go` (the text/glob/regex query used by the filter, the search and sync excludes), `guard.go` (read-only and profile identity), `trash.go`, `verify.go`, `notify.go`, `audit.go` and `options.go`. |
+| `internal/session` | One browser pane: location (bucket, prefix, local dir), object map, selection sets per listing scope, filter, and back/forward history — all behind one mutex. The controller holds `panes [2]*session.Pane`, so a navigation captures its pane and cannot be redirected by a `Tab`. No tview. |
+| `internal/ops` | Long-running operations (`Download`, `Upload`) as values implementing `Operation`. They depend only on narrow ports (`Fetcher`, `Pusher`, `Checker`, `FS`, `Gate`, declared consumer-side in `ports.go` and satisfied by `*model.Model`) and on a `Reporter` they emit progress and questions through — so an overwrite prompt is a value, not a call into tview. Unit-tested against a fake store. No tview. |
+| `internal/jobs` | The background transfer queue: `Job`/`Queue`/`View`, the concurrency gate, the header's transfer badge and the completion notices. No tview. |
+| `internal/ui/shell` | Every overlay and every UI update made off the UI goroutine. `Push` returns a `*Layer` whose page name nobody else holds, so two flows cannot destroy each other's modal; `Do` appends to a pending list and returns, so it never blocks from any goroutine (`QueueUpdateDraw` waits on the event loop, and calling it *from* the event loop deadlocks). |
+| `internal/ui/flows` | The single `Runner` that drives any `ops.Operation`: confirmation, job registration, the Background/Cancel progress modal, the redraw throttle, and the summary with its Retry and Export buttons. Plus the pure rate/ETA and report-text helpers. |
+| `internal/ui/screens` | Self-contained overlay screens that own their own widgets — currently the transfers panel. |
+| `internal/ui/widgets` | Pure tview construction. Builds the main flex layout (object list + details panel), modal helper, profile form, local-file browser, hotkeys / about pop-ups. Contains the version string. |
+| `internal/model` | S3 layer (`model.go` plus `sync.go`, `object.go`, `versions.go`, `copy.go`, `content.go`, `conflicts.go`, `write.go` for per-profile write options and MIME derivation, `checksum.go` for integrity, `local.go` for the local pane's listings and upload expansion). Wraps `s3.Client`, `s3manager.Downloader/Uploader`, custom endpoint resolver, static-credentials provider, and TLS skip-verify. Exposes high-level operations: `List` / `ListStream`, `ListBuckets`, `ListObjects` / `ListObjectsStream`, `DownloadTarget`, `Upload`, `PrepareUpload`, `HeadObject`, `PutObjectMeta`, `ObjectTags` / `PutObjectTags`, `SetStorageClass`, `RestoreObject`, `ListVersions`, `RestoreVersion`, `DeleteVersion`, `DownloadVersion`, `GetVersionContent`, `GetObjectHead`, `ObjectChecksum` / `VerifyLocalFile` / `LocalChecksum` / `RemoteChecksums`, `MimeForName` / `MimeForFile`, `WalkDir` / `LocalTargets`, `ResolveDownloadObjects`, `Delete`, `DeleteKey`, `DeleteBucket`, `UploadFile`, `WalkLocal`, `ListRemoteEntries`, `CreateBucket`, `CreateFolder`, `MakeBucketPublic`, `GetBucketLocation`, `RefreshClient`. Every operation that *paginates* or moves bytes takes a `context.Context` and can be cancelled; the single-request bucket-level calls (`CreateBucket`, `DeleteBucket`, `BucketConfig`, `GetBucketLocation`, `PresignGetURL`, the multipart-upload listing/abort) do not. Implements `progressReader` / `progressWriterAt` for live byte-count progress. |
+| `internal/utils` | Small helpers: path-split rune predicate, random string, clipboard write. |
 | `internal/config` | JSON profile storage in `~/.config/s3duck-tui/config.json` — load, write, append, copy, delete; auto-creates the file/dir on first run with `0700` permissions. `awsshared.go` parses `~/.aws/credentials` / `~/.aws/config` for the profile import. |
 
 ### Data flow
