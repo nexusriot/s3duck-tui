@@ -21,6 +21,13 @@ type fakeFetcher struct {
 	// blockFor names keys whose transfer waits for ctx before returning, used
 	// to test cancellation draining.
 	blockFor map[string]bool
+	// gate, when set, holds every transfer until it is closed, and announces
+	// each arrival on started. Together they let a test park exactly as many
+	// workers as there are slots, so the dispatcher is provably blocked
+	// waiting for one when the test cancels — no sleeps, no racing the
+	// scheduler.
+	gate    chan struct{}
+	started chan string
 	// got records every key fetched, in completion order, with its overwrite
 	// flag.
 	got       []fetched
@@ -43,6 +50,12 @@ func (f *fakeFetcher) DownloadTarget(
 ) (int64, error) {
 	if f.fetchHook != nil {
 		f.fetchHook(t.Key)
+	}
+	if f.gate != nil {
+		if f.started != nil {
+			f.started <- t.Key
+		}
+		<-f.gate
 	}
 	f.mu.Lock()
 	err := f.failFor[t.Key]

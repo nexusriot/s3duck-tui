@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/nexusriot/s3duck-tui/internal/model"
 )
@@ -260,32 +261,59 @@ func TestDownloadHonoursAnAlreadyCancelledContext(t *testing.T) {
 	}
 }
 
-// Cancelling mid-transfer stops new work being handed out but lets the
-// in-flight transfers drain, so the report is about what actually happened.
+// Cancelling mid-transfer stops new work being handed out, and lets the
+// transfers already started drain so the report is about what actually
+// happened.
+//
+// Timing-free by construction: every worker slot is parked inside a fetch, so
+// the dispatcher is demonstrably blocked waiting for one when the cancel
+// lands. An earlier version cancelled from inside a fetch and asserted that
+// "not everything" transferred, which held on an idle machine and failed
+// about three runs in four under CPU contention — the dispatcher simply got
+// through all the work before the cancelling goroutine was scheduled again.
 func TestDownloadCancelMidTransferDrains(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	f := &fakeFetcher{}
-	f.fetchHook = func(key string) {
-		if key == "a" {
-			cancel()
-		}
+	f := &fakeFetcher{
+		gate:    make(chan struct{}),
+		started: make(chan string, DownloadWorkers),
 	}
-	// Many more objects than workers, so the dispatcher is still handing work
-	// out when the cancel lands.
+
 	var tg []model.DownloadTarget
-	for i := range 60 {
+	for i := range DownloadWorkers * 10 {
 		tg = append(tg, model.DownloadTarget{Key: fmt.Sprintf("k%02d", i), Size: 1})
 	}
-	tg[0].Key = "a" // the one whose fetch trips the cancel
 	d := newDownload(t, newMemFS(), f, tg)
 
-	res := d.Run(ctx, &recorder{})
+	done := make(chan Result, 1)
+	go func() { done <- d.Run(ctx, &recorder{}) }()
+
+	// Every slot is now held by a parked fetch, so the dispatcher is blocked
+	// trying to take one for the next object.
+	for range DownloadWorkers {
+		select {
+		case <-f.started:
+		case <-time.After(5 * time.Second):
+			t.Fatal("workers never reached the fetcher")
+		}
+	}
+
+	cancel()
+	close(f.gate) // let the parked transfers finish
+
+	var res Result
+	select {
+	case res = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after the cancel")
+	}
 
 	if !res.Canceled {
 		t.Error("result should be marked cancelled")
 	}
-	if got := len(f.keys()); got >= len(d.Targets) {
-		t.Errorf("transferred %d of %d objects; a cancel should stop dispatch", got, len(d.Targets))
+	if got := len(f.keys()); got != DownloadWorkers {
+		t.Errorf("transferred %d objects, want exactly the %d already in flight; "+
+			"a cancel must stop dispatch, and must not abandon what had started",
+			got, DownloadWorkers)
 	}
 }
 
