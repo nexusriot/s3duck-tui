@@ -1,0 +1,28 @@
+package screens
+
+import (
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/nexusriot/s3duck-tui/internal/jobs"
+)
+
+func TestTransferRow(t *testing.T) {
+	jv := jobs.View{
+		Kind: "download", Desc: "5 obj → /dl", Status: jobs.Running,
+		Total: 200, Done: 100, Count: 5, DoneCount: 2,
+	}
+	primary, secondary := TransferRow(jv, time.Second)
+	if !strings.Contains(primary, "running") || !strings.Contains(primary, "download") {
+		t.Errorf("primary = %q", primary)
+	}
+	if !strings.Contains(secondary, "2/5 obj") || !strings.Contains(secondary, "50%") {
+		t.Errorf("secondary = %q, want 2/5 obj and 50%%", secondary)
+	}
+	// A finished job shows "done" instead of a live rate/ETA.
+	jv.Status = jobs.Done
+	if _, sec := TransferRow(jv, time.Second); !strings.Contains(sec, "done") {
+		t.Errorf("done-row secondary = %q, want 'done'", sec)
+	}
+}

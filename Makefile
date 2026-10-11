@@ -19,12 +19,13 @@
 #   deb-amd64  deb-arm64  deb-armhf  deb-riscv64   ->  build/<pkg>.deb
 #
 # Override version:   make debs VERSION=0.0.40
-# The version is also hard-coded in pkg/view/view.go and build-deb.sh; bump all three.
+# The version is also hard-coded in internal/ui/widgets/view.go and build-deb.sh;
+# bump all three. TestVersionMatchesPackaging fails the build if one is missed.
 
 APP        := s3duck-tui
 PKG        := ./cmd/s3duck-tui
 GO         ?= go
-VERSION    ?= 0.10.0
+VERSION    ?= 0.10.1
 LDFLAGS    ?= -s -w
 BUILD_DIR  := build
 DIST_DIR   := dist

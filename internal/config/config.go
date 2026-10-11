@@ -194,17 +194,62 @@ func FileExist(fileName string) (bool, error) {
 	return false, err
 }
 
+// CopyConfig stores conf as a new profile.
+//
+// conf arrives as a shallow copy of the profile being duplicated, so its
+// reference fields still point into the original's. Bookmarks is the one that
+// bites: the two slices share a backing array, and whichever profile appends
+// into the spare capacity second overwrites the entry the first just added —
+// silently, since both slices stay the right length. Clone them here, where
+// the copy is made, rather than relying on every caller to remember.
 func (p *Params) CopyConfig(conf Config) error {
 	if p.NameExists(conf.Name) {
 		return fmt.Errorf("a profile named %q already exists", conf.Name)
 	}
-	p.Config = append(p.Config, &conf)
+	p.Config = append(p.Config, conf.clone())
 	return p.WriteConfig()
 }
 
+// clone returns an independent copy of c: no slice or pointer field is shared
+// with the original, so edits to either cannot reach the other.
+func (c *Config) clone() *Config {
+	out := *c
+	if c.Bookmarks != nil {
+		out.Bookmarks = make([]Bookmark, len(c.Bookmarks))
+		copy(out.Bookmarks, c.Bookmarks)
+	}
+	if c.Region != nil {
+		region := *c.Region
+		out.Region = &region
+	}
+	return &out
+}
+
+// DeleteConfig removes the profile at position i. The index comes from the
+// profiles list widget, captured when the confirmation opened, so it is
+// checked rather than trusted.
+//
+// The in-memory list is only adopted once the save succeeded. Dropping the
+// entry first left the UI showing a profile that the slice no longer held
+// whenever the write failed, and every later action addresses a profile by
+// its row — so the next edit or delete indexed past the end and took the
+// terminal down with it.
 func (p *Params) DeleteConfig(i int) error {
-	p.Config = append(p.Config[:i], p.Config[i+1:]...)
-	return p.WriteConfig()
+	if i < 0 || i >= len(p.Config) {
+		return fmt.Errorf("no profile at position %d", i)
+	}
+
+	kept := make([]*Config, 0, len(p.Config)-1)
+	kept = append(kept, p.Config[:i]...)
+	kept = append(kept, p.Config[i+1:]...)
+
+	prev := p.Config
+	p.Config = kept
+	if err := p.WriteConfig(); err != nil {
+		p.Config = prev
+		return err
+	}
+	return nil
 }
 
 func CreateEmptyConfig(configFile string) error {
