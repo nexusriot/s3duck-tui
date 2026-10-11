@@ -10,7 +10,7 @@ import (
 	"github.com/rivo/tview"
 )
 
-const versionText = "S3Duck 🦆 TUI v.0.10.0"
+const versionText = "S3Duck 🦆 TUI v.0.10.1"
 
 // View ...
 type View struct {
@@ -282,8 +282,21 @@ func (v *View) SetHeaderVersionText(version string) {
 	v.Frame.AddText(version, true, tview.AlignCenter, tcell.ColorGreen)
 }
 
+// ConfirmOK and ConfirmCancel are NewConfirm's button labels. They are
+// constants because a done handler only learns which button was pressed by
+// comparing the label it is handed, and that string used to be retyped at
+// every call site. One copy drifted to lowercase, and since the mismatch just
+// took the "not OK" branch, the dialog closed and the operation behind it
+// silently did nothing.
+const (
+	ConfirmOK     = "OK"
+	ConfirmCancel = "Cancel"
+)
+
+// NewConfirm builds the app's yes/no dialog. Compare a done handler's label
+// against ConfirmOK, never against a literal.
 func (v *View) NewConfirm() *tview.Modal {
-	return tview.NewModal().AddButtons([]string{"OK", "Cancel"})
+	return tview.NewModal().AddButtons([]string{ConfirmOK, ConfirmCancel})
 }
 
 func (v *View) NewCreateProfileForm(header string) *tview.Form {
@@ -300,29 +313,16 @@ func (v *View) NewCreateProfileForm(header string) *tview.Form {
 	form.AddCheckbox("Disable ssl check", false, func(bool) {})
 	form.AddInputField("Max bytes/sec (0=unltd)", "", 52, nil, nil)
 	form.SetBorder(true)
-	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		switch event.Key() {
-		case tcell.KeyEsc:
-			v.Pages.RemovePage("modal")
-		}
-		return event
-	})
 	return form
 }
 
 // NewInputForm builds a single-field form pre-filled with value, used by
-// rename. Esc closes the "modal" page.
+// rename. The caller owns the overlay, so the caller installs Esc.
 func (v *View) NewInputForm(header, label, value string) *tview.Form {
 	form := tview.NewForm()
 	form.SetTitle(header)
 	form.AddInputField(label, value, 50, nil, nil)
 	form.SetBorder(true)
-	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyEsc {
-			v.Pages.RemovePage("modal")
-		}
-		return event
-	})
 	return form
 }
 
@@ -382,12 +382,6 @@ func (v *View) NewProfileOptionsForm(name string, opts ProfileOptions, sseChoice
 	form.AddDropDown(FieldOptChecksum, sseLabels(checksumChoices), indexOf(checksumChoices, opts.Checksum), nil)
 	form.AddCheckbox(FieldOptVerify, opts.Verify, nil)
 	form.SetBorder(true)
-	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyEsc {
-			v.Pages.RemovePage("modal")
-		}
-		return event
-	})
 	return form
 }
 
@@ -410,25 +404,19 @@ func sseLabels(choices []string) []string {
 const ProfileOptionsHeight = 17
 
 // NewSearchForm builds the recursive-search form: a query input (item 0) and an
-// "All buckets" checkbox (item 1). Esc closes the "modal" page.
+// "All buckets" checkbox (item 1). The caller owns the overlay, so the caller installs Esc.
 func (v *View) NewSearchForm(header string) *tview.Form {
 	form := tview.NewForm()
 	form.SetTitle(header)
 	form.AddInputField("Query", "", 50, nil, nil)
 	form.AddCheckbox("All buckets", false, nil)
 	form.SetBorder(true)
-	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyEsc {
-			v.Pages.RemovePage("modal")
-		}
-		return event
-	})
 	return form
 }
 
 // NewBatchRenameForm builds the batch/pattern rename form: a pattern template
 // (item 0) with {name}/{ext}/{n} tokens, and an optional find (item 1) /
-// replacement (item 2) pair applied to the name. Esc closes the "modal" page.
+// replacement (item 2) pair applied to the name. The caller owns the overlay, so the caller installs Esc.
 func (v *View) NewBatchRenameForm(header string) *tview.Form {
 	form := tview.NewForm()
 	form.SetTitle(header)
@@ -436,19 +424,13 @@ func (v *View) NewBatchRenameForm(header string) *tview.Form {
 	form.AddInputField("Find (optional)", "", 50, nil, nil)
 	form.AddInputField("Replace with", "", 50, nil, nil)
 	form.SetBorder(true)
-	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyEsc {
-			v.Pages.RemovePage("modal")
-		}
-		return event
-	})
 	return form
 }
 
 // NewCopyMoveForm builds the copy/move destination form: a bucket dropdown
 // (item 0, defaulting to currentBucket) plus a destination-prefix input
 // (item 1). Buckets other than the current one make the transfer cross-bucket.
-// Esc closes the "modal" page.
+// The caller owns the overlay, so the caller installs Esc.
 func (v *View) NewCopyMoveForm(header string, buckets []string, currentBucket, prefix string) *tview.Form {
 	initial := 0
 	for i, b := range buckets {
@@ -463,12 +445,6 @@ func (v *View) NewCopyMoveForm(header string, buckets []string, currentBucket, p
 	form.AddDropDown("Destination bucket", buckets, initial, nil)
 	form.AddInputField("Destination prefix", prefix, 50, nil, nil)
 	form.SetBorder(true)
-	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyEsc {
-			v.Pages.RemovePage("modal")
-		}
-		return event
-	})
 	return form
 }
 
@@ -491,7 +467,7 @@ const (
 // title is always one side of the transfer — the source, except for an upload.
 // The local-directory and destination-bucket rows are both always present:
 // which one applies follows from the direction, and hiding rows on selection
-// would mean rebuilding the form mid-interaction. Esc closes the "modal" page.
+// would mean rebuilding the form mid-interaction. The caller owns the overlay, so the caller installs Esc.
 func (v *View) NewSyncForm(current, localDir string, directions, buckets []string, dstBucket, dstPrefix string) *tview.Form {
 	initialBucket := 0
 	for i, b := range buckets {
@@ -511,12 +487,6 @@ func (v *View) NewSyncForm(current, localDir string, directions, buckets []strin
 	form.AddCheckbox(FieldSyncChecksum, false, nil)
 	form.AddInputField(FieldSyncExclude, "", 56, nil, nil)
 	form.SetBorder(true)
-	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyEsc {
-			v.Pages.RemovePage("modal")
-		}
-		return event
-	})
 	return form
 }
 
@@ -539,7 +509,7 @@ const (
 // NewObjectMetaForm builds the metadata + tags editor. Read its fields with
 // GetFormItemByLabel and the Field* constants above. tagsUnavailable notes a
 // backend that rejected GetObjectTagging, so the user knows an empty tag box
-// means "not supported" rather than "no tags". Esc closes the "modal" page.
+// means "not supported" rather than "no tags". The caller owns the overlay, so the caller installs Esc.
 func (v *View) NewObjectMetaForm(key, summary string, tagsUnavailable bool) *tview.Form {
 	form := tview.NewForm()
 	form.SetTitle(fmt.Sprintf(" Metadata & tags — %s ", key))
@@ -555,20 +525,12 @@ func (v *View) NewObjectMetaForm(key, summary string, tagsUnavailable bool) *tvi
 		form.AddTextView("", "[red]this endpoint reported no tagging support[-]", 0, 1, true, false)
 	}
 	form.SetBorder(true)
-	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyEsc {
-			// The editor lives on its own page (see metaFormPage in the
-			// controller) so error modals can't replace it.
-			v.Pages.RemovePage("modal-meta")
-		}
-		return event
-	})
 	return form
 }
 
 // NewStorageClassForm builds the storage-class / restore dialog: a class
 // dropdown plus, only when the object is archived, restore days and a retrieval
-// tier. Read its fields with GetFormItemByLabel. Esc closes the "modal" page.
+// tier. Read its fields with GetFormItemByLabel. The caller owns the overlay, so the caller installs Esc.
 func (v *View) NewStorageClassForm(key, summary string, classes []string, current string, tiers []string, archived bool) *tview.Form {
 	initial := 0
 	for i, cl := range classes {
@@ -587,12 +549,6 @@ func (v *View) NewStorageClassForm(key, summary string, classes []string, curren
 		form.AddDropDown(FieldRestoreTier, tiers, 0, nil)
 	}
 	form.SetBorder(true)
-	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyEsc {
-			v.Pages.RemovePage("modal")
-		}
-		return event
-	})
 	return form
 }
 
@@ -623,13 +579,6 @@ func (v *View) NewCreateForm(header string, disablePublic bool) *tview.Form {
 		form.AddCheckbox("Public?", false, func(bool) {})
 	}
 	form.SetBorder(true)
-	form.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		switch event.Key() {
-		case tcell.KeyEsc:
-			v.Pages.RemovePage("modal")
-		}
-		return event
-	})
 	return form
 }
 

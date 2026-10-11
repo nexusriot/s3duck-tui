@@ -904,7 +904,7 @@ would look like the filter had been applied and found everything.
 
 | Area | Description |
 |---|---|
-| **Navigation race** | `c.currentBucket` and `c.restoreNext` are written from the goroutines spawned by `Down()`/`jumpTo`/`navigateTo` without the `mu` mutex. In single-pane use navigation is serial, so races are unlikely — but in dual-pane, a Tab during a slow bucket-open swaps the live fields mid-write and the navigation lands in the other pane. A proper fix passes navigation state through the refresh path instead of mutating it in place. Transfers are no longer affected: every transfer flow captures its bucket/path *and its client* at entry. |
+| ~~Navigation race~~ | **Fixed.** The live fields it described (`c.currentBucket`, `c.restoreNext`) no longer exist: a pane is now a `session.Pane` with one mutex over its whole location, and `Down()`/`jumpTo`/`navigateTo` capture the `*session.Pane` on the UI goroutine before spawning. A Tab during a slow bucket-open therefore cannot redirect a navigation into the other pane, and `Pane.Enter` writes bucket, prefix and cursor target under one lock so no reader sees the new bucket paired with the old prefix. |
 | ~~No retries on upload~~ | **Fixed.** Both upload paths share `newUploader`, which installs the SDK's standard retryer (`uploadMaxAttempts` = 3). Retries are safe because every part is re-read from the file rather than from a consumed buffer. |
 | **Sequential per-file overwrite** | Overwrite decisions block Phase 1 completion. For a large selection with many conflicts, the user must click through each dialog before any download starts. |
 | **Remote→remote sync has no byte progress** | The transfer happens inside S3, so the client sees only completed operations. The op counter advances; the byte gauge does not. |
@@ -934,6 +934,78 @@ would look like the filter had been applied and found everything.
 | **The activity log is append-only and unencrypted** | It records bucket and object names (never credentials) at mode 0600, rotated once at 2 MiB. Delete the file to clear it; there is no in-app purge. |
 
 ---
+
+## Fixed in the 0.10.1 deep review
+
+A read-through of the whole tree. Every finding below was reproduced by a
+failing test before it was fixed, and the test was re-run against the old code
+to confirm it actually caught the defect.
+
+- **Empty Trash was a silent no-op.** Its confirmation handler compared the
+  pressed button against `"ok"` while `NewConfirm` offers `"OK"`, so the
+  comparison never matched and the handler always took the early return. The
+  dialog sized the trash, promised to remove N objects, closed on OK, and
+  removed nothing — the objects kept costing storage while the user believed
+  they were gone. The label was a magic string retyped at nine call sites; it
+  is now `widgets.ConfirmOK`, and a source-scanning test rejects any new
+  literal comparison. Note this *activated* a destructive path that had never
+  once run.
+- **Deleting a profile could panic the TUI.** `Params.DeleteConfig` sliced with
+  an unchecked index, and it dropped the entry from the in-memory list *before*
+  saving — so a failed write (read-only home, full disk) left the slice one
+  shorter than the list on screen. Every profile action addresses a profile by
+  row, so the next edit or delete indexed past the end. The index is now
+  checked and the new list is only adopted once the save succeeded; the
+  remaining row-addressed actions go through a `configAt` guard.
+- **Duplicating a profile shared its bookmarks with the original.** The copy is
+  made by value, so both `Bookmarks` slices pointed at one backing array. Each
+  profile appended into the same spare capacity and the second write silently
+  overwrote the first profile's new bookmark — both slices kept the right
+  length, so nothing looked wrong. `CopyConfig` now clones the slice and the
+  `Region` pointer.
+- **The bookmark manager never closed when a bookmark was picked.** Its rows
+  are wired before the overlay is pushed, and `rebuildBookmarkList` took the
+  layer handle *by value* — capturing the nil it still held. `Layer.Close` is
+  nil-safe, so the miss was silent: the jump happened behind a modal still
+  covering the listing. It now takes the handle by address, the same idiom
+  `escapeCloses` already used.
+- **Retrying a partly-failed move replayed the original run's bookkeeping.**
+  `ops.Copy.withRetry` copied the operation wholesale, so the retry inherited
+  `OnMoved` — which is not only the undo ledger but also consumes the cut
+  clipboard and clears the marks in the source scope. A user who retried a
+  backgrounded paste after yanking something else had that new clipboard wiped.
+  The callback is now cleared, which is what its own comment had always
+  claimed. The cost, stated there: a retry's moves are not added to the
+  one-step undo.
+- **Profile-list mutations raced the UI.** Copy and delete rewrote
+  `c.params.Config` from a background goroutine while every profiles-screen
+  handler read it. Both now run inline on the UI goroutine the done handler is
+  already on — which is what every other `WriteConfig` call site does, a save
+  being one small local file.
+- **Esc stopped closing ten dialogs.** Found while auditing REFACTOR.md's
+  "226 raw page calls → 0" claim, which had only ever been counted over
+  `internal/controller`. Every dialog constructor in `internal/ui/widgets`
+  still carried an Esc handler calling `Pages.RemovePage("modal")` — a page
+  name from before overlays were handles. The shell names every overlay
+  `layer-N`, so the call removed nothing and Esc did nothing in the profile
+  forms, rename, search, batch rename, copy/move, sync, metadata, storage
+  class and create dialogs. Each stayed usable through its Cancel button, so
+  nothing failed; only a user pressing Esc would notice. The widgets now
+  install no key handling at all — overlay lifetime belongs to whoever pushed
+  the layer — and the controller wires `escapeCloses` at each call site. The
+  copy/move dialog turned out never to have had Esc wired at all, which the
+  new guard caught rather than the audit.
+
+Test coverage added alongside: the integration suite gained a controller half
+(`internal/controller/integration_test.go`) covering the flows the app
+*composes* rather than the calls it makes — a full sync in both directions
+including delete-extraneous and the exclude guard, and safe delete's round trip
+through the trash. The model half gained the browsing and housekeeping calls
+that had no server-backed test at all: the recursive prefix delete, the
+delimited listing navigation is built on, folder markers, download resolution,
+presigned links, incomplete-upload cleanup, bucket config, public-bucket
+policy, and `RefreshClient`'s fail-safe contract. Both halves were verified
+re-runnable against a persistent server.
 
 ## Fixed in the 0.8.0 follow-up review
 

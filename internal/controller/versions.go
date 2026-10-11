@@ -11,6 +11,7 @@ import (
 
 	"github.com/nexusriot/s3duck-tui/internal/model"
 	"github.com/nexusriot/s3duck-tui/internal/ui/shell"
+	"github.com/nexusriot/s3duck-tui/internal/ui/widgets"
 )
 
 // versionRow renders one version for the history list. A delete marker has no
@@ -195,7 +196,7 @@ func (c *Controller) confirmRestoreVersion(bucket *model.Object, key, shortName 
 		shortName, v.VersionID)).
 		SetDoneFunc(func(_ int, label string) {
 			confirmLay.Close()
-			if label != "OK" {
+			if label != widgets.ConfirmOK {
 				return
 			}
 			history.Close()
@@ -233,7 +234,7 @@ func (c *Controller) confirmDeleteVersion(bucket *model.Object, key, shortName s
 		what, shortName, v.VersionID, extra)).
 		SetDoneFunc(func(_ int, label string) {
 			confirmLay.Close()
-			if label != "OK" {
+			if label != widgets.ConfirmOK {
 				return
 			}
 			history.Close()

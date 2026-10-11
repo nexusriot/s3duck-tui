@@ -60,6 +60,7 @@ func (c *Controller) EditProfileOptions() {
 	})
 	form.AddButton("Cancel", func() { lay.Close() })
 
+	form.SetInputCapture(escapeCloses(&lay))
 	lay = c.pushModalClamped(form, 76, widgets.ProfileOptionsHeight)
 	c.view.App.SetFocus(form)
 }

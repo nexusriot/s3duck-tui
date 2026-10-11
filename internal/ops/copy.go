@@ -139,8 +139,19 @@ func (c *Copy) apply(ctx context.Context, rep Reporter, it CopyItem, dstKey stri
 }
 
 // withRetry stamps the result with an operation covering exactly the items that
-// failed. The undo callback is dropped: a retry's moves are recorded by the
-// retry itself, and replaying the original's would double-count.
+// failed.
+//
+// OnMoved is cleared, because it is not only an undo ledger: the controller
+// also uses it to consume the cut clipboard and to clear the marks in the
+// scope the items were moved out of. Those are one-shot effects belonging to
+// the run that moved them. A retry inheriting the callback applies them again,
+// to whatever state exists by then — wiping a clipboard the user filled after
+// the first pass, and marks they re-made in the source folder.
+//
+// The cost is that a retry's own moves are not added to the one-step undo,
+// which still reverses what the first pass moved. Accumulating across the two
+// would need the undo to know the runs belong together; an unrelated move in
+// between would otherwise be folded into the same entry.
 func (c *Copy) withRetry(res Result) Result {
 	if len(res.Failures) == 0 {
 		return res
@@ -160,6 +171,7 @@ func (c *Copy) withRetry(res Result) Result {
 	}
 	next := *c
 	next.Items = again
+	next.OnMoved = nil
 	res.Retry = &next
 	return res
 }

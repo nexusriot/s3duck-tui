@@ -12,6 +12,7 @@ import (
 	cfg "github.com/nexusriot/s3duck-tui/internal/config"
 	"github.com/nexusriot/s3duck-tui/internal/model"
 	"github.com/nexusriot/s3duck-tui/internal/ui/shell"
+	"github.com/nexusriot/s3duck-tui/internal/ui/widgets"
 	u "github.com/nexusriot/s3duck-tui/internal/utils"
 )
 
@@ -90,6 +91,7 @@ func (c *Controller) CreateConfigEntry() {
 		lay.Close()
 	})
 
+	cForm.SetInputCapture(escapeCloses(&lay))
 	lay = c.pushModal(cForm, 75, 23)
 }
 
@@ -101,7 +103,10 @@ func (c *Controller) EditConfigEntry() {
 	}
 	i := c.view.List.GetCurrentItem()
 
-	entry := c.params.Config[i]
+	entry := c.configAt(i)
+	if entry == nil {
+		return
+	}
 	cForm := c.view.NewCreateProfileForm("Edit config entry")
 
 	cForm.GetFormItem(0).(*tview.InputField).SetText(entry.Name)
@@ -154,6 +159,7 @@ func (c *Controller) EditConfigEntry() {
 		lay.Close()
 	})
 
+	cForm.SetInputCapture(escapeCloses(&lay))
 	lay = c.pushModal(cForm, 75, 23)
 }
 
@@ -173,22 +179,26 @@ func (c *Controller) CopyProfile() {
 		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
 			confirmLay.Close()
 
-			if buttonLabel == "OK" {
-				go func() {
-					conf := *c.params.Config[i]
-					conf.Name = newName
-					if err := c.params.CopyConfig(conf); err != nil {
-						c.error("Failed to copy config", err)
-						return
-					}
-					// Widget rebuilds must run on the UI goroutine.
-					c.shell.Do(func() {
-						c.fillConfigData()
-						c.view.List.SetCurrentItem(len(c.params.Config) - 1)
-					})
-				}()
-
+			if buttonLabel != widgets.ConfirmOK {
+				return
 			}
+			// Inline, on the UI goroutine the done handler already runs on:
+			// c.params.Config is read by every profile screen handler, so
+			// rewriting it from a background goroutine raced them. Saving is
+			// one small local file, which is why every other config write —
+			// options, edit, bookmarks — is done the same way.
+			entry := c.configAt(i)
+			if entry == nil {
+				return
+			}
+			conf := *entry
+			conf.Name = newName
+			if err := c.params.CopyConfig(conf); err != nil {
+				c.error("Failed to copy config", err)
+				return
+			}
+			c.fillConfigData()
+			c.view.List.SetCurrentItem(len(c.params.Config) - 1)
 		})
 	confirmLay = c.pushRaw(confirm)
 }
@@ -299,13 +309,28 @@ func (c *Controller) ImportAWSProfiles() {
 	}()
 }
 
+// configAt is the profile shown at list row i, or nil when the row does not
+// name one. Every profile action is addressed by row, and the row is captured
+// when a dialog opens and used after it closes — so the list and the stored
+// slice can disagree by the time it is read, and an unchecked index would take
+// the terminal down with it.
+func (c *Controller) configAt(i int) *cfg.Config {
+	if i < 0 || i >= len(c.params.Config) {
+		return nil
+	}
+	return c.params.Config[i]
+}
+
 func (c *Controller) CheckProfile() {
 	if c.view.List.GetItemCount() == 0 {
 		return
 	}
 	i := c.view.List.GetCurrentItem()
 
-	cf := c.params.Config[i]
+	cf := c.configAt(i)
+	if cf == nil {
+		return
+	}
 
 	// A throwaway client: verifying a profile must never replace c.model —
 	// a queued/backgrounded transfer that reads the model later would run
@@ -348,17 +373,17 @@ func (c *Controller) DeleteConfigEntry() {
 			// including a profile form the user was in the middle of.
 			confirmLay.Close()
 
-			if buttonLabel == "OK" {
-				go func() {
-					if err := c.params.DeleteConfig(i); err != nil {
-						c.error("Failed to delete config", err)
-						return
-					}
-					// Widget rebuilds must run on the UI goroutine.
-					c.shell.Do(c.fillConfigData)
-				}()
-
+			if buttonLabel != widgets.ConfirmOK {
+				return
 			}
+			// Inline for the same reason as CopyProfile: the profile list is
+			// UI state, and a background goroutine rewriting it raced every
+			// handler that reads it.
+			if err := c.params.DeleteConfig(i); err != nil {
+				c.error("Failed to delete config", err)
+				return
+			}
+			c.fillConfigData()
 		})
 	confirmLay = c.pushRaw(confirm)
 }
@@ -477,8 +502,10 @@ func (c *Controller) fillConfigData() {
 
 	for _, cf := range c.params.Config {
 		c.view.List.AddItem(cf.Name, cf.Name, 0, func() {
-			i := c.view.List.GetCurrentItem()
-			conf := c.params.Config[i]
+			conf := c.configAt(c.view.List.GetCurrentItem())
+			if conf == nil {
+				return
+			}
 			c.activeConfig = conf
 			c.Duck()
 		})

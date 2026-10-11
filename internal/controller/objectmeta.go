@@ -200,6 +200,7 @@ func (c *Controller) EditObjectMeta() {
 			})
 			form.AddButton("Cancel", func() { formLay.Close() })
 
+			form.SetInputCapture(escapeCloses(&formLay))
 			formLay = c.pushModal(form, 80, metaEditorHeight)
 		})
 	}()
@@ -309,6 +310,7 @@ func (c *Controller) ChangeStorageClass() {
 			}
 			form.AddButton("Cancel", func() { classLay.Close() })
 
+			form.SetInputCapture(escapeCloses(&classLay))
 			classLay = c.pushModal(form, 78, 16)
 		})
 	}()

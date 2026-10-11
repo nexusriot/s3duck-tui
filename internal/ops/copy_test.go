@@ -304,3 +304,42 @@ func TestCopyReportsObjectProgress(t *testing.T) {
 		t.Errorf("a server-side copy claimed byte progress: %+v", last)
 	}
 }
+
+// TestCopyRetryDoesNotReplayTheMoveCallback pins the one-shot bookkeeping that
+// hangs off a move.
+//
+// OnMoved is not just an undo ledger: the controller also uses it to consume
+// the cut clipboard and to clear the marks in the source scope. Those belong to
+// the run that moved the items. A retry carrying the same callback applies them
+// a second time, to whatever state exists by then — so a user who retried a
+// partly-failed paste after yanking something else had that new clipboard
+// silently wiped, and marks they had re-made in the source folder cleared.
+func TestCopyRetryDoesNotReplayTheMoveCallback(t *testing.T) {
+	mv := &fakeMover{failFor: map[string]error{"from/b.txt": errors.New("boom")}}
+	c := newCopy(mv, file("a.txt"), file("b.txt"))
+	c.Move = true
+
+	runs := 0
+	c.OnMoved = func([]Transfer) { runs++ }
+
+	res := c.Run(context.Background(), &recorder{})
+	if runs != 1 {
+		t.Fatalf("OnMoved ran %d times on the first pass, want 1", runs)
+	}
+
+	rc, ok := res.Retry.(*Copy)
+	if !ok {
+		t.Fatalf("retry is %T, want *Copy", res.Retry)
+	}
+	if rc.OnMoved != nil {
+		t.Error("the retry carries the original run's move callback; running it would redo that run's clipboard and mark bookkeeping")
+	}
+
+	// Let the retry succeed, so the callback would fire if it were still there.
+	mv.failFor = nil
+	rc.Run(context.Background(), &recorder{})
+
+	if runs != 1 {
+		t.Errorf("OnMoved ran %d times in total, want 1: the retry replayed the original run's bookkeeping", runs)
+	}
+}

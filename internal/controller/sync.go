@@ -434,6 +434,7 @@ func (c *Controller) showSyncForm(bucket *model.Object, prefix string, bucketNam
 	})
 	form.AddButton("Cancel", func() { lay.Close() })
 
+	form.SetInputCapture(escapeCloses(&lay))
 	lay = c.pushModal(form, 82, syncFormHeight)
 }
 

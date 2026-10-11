@@ -132,7 +132,7 @@ func (c *Controller) EmptyTrash() {
 				trash, target.objects, widgets.HumanizeBytes(target.bytes)))
 			confirm.SetDoneFunc(func(_ int, label string) {
 				confirmLay.Close()
-				if label != "ok" {
+				if label != widgets.ConfirmOK {
 					return
 				}
 				// runDelete diverts to the trash for a trash-enabled profile;

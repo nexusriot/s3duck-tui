@@ -14,6 +14,7 @@ import (
 
 	"github.com/nexusriot/s3duck-tui/internal/model"
 	"github.com/nexusriot/s3duck-tui/internal/ui/shell"
+	"github.com/nexusriot/s3duck-tui/internal/ui/widgets"
 )
 
 // dupMember is one copy of a duplicated object.
@@ -356,7 +357,7 @@ func (c *Controller) confirmDeleteDup(mdl *model.Model, bucket *model.Object, pr
 		m.Key, others, pluralYIes(others), verb)).
 		SetDoneFunc(func(_ int, label string) {
 			confirmLay.Close()
-			if label != "OK" {
+			if label != widgets.ConfirmOK {
 				return
 			}
 			go func() {

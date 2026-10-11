@@ -226,7 +226,7 @@ func (c *Controller) confirmThen(text string, onYes func()) {
 	confirm := c.view.NewConfirm()
 	confirm.SetText(text).SetDoneFunc(func(_ int, label string) {
 		lay.Close()
-		if label == "OK" {
+		if label == widgets.ConfirmOK {
 			onYes()
 		}
 	})
@@ -510,7 +510,7 @@ func (c *Controller) Delete() {
 			confirm.SetText(deleteConfirmText(targets)).
 				SetDoneFunc(func(_ int, buttonLabel string) {
 					confirmLay.Close()
-					if buttonLabel != "OK" {
+					if buttonLabel != widgets.ConfirmOK {
 						return
 					}
 					c.runDelete(targets, bucket)
@@ -1243,6 +1243,7 @@ func (c *Controller) create(isBucket bool) {
 		lay.Close()
 	})
 
+	cForm.SetInputCapture(escapeCloses(&lay))
 	lay = c.pushModal(cForm, 65, 9)
 }
 
@@ -1401,6 +1402,7 @@ func (c *Controller) renameSingle() {
 		lay.Close()
 	})
 
+	form.SetInputCapture(escapeCloses(&lay))
 	lay = c.pushModal(form, 65, 9)
 }
 
@@ -1533,6 +1535,7 @@ func (c *Controller) batchRename(names []string) {
 			})
 	})
 	form.AddButton("Cancel", func() { lay.Close() })
+	form.SetInputCapture(escapeCloses(&lay))
 	lay = c.pushModal(form, 70, 11)
 }
 
@@ -1838,6 +1841,7 @@ func (c *Controller) copyOrMove(isMove bool) {
 			form.AddButton("Cancel", func() {
 				lay.Close()
 			})
+			form.SetInputCapture(escapeCloses(&lay))
 			lay = c.pushModal(form, 75, 11)
 		})
 	}()
@@ -2014,7 +2018,7 @@ func (c *Controller) Undo() {
 	confirm.SetText(fmt.Sprintf("Undo %s?", op.desc)).
 		SetDoneFunc(func(_ int, label string) {
 			confirmLay.Close()
-			if label != "OK" {
+			if label != widgets.ConfirmOK {
 				return
 			}
 			c.runUndo(op)
@@ -3242,6 +3246,7 @@ func (c *Controller) RecursiveSearch() {
 		c.runRecursiveSearch(bucket, prefix, q)
 	})
 	form.AddButton("Cancel", func() { lay.Close() })
+	form.SetInputCapture(escapeCloses(&lay))
 	lay = c.pushModal(form, 65, 9)
 }
 
@@ -3485,7 +3490,11 @@ func (c *Controller) Bookmarks() {
 	list.SetBorder(true).SetTitle(" Bookmarks — Enter: go • Del: remove • Esc: close ")
 	list.SetSelectedBackgroundColor(tcell.ColorBlue)
 	list.SetSelectedTextColor(tcell.ColorWhite)
-	c.rebuildBookmarkList(list, lay)
+	// The rows are built before the overlay exists, so they are handed the
+	// address of the handle rather than its value: passing lay here would
+	// freeze the nil it still holds, and Layer.Close is nil-safe, so picking
+	// a bookmark would navigate without ever taking the manager down.
+	c.rebuildBookmarkList(list, &lay)
 
 	list.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
 		switch ev.Key() {
@@ -3493,7 +3502,7 @@ func (c *Controller) Bookmarks() {
 			lay.Close()
 			return nil
 		case tcell.KeyDelete:
-			c.removeBookmarkAt(list, lay)
+			c.removeBookmarkAt(list, &lay)
 			return nil
 		}
 		return ev
@@ -3512,7 +3521,10 @@ func (c *Controller) bookmarkOffset() int {
 	return 0
 }
 
-func (c *Controller) rebuildBookmarkList(list *tview.List, lay *shell.Layer) {
+// rebuildBookmarkList fills the manager's rows. lay is the manager's own
+// overlay, taken by address because the rows are wired before it is pushed and
+// are rebuilt afterwards — see Bookmarks.
+func (c *Controller) rebuildBookmarkList(list *tview.List, lay **shell.Layer) {
 	list.Clear()
 	if c.pane().Bucket() != nil {
 		list.AddItem("[green]＋ Add current location[-]", "", 0, func() {
@@ -3522,7 +3534,7 @@ func (c *Controller) rebuildBookmarkList(list *tview.List, lay *shell.Layer) {
 	for _, bm := range c.activeConfig.Bookmarks {
 		bm := bm
 		list.AddItem("★ "+bm.Name, "", 0, func() {
-			lay.Close()
+			(*lay).Close()
 			c.jumpTo(bm.Bucket, bm.Prefix, "")
 		})
 	}
@@ -3531,7 +3543,7 @@ func (c *Controller) rebuildBookmarkList(list *tview.List, lay *shell.Layer) {
 	}
 }
 
-func (c *Controller) addCurrentBookmark(list *tview.List, lay *shell.Layer) {
+func (c *Controller) addCurrentBookmark(list *tview.List, lay **shell.Layer) {
 	if c.pane().Bucket() == nil {
 		return
 	}
@@ -3550,7 +3562,7 @@ func (c *Controller) addCurrentBookmark(list *tview.List, lay *shell.Layer) {
 	c.rebuildBookmarkList(list, lay)
 }
 
-func (c *Controller) removeBookmarkAt(list *tview.List, lay *shell.Layer) {
+func (c *Controller) removeBookmarkAt(list *tview.List, lay **shell.Layer) {
 	idx := list.GetCurrentItem() - c.bookmarkOffset()
 	if idx < 0 || idx >= len(c.activeConfig.Bookmarks) {
 		return

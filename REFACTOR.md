@@ -453,13 +453,25 @@ hard logic is still untested.
 
 | Metric | Before | After |
 |---|---|---|
-| `controller.go` | 5,648 lines | 3,984 |
+| `controller.go` | 5,648 lines | 3,996 |
 | Fields on `Controller` | 44 | 29 |
-| Methods on `*Controller` | 201 | 183 |
-| Raw `Pages.*Page` calls | 226 | 0 |
+| Methods on `*Controller` | 201 | 184 |
+| Raw `Pages.*Page` calls | 226 | 2 (both inside `ui/shell`, which owns them) |
 | `QueueUpdateDraw` outside the shell | 92 | 0 |
 | Interfaces in the repo | 0 | 8 |
-| Tests | 247 | 342 |
+| Tests | 247 | 371 |
+
+The page-call row read "0" until 0.10.1, because it was only ever counted over
+`internal/controller`. Ten raw `Pages.RemovePage("modal")` calls had been left
+behind in `internal/ui/widgets`, in the Esc handlers of the dialog
+constructors — written when overlays were addressed by magic string, and never
+converted. The shell names every overlay `layer-N`, so those handlers removed a
+page that does not exist and **Esc silently stopped closing ten dialogs**. The
+forms were still usable through their Cancel buttons, so nothing failed and
+nothing in the suite noticed. Fixed in 0.10.1: the widgets install no key
+handling at all (overlay lifetime belongs to whoever pushed the layer), the
+controller wires `escapeCloses` at each call site, and two tests now pin both
+halves of that boundary — one per package, so neither side can drift alone.
 
 ### What is still open
 

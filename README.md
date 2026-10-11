@@ -355,15 +355,27 @@ make staticcheck   # the remaining lint CI runs (needs staticcheck installed)
 ```
 
 The unit suite needs no network: it covers the pure functions (planners,
-matchers, formatters, parsers) plus a set of documentation guards that assert
-this README still matches the code — every default key binding appears in the
-tables below, every table key is really bound, every profile field is
-documented, and the `keys.json` example names real actions. Behaviour that can
-only be observed against a real server — that restoring a version *adds* one
-rather than rewinding, that a storage-class change preserves metadata, that an
-uploaded object's stored Content-Type is the derived one, that a checksum
-round-trips and a tampered file is caught — lives in a tag-gated integration
-suite:
+matchers, formatters, parsers) plus a set of guards that assert the code still
+matches what is written down — every default key binding appears in the tables
+below, every table key is really bound, every profile field is documented, the
+`keys.json` example names real actions, the version the app reports matches the
+one the Makefile and `build-deb.sh` package, and no confirmation handler
+compares the dialog's button label to a hand-typed literal. The last two exist
+because each guards a constant that is stated in more than one place and had
+already drifted once.
+
+Behaviour that can only be observed against a real server lives in a tag-gated
+integration suite, in two halves. `internal/model` covers the S3 calls
+themselves: that restoring a version *adds* one rather than rewinding, that a
+storage-class change preserves metadata, that an uploaded object's stored
+Content-Type is the derived one, that a checksum round-trips and a tampered
+file is caught, that a prefix delete takes the subtree and not the sibling
+sharing its name stem, and that a presigned link actually fetches.
+`internal/controller` covers the flows the app *composes* out of those calls —
+a full sync (scan both sides, diff, apply, and confirm the destination mirrors
+the source, deletes included) and safe delete's round trip through the trash.
+Those are not model calls, so the model suite cannot see them; they are also
+where the decisions that can lose data live.
 
 ```
 make test-integration     # starts a throwaway MinIO in Docker, runs, tears down
