@@ -453,13 +453,13 @@ hard logic is still untested.
 
 | Metric | Before | After |
 |---|---|---|
-| `controller.go` | 5,648 lines | 3,996 |
+| `controller.go` | 5,648 lines | 4,020 |
 | Fields on `Controller` | 44 | 29 |
 | Methods on `*Controller` | 201 | 184 |
 | Raw `Pages.*Page` calls | 226 | 2 (both inside `ui/shell`, which owns them) |
 | `QueueUpdateDraw` outside the shell | 92 | 0 |
 | Interfaces in the repo | 0 | 8 |
-| Tests | 247 | 371 |
+| Tests | 247 | 374 |
 
 The page-call row read "0" until 0.10.1, because it was only ever counted over
 `internal/controller`. Ten raw `Pages.RemovePage("modal")` calls had been left
@@ -473,11 +473,22 @@ handling at all (overlay lifetime belongs to whoever pushed the layer), the
 controller wires `escapeCloses` at each call site, and two tests now pin both
 halves of that boundary — one per package, so neither side can drift alone.
 
+Phase 4 left a similar residue, found in 0.10.2. Converting sync to
+`ops.Sync` moved its scheduler into `internal/ops`, but the controller's copy —
+`splitSyncPhases`, `syncWorkerCount`, `indexedOp`, `syncWorkers` — was never
+deleted, and kept its tests. Two implementations of the writes-before-deletes
+barrier, one of them dead and both green, is the exact failure mode a "move the
+logic out" refactor is supposed to end: a later fix to the barrier would have
+gone into whichever copy the author found first. Deleted. Worth a rule for the
+remaining conversions: when a flow becomes an `ops.Operation`, its old
+scheduling helpers go in the same commit, and so do their tests — a test is
+what makes dead code look alive.
+
 ### What is still open
 
 - **Four of seven flows are converted.** `Download`, `Upload`, `Copy`/`Move`
   and `Sync` are `ops.Operation`s. Still open-coding the pipeline the Runner
-  owns: `runCrossCopy` (226 lines), `runBatchRename` (111), `runUndo` and
+  owns: `runCrossCopy` (221 lines), `runBatchRename` (81), `runUndo` and
   `runDelete`. The pattern is established — each is a `Describe`/`Run` pair plus
   a ten-line constructor — and `runUndo`/`runBatchRename` are both really
   `ops.Copy` with a different label, so they should collapse rather than grow
@@ -492,7 +503,9 @@ halves of that boundary — one per package, so neither side can drift alone.
   that rejects `Put`/`Delete`/`Copy`, so forgetting one becomes impossible
   rather than merely unlikely.
 - **`progressReader.Read` is still non-atomic** (`internal/model/model.go`),
-  unlike its `progressWriterAt` sibling.
+  unlike its `progressWriterAt` sibling. Reviewed in 0.10.2 and left: one
+  goroutine reads a given reader (the uploader takes a part at a time), so
+  this is a consistency wart rather than a race.
 - **The integration CI job still does not run `-race`.**
 
 See the commit history on `refactor/architecture` for the per-phase diffs.

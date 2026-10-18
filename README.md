@@ -47,10 +47,10 @@ Features
 35. **Overwrite confirmation for remote writes** — rename, batch rename, copy, move, paste, upload, cross-profile copy and restore-from-trash all check the destination first and name exactly what they would replace, offering **Overwrite**, **Skip existing** (when that still leaves something to do) or **Cancel**. Skipping a destination on a *move* leaves the source in place too, so nothing is ever deleted without having been written somewhere. Sync is exempt: its dry-run plan already lists every update before anything moves
 36. **Copies above 5 GiB** — copy, move, rename, storage-class changes, metadata saves and version restores fall back to a concurrent multipart part-copy past the size where a single-request S3 copy is rejected, carrying content headers, metadata and tags across
 37. Custom endpoints and self-signed TLS support (`ignore_ssl`)
-38. **Local pane** (`l`) — point one dual-pane side at a directory and browse it with the same columns, sort, filter and multi-select as a bucket; `Ctrl+Y` then uploads the marked files, and a download lands in that directory. The local pane never deletes, renames or creates: it is a transfer endpoint, not a file manager
+38. **Local pane** (`l`) — point one dual-pane side at a directory and browse it with the same columns, sort, filter and multi-select as a bucket; `Ctrl+Y` then uploads the marked files, and a download lands in that directory. The local pane never deletes, renames or creates: it is a transfer endpoint, not a file manager. Actions that only mean something against an object — properties, presigned links, versions, metadata and the rest — say so instead of acting on the local file
 39. **Usage browser** (`G`) — one recursive listing, then drill down through the prefix tree by size: share bars, object counts and a **storage-class breakdown** at every level, `g` to jump to any node in the browser. The flat top-10 summary (Ctrl+G) now discloses what it folded away instead of truncating silently
 40. **Preview** (`P`) — read-only look at the head of any object through a **ranged GET**, so previewing a 40 GiB log costs one small request; binary content is shown as a hexdump, and `e` hands the object to the editor
-41. **Version diff** (`D` in the version browser) — unified diff of any old version against the current one
+41. **Version diff** (`D` in the version browser) — unified diff of any old version against the current one. Bounded by line count rather than by bytes (the comparison is quadratic in lines): a pair too large to diff in memory is declined with both counts named, rather than taking the app down
 42. **Read-only profiles** — a per-profile flag that refuses every mutating action, and a header that always names the open profile, its endpoint and its read-only state, so "which account is this?" is answerable without leaving the browser
 43. **Safe delete (trash)** — a per-profile mode where delete becomes a server-side move into `.s3duck-trash/<timestamp>/`; `R` restores objects to the keys they came from — through the same overwrite confirmation as any other remote write, since the original key may hold something newer by then — and emptying the trash is the one delete that is never diverted
 44. **Checksums** — ask S3 to verify a `CRC32C` / `CRC32` / `SHA256` / `SHA1` checksum on every write, verify a downloaded file against it automatically or on demand (`V`), and get a straight answer for multipart objects, whose ETag can never be compared. Optional per-upload **server-side encryption** (SSE-S3 / SSE-KMS)
@@ -147,7 +147,7 @@ update queue that never blocks. See [REFACTOR.md](REFACTOR.md).
 1. **Startup** — `main` builds a `Controller`, which builds a `View` and loads `Params` from `internal/config`. The profile list is rendered first.
 2. **Open profile** — selecting a profile goes through `modelConfigFor` (the single place a stored profile becomes a connection: credentials, throughput cap, write options) and `model.NewModel`, which builds the AWS config — custom endpoint resolver, then either static credentials or the SDK's own resolution for the profile's `aws_profile`, plus a per-phase-timeout HTTP client with optional `InsecureSkipVerify`. If the profile remembers a location, it is reopened there.
 3. **Browse** — selecting a bucket triggers `RefreshClient` (resolves bucket region via `GetBucketLocation`, rebuilds the client). Subsequent navigation uses `ListStream(ctx, prefix, bucket, onPage)` with `Delimiter="/"`, rendering folders + files as pages arrive; `Esc` cancels and whatever arrived stays browsable. A pane pointed at a local directory reads it with `WalkDir` instead.
-4. **Transfer** — long-running operations (download / upload / delete / summary / scans) run in goroutines with a `context.Context` that the cancel button on the progress or wait modal can cancel. Progress callbacks are funneled back to the UI through `App.QueueUpdateDraw`; failures accumulate in an `opResult`, so the final report can re-run only what failed.
+4. **Transfer** — long-running operations (download / upload / copy / sync, and the delete / scan flows) run in goroutines with a `context.Context` that the cancel button on the progress or wait modal can cancel. Progress is reported through `shell.Do`, which never blocks whichever goroutine calls it; failures accumulate in an `ops.Result` (or, for the flows not yet converted, an `opResult`), so the final report can re-run exactly what failed.
 5. **Selection scope** — multi-select state is keyed by `bucket:path`, so selections survive navigation in and out of folders.
 6. **Sync** — `Ctrl+E` scans both sides (local tree and/or remote prefixes), drops anything matching the run's exclude patterns, optionally resolves per-file checksums, diffs them with the pure `planSync`, shows the resulting plan, and only then applies it through the same transfer-job machinery as downloads and uploads. `=` runs the same diff read-only across the two panes.
 
@@ -358,11 +358,11 @@ The unit suite needs no network: it covers the pure functions (planners,
 matchers, formatters, parsers) plus a set of guards that assert the code still
 matches what is written down — every default key binding appears in the tables
 below, every table key is really bound, every profile field is documented, the
-`keys.json` example names real actions, the version the app reports matches the
-one the Makefile and `build-deb.sh` package, and no confirmation handler
-compares the dialog's button label to a hand-typed literal. The last two exist
-because each guards a constant that is stated in more than one place and had
-already drifted once.
+`keys.json` example names real actions, every repository path the docs name
+still exists, the version the app reports matches the one the Makefile and
+`build-deb.sh` package, and no confirmation handler compares the dialog's
+button label to a hand-typed literal. The last three exist because each guards
+something stated in more than one place that had already drifted once.
 
 Behaviour that can only be observed against a real server lives in a tag-gated
 integration suite, in two halves. `internal/model` covers the S3 calls

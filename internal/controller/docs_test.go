@@ -254,3 +254,45 @@ func TestGeneratedHelpHasNoDuplicateChords(t *testing.T) {
 		seen[h.Chord] = h.Help
 	}
 }
+
+// docPathRe matches a backticked repository path in the documentation.
+var docPathRe = regexp.MustCompile("`((?:internal|cmd)/[A-Za-z0-9_./-]+)`")
+
+// docPathsNotExpectedToExist are paths the docs name precisely because they do
+// NOT exist — a rejected package name, in REFACTOR.md's case.
+var docPathsNotExpectedToExist = map[string]bool{
+	"internal/s3": true,
+}
+
+// The documentation names files and packages constantly, and a rename leaves
+// those references pointing at nothing — silently, because prose is the one
+// thing no compiler reads. The 0.10.2 review found three sections describing a
+// structure two refactors old; this is the cheap half of that check, made
+// permanent.
+//
+// It cannot see a paragraph whose *claim* has gone stale (that still takes a
+// reader), but it does catch the most common way one starts to: the file it
+// points at moved.
+func TestDocsOnlyNameFilesThatExist(t *testing.T) {
+	checked := 0
+	for _, name := range []string{"README.md", "DESIGN.md", "REFACTOR.md", "ROADMAP.md"} {
+		doc := readDoc(t, name)
+		seen := map[string]bool{}
+		for _, m := range docPathRe.FindAllStringSubmatch(doc, -1) {
+			p := m[1]
+			if seen[p] || docPathsNotExpectedToExist[p] {
+				continue
+			}
+			seen[p] = true
+			checked++
+			if _, err := os.Stat("../../" + p); err != nil {
+				t.Errorf("%s names %q, which does not exist (renamed or removed?)", name, p)
+			}
+		}
+	}
+	// A guard that matches nothing passes forever. ROADMAP.md legitimately
+	// names no paths, so the floor is across the set rather than per file.
+	if checked < 10 {
+		t.Errorf("only %d repository paths found across the docs; the regex has stopped matching", checked)
+	}
+}

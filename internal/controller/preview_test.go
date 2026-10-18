@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -98,13 +99,22 @@ func TestSplitLines(t *testing.T) {
 }
 
 func TestUnifiedDiff(t *testing.T) {
+	diff := func(a, b, la, lb string) string {
+		t.Helper()
+		got, err := unifiedDiff(a, b, la, lb)
+		if err != nil {
+			t.Fatalf("unifiedDiff(%q, %q) errored: %v", a, b, err)
+		}
+		return got
+	}
+
 	// Identical content produces no diff at all, which is what lets the
 	// caller say "identical" instead of showing an empty window.
-	if got := unifiedDiff("a\nb\n", "a\nb\n", "old", "new"); got != "" {
+	if got := diff("a\nb\n", "a\nb\n", "old", "new"); got != "" {
 		t.Errorf("identical inputs produced a diff: %q", got)
 	}
 
-	got := unifiedDiff("keep\nold\ntail\n", "keep\nnew\ntail\n", "v1", "current")
+	got := diff("keep\nold\ntail\n", "keep\nnew\ntail\n", "v1", "current")
 	if !strings.Contains(got, "- old") || !strings.Contains(got, "+ new") {
 		t.Errorf("diff missing the change: %q", got)
 	}
@@ -116,15 +126,32 @@ func TestUnifiedDiff(t *testing.T) {
 	}
 
 	// Pure addition and pure removal.
-	if got := unifiedDiff("", "added\n", "v1", "current"); !strings.Contains(got, "+ added") {
+	if got := diff("", "added\n", "v1", "current"); !strings.Contains(got, "+ added") {
 		t.Errorf("addition diff = %q", got)
 	}
-	if got := unifiedDiff("gone\n", "", "v1", "current"); !strings.Contains(got, "- gone") {
+	if got := diff("gone\n", "", "v1", "current"); !strings.Contains(got, "- gone") {
 		t.Errorf("removal diff = %q", got)
 	}
 
 	// Tags inside content must be escaped, or the viewer would eat them.
-	if got := unifiedDiff("[red]\n", "[blue]\n", "v1", "current"); !strings.Contains(got, "[[red]") {
+	if got := diff("[red]\n", "[blue]\n", "v1", "current"); !strings.Contains(got, "[[red]") {
 		t.Errorf("content tags not escaped: %q", got)
+	}
+}
+
+// The LCS table is quadratic in LINES, so the byte cap on the bodies bounds
+// nothing: two 1 MiB files of short lines would ask for gigabytes. The guard
+// has to refuse before it allocates, not after.
+func TestUnifiedDiffRefusesAnOversizedTable(t *testing.T) {
+	big := strings.Repeat("x\n", 4096) // 4096 lines a side -> ~16.8M cells
+	_, err := unifiedDiff(big, big+"y\n", "v1", "current")
+	if !errors.Is(err, errDiffTooLarge) {
+		t.Fatalf("want errDiffTooLarge, got %v", err)
+	}
+
+	// Just under the cap still diffs.
+	small := strings.Repeat("x\n", 64)
+	if _, err := unifiedDiff(small, small+"y\n", "v1", "current"); err != nil {
+		t.Errorf("a small diff was refused: %v", err)
 	}
 }

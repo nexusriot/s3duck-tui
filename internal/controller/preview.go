@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"unicode"
@@ -208,17 +209,34 @@ func (c *Controller) showTextOverlay(title, body, footer string, extra func(*tce
 	})
 }
 
+// maxDiffCells bounds the LCS table. The walk is quadratic in LINES, not in
+// bytes, so the editMaxSize cap on the bodies bounds nothing useful: a 1 MiB
+// CSV of 40-byte rows is ~26k lines a side, and a table that size is ~5 GiB of
+// int — the process dies before it can draw anything. 4M cells is ~32 MiB and
+// covers two 2000-line files, which is every config file a version diff is
+// actually for; past it the diff declines rather than taking the app with it.
+const maxDiffCells = 4 << 20
+
+// errDiffTooLarge is what unifiedDiff reports instead of allocating a table
+// that would exhaust memory. It is a sentinel so the caller can word the
+// message; errors.Is identifies it.
+var errDiffTooLarge = errors.New("too many lines to diff")
+
 // unifiedDiff renders a minimal line diff between two texts. It is a plain
 // longest-common-subsequence walk rather than a full Myers implementation:
-// the inputs are capped at editMaxSize, where the quadratic table costs
-// nothing worth optimising, and the result is the same.
+// within maxDiffCells the quadratic table costs nothing worth optimising, and
+// the result is the same.
 //
 // Context is unlimited — every line is shown, changed or not — because a
 // version diff is usually a config file where the surrounding lines are the
-// point. Empty output means the two versions are byte-identical.
-func unifiedDiff(a, b string, labelA, labelB string) string {
+// point. Empty output with a nil error means the two versions are identical.
+func unifiedDiff(a, b string, labelA, labelB string) (string, error) {
 	linesA := splitLines(a)
 	linesB := splitLines(b)
+
+	if cells := int64(len(linesA)+1) * int64(len(linesB)+1); cells > maxDiffCells {
+		return "", fmt.Errorf("%w: %d and %d lines", errDiffTooLarge, len(linesA), len(linesB))
+	}
 
 	// lcs[i][j] = length of the longest common subsequence of a[i:] and b[j:].
 	lcs := make([][]int, len(linesA)+1)
@@ -266,9 +284,9 @@ func unifiedDiff(a, b string, labelA, labelB string) string {
 		changed = true
 	}
 	if !changed {
-		return ""
+		return "", nil
 	}
-	return b2.String()
+	return b2.String(), nil
 }
 
 // splitLines splits on newlines without producing a trailing empty line for
@@ -315,7 +333,11 @@ func (c *Controller) diffVersions(bucket *model.Object, key string, v model.Obje
 		if len(short) > 8 {
 			short = short[:8]
 		}
-		body := unifiedDiff(string(older), string(current), "version "+short, "current")
+		body, err := unifiedDiff(string(older), string(current), "version "+short, "current")
+		if err != nil {
+			c.error("Diff", fmt.Errorf("%s: %w — download both versions and diff them locally", key, err))
+			return
+		}
 		if body == "" {
 			c.success(fmt.Sprintf("%s: version %s is identical to the current one", key, short))
 			return

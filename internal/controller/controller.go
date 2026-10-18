@@ -338,15 +338,6 @@ func objKey(o *model.Object) string {
 	return *o.FullPath
 }
 
-func getPosition(element string, slice []string) int {
-	for k, v := range slice {
-		if element == v {
-			return k
-		}
-	}
-	return 0
-}
-
 func (c *Controller) getSelectedObjectName() string {
 	// GetCurrentItem returns 0 even for an empty list, and GetItemText indexes
 	// unchecked — an empty buckets screen (no buckets, or no list permission)
@@ -795,8 +786,8 @@ func (c *Controller) updateList() error {
 		return nil
 	}
 
-	ctx := c.listing.begin()
-	defer c.listing.end(ctx)
+	ctx, gen := c.listing.begin()
+	defer c.listing.end(gen)
 
 	// The pane and title base are captured before the fetch: a Tab during a
 	// slow listing must not redirect the progress counter into the other pane.
@@ -1605,16 +1596,21 @@ func (c *Controller) runBatchRename(ops []renameOp, skip map[string]bool) {
 				break loop
 			default:
 			}
-			n, label := i+1, op.label
+			// Separate names, deliberately: `n, err :=` below would ASSIGN to an
+			// `n` declared here (same scope, only err is new), so the queued
+			// closure — which the UI goroutine runs later — would read the
+			// object count MoveKeys returned instead of the index. A wrong
+			// number on screen, and a data race on every item but the last.
+			idx, label := i+1, op.label
 			c.shell.Do(func() {
-				progress.SetText(fmt.Sprintf("Renaming %d/%d\n%s", n, len(ops), label))
+				progress.SetText(fmt.Sprintf("Renaming %d/%d\n%s", idx, len(ops), label))
 			})
-			n, err := mdl.MoveKeys(ctx, bucket, bucket, op.srcKey, op.dstKey, op.isFolder, skip, nil)
+			written, err := mdl.MoveKeys(ctx, bucket, bucket, op.srcKey, op.dstKey, op.isFolder, skip, nil)
 			if err != nil {
 				failed = append(failed, opFailure{item: retryItem{label: op.label, target: op}, err: err})
 				continue
 			}
-			if n == 0 {
+			if written == 0 {
 				// Every object under this op was kept, so nothing moved.
 				// Recording it would put an undo entry on the stack whose
 				// destination does not exist.
@@ -3022,12 +3018,21 @@ func (c *Controller) uploadEmptyDir(localPath, dstPath string, dstBucket *model.
 func (c *Controller) ShowFileProperties(key string) {
 	// lay is assigned below; every handler here runs after that.
 	var lay *shell.Layer
+	// A local pane holds File objects too, but no bucket, no ETag and no S3
+	// link — reading them was a nil dereference that took the whole TUI down.
+	if c.remoteOnly("Properties") {
+		return
+	}
 	obj, ok := c.pane().Lookup(key)
 	if !ok || obj.Ot != model.File {
 		return
 	}
+	bucket := c.pane().Bucket()
+	if bucket == nil || bucket.Key == nil || obj.FullPath == nil {
+		return
+	}
 
-	bucketName := *c.pane().Bucket().Key
+	bucketName := *bucket.Key
 	fullPath := *obj.FullPath
 
 	var url string
@@ -3037,12 +3042,23 @@ func (c *Controller) ShowFileProperties(key string) {
 		url = fmt.Sprintf("%s/%s/%s", c.model.Cf.Url, bucketName, fullPath)
 	}
 
+	// Size and ETag are optional on an S3-compatible listing, so neither is
+	// dereferenced blind.
+	size := "-"
+	if obj.Size != nil {
+		size = humanize.IBytes(uint64(*obj.Size))
+	}
+	etag := "-"
+	if obj.Etag != nil {
+		etag = *obj.Etag
+	}
+
 	text := fmt.Sprintf(
 		"[black]Name: [white]%s\n[black]Size: [white]%s\n[black]Modified: [white]%v\n[black]Etag: [white]%s\n[black]Link: [white]%s",
 		*obj.Key,
-		humanize.IBytes(uint64(*obj.Size)),
+		size,
 		obj.LastModified,
-		*obj.Etag,
+		etag,
 		url,
 	)
 
@@ -3067,6 +3083,11 @@ func (c *Controller) ShowFileProperties(key string) {
 // selected object to the clipboard. Unlike the naive public link, this works
 // for private buckets.
 func (c *Controller) PresignLink(key string) {
+	// Without this a local file reached the model and came back with a bare
+	// "bucket is nil", which says nothing about why.
+	if c.remoteOnly("Presigned links") {
+		return
+	}
 	obj, ok := c.pane().Lookup(key)
 	if !ok || obj.Ot != model.File {
 		return
@@ -3076,6 +3097,9 @@ func (c *Controller) PresignLink(key string) {
 		return
 	}
 	bucket := c.pane().Bucket()
+	if bucket == nil {
+		return
+	}
 	fullPath := *obj.FullPath
 
 	type ttlChoice struct {

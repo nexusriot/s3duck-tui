@@ -118,26 +118,6 @@ func TestLocalDownloadPathTraversal(t *testing.T) {
 	}
 }
 
-func TestGetPosition(t *testing.T) {
-	slice := []string{"a", "b", "c"}
-	cases := map[string]struct {
-		el   string
-		want int
-	}{
-		"first":           {"a", 0},
-		"middle":          {"b", 1},
-		"last":            {"c", 2},
-		"missing -> zero": {"z", 0},
-	}
-	for name, tc := range cases {
-		t.Run(name, func(t *testing.T) {
-			if got := getPosition(tc.el, slice); got != tc.want {
-				t.Errorf("getPosition(%q) = %d, want %d", tc.el, got, tc.want)
-			}
-		})
-	}
-}
-
 func TestDetectCategory(t *testing.T) {
 	cases := map[string]string{
 		"a/b/file.pdf":  "documents",

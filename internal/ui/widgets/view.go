@@ -10,7 +10,7 @@ import (
 	"github.com/rivo/tview"
 )
 
-const versionText = "S3Duck 🦆 TUI v.0.10.1"
+const versionText = "S3Duck 🦆 TUI v.0.10.2"
 
 // View ...
 type View struct {

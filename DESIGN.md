@@ -77,23 +77,34 @@ CI ([.github/workflows/ci.yml](.github/workflows/ci.yml)) is three jobs: lint+un
 | Category | What runs there | Notes |
 |---|---|---|
 | **UI goroutine** | tview event loop, all input handlers, `SetChangedFunc` / `AddItem` callbacks | The only goroutine allowed to mutate tview widgets directly |
-| **Network goroutines** | `ListBuckets`, `List`, `GetBucketLocation`, upload, download, delete, copy/move, summary | Spawned by controller; results returned to the UI goroutine via `App.QueueUpdateDraw` |
+| **Network goroutines** | `ListBuckets`, `List`, `GetBucketLocation`, upload, download, delete, copy/move, summary | Spawned by the controller; results returned to the UI goroutine through `shell.Do` (see *UI update rule*) |
+| **Shell pump** | `shell.pump()` — forwards batched UI closures to tview | One for the app's lifetime, and never the UI goroutine, which is what lets `QueueUpdateDraw`'s wait complete |
 | **Refresh goroutine** | `updateList()` — fetches the object map page by page, then queues a redraw | Serialised by `refreshMu`; at most one active at a time, and cancellable through `listingState` |
 | **Status ticker** | `runStatusTicker()` — recomputes the header's transfer badge / notice | One for the app's lifetime; queues a redraw *only* when the text changed, so an idle app costs a string compare |
 
 ### Mutexes
 
+Most of the state that used to sit behind one controller-wide lock now belongs
+to the object that owns it, so the table reads as an inventory of owners rather
+than of fields. Anything not listed here is confined to one goroutine.
+
 | Mutex | Protects |
 |---|---|
-| `Controller.mu` | `objs` (the displayed object map), `selectedByScope` (multi-select state), `filter`, `partial` (the listing-was-incomplete flag) and `sortBy`/`sortDesc`. All are read on the UI goroutine (input handlers, list callbacks) and written by background refresh/download/upload goroutines. |
-| `Controller.jobsMu` | The transfer-job list *and* the header notice (`notice`/`noticeUntil`), which the status ticker reads and `announceJob` writes from transfer goroutines. |
-| `listingState.mu` | The in-flight listing's cancel function, so Esc can cancel a listing started by another goroutine. |
-| `Controller.refreshMu` | Serialises `updateList()` so overlapping refreshes can't race on the object map or stack redundant network calls. |
-| `downloadSummary` per-download `sumMu` | All per-download mutable state inside the download goroutine: the summary counters, `activeProgress` map, `completedBytes`, throttle timestamp. |
+| `session.Pane.mu` | One pane's whole world: location (bucket, prefix, local dir), the object map, the per-scope selection sets, filter, `partial`, the pending cursor target and the bucket-row position. Read on the UI goroutine, written by navigation and refresh goroutines. `Enter` writes bucket, prefix and cursor target under one acquisition, so no reader sees the new bucket paired with the old prefix. |
+| `Controller.mu` | `sortBy`/`sortDesc` — the only listing state left on the controller, since ordering is a preference rather than a property of a location. |
+| `Controller.refreshMu` | Serialises `updateList()`, so overlapping refreshes can't stack network calls or race on a pane's object map. |
+| `Controller.activityMu` | The in-session activity ring, written from every transfer goroutine. |
+| `Controller.undoMu` | The one-step undo, written from transfer goroutines and read by `Undo` on the UI goroutine. |
+| `listingState.mu` | The in-flight listing's cancel function and its generation, so `Esc` can cancel a listing started by another goroutine — and so a listing that finishes late cannot unregister the one that replaced it. |
+| `shell.Shell.mu` | The overlay stack, the pending-closure list and the current toast. |
+| `jobs.Queue.mu` / `jobs.Job.mu` | The job list and the header notice; each job's own counters and status, which progress goroutines write while the panel ticker reads. |
+| `ops.ledger.mu` | One operation's result as parallel workers report into it. `syncProgress.mu` and the download's `live`-map lock do the same for the in-flight byte counts. |
+| `flows.uiReporter.mu` | The progress redraw throttle. |
+| `model.rateLimiter.mu` | The token bucket shared by every transfer worker of a profile. |
 
 ### UI update rule
 
-Any code that modifies a tview widget **must** run on the UI goroutine. Background goroutines use `App.QueueUpdateDraw(func() { ... })`. Direct widget calls from a goroutine (without QueueUpdateDraw) are a data race and can corrupt the display.
+Any code that modifies a tview widget **must** run on the UI goroutine. Direct widget calls from a background goroutine are a data race and can corrupt the display. Every off-UI update goes through `shell.Do`; nothing outside `ui/shell` calls `App.QueueUpdateDraw` any more, for the reason below.
 
 ~~The mirror-image rule bites more often~~ — **retired in the `ui/shell` refactor.** It used to read: `c.error` and `c.success` are built on `QueueUpdateDraw`, which blocks until the event loop runs the closure, so calling them inline from the UI goroutine froze the app; callers had to write `go c.error(...)` from a button handler and a bare `c.error(...)` from a worker. That cost two shipped freezes (`Upload()` on an empty directory, and the filter box's `SetChangedFunc` calling `renderList` inline).
 
@@ -109,46 +120,56 @@ Toasts keep replace-the-previous semantics through `shell.Toast`, which closes t
 
 ## Download pipeline
 
+The pipeline itself is `ops.Download` (`internal/ops/download.go`): it knows
+nothing about a terminal, depends only on the `Fetcher` / `Checker` / `FS` /
+`Gate` ports, and is unit-tested against a fake store. The controller
+(`runDownload`) only resolves the object set and hands it over; `flows.Runner`
+renders the confirmation, the progress modal and the summary.
+
 ### Two-phase design
 
-Downloads are split into two sequential phases inside a single goroutine:
+`Download.Run` splits the work into two sequential phases:
 
 Before either phase, folder **resolution** (the recursive `ListObjects` behind a folder selection) runs in its own goroutine behind a "Resolving…" modal — inline on the UI goroutine it froze the whole TUI for the length of the listing and swallowed its errors. Local paths are derived through `model.SafeLocalPath`, which rejects any key whose cleaned path escapes the destination directory: S3 keys may legally contain `..` segments, and an unchecked `filepath.Join` is the zip-slip pattern (a hostile shared bucket could plant `docs/../../../.bashrc`).
 
-**Phase 1 — overwrite resolution (sequential)**
+**Phase 1 — `plan`: overwrite resolution (sequential)**
 
-Iterates `allObjects` one at a time, handling:
-- Directory marker keys (`key/`) — created immediately with `os.MkdirAll`; not queued for network download
-- File conflict detection — `os.Stat` → modal prompt (Overwrite / Skip / Overwrite All / Skip All / Cancel)
-- Building `toDownload []resolvedItem` — the approved list for Phase 2
+Walks `Targets` one at a time, handling:
+- Directory marker keys (`key/`) — created immediately through the `FS` port; not queued for transfer
+- File conflict detection — `FS.Exists` → `rep.Ask(ops.Question{Kind: QOverwrite})` → Overwrite / Skip / Overwrite All / Skip All / Cancel
+- Building `[]resolved` — the approved list, each carrying the decision made about it
 
-Overwrite prompts are inherently sequential because `askOverwrite` blocks the goroutine on user input via a channel; parallel prompts would overlap modals and confuse the user.
+Overwrite questions are inherently sequential because the reporter blocks the operation's goroutine until the user answers; asking from four workers at once would stack modals. Note what the question *is* here: a value the operation emits, not a call into tview. That inversion is why this package needs no widget handle and can be driven by a scripted reporter in a test.
 
-An Overwrite decision only sets a flag on the item — **nothing is deleted at prompt time**. The transfer downloads into a sibling `*.s3duck-part` temp file and renames it onto the target only after the body is fully on disk, so a cancel while the job is still queued (or a failed transfer) leaves every existing file intact; `sum.overwritten` is likewise counted on completion, when the file was actually replaced. (Phase 1 used to `os.Remove` at decision time: an "Overwrite All" over 200 files followed by a cancel deleted all 200 and downloaded none.)
+Phase 1 runs **outside** the transfer gate. It is user-interaction time, not bandwidth, and holding one of the two transfer slots through a pile of overwrite dialogs would stall every other transfer in the app.
 
-**Phase 2 — parallel download (semaphore pool)**
+An Overwrite decision only sets a flag on the item — **nothing is deleted at prompt time**. The transfer downloads into a sibling `*.s3duck-part` temp file and renames it onto the target only after the body is fully on disk, so a cancel while the job is still queued (or a failed transfer) leaves every existing file intact; the ledger counts an overwrite on completion, when the file was actually replaced. (Phase 1 used to `os.Remove` at decision time: an "Overwrite All" over 200 files followed by a cancel deleted all 200 and downloaded none.)
+
+**Phase 2 — `transfer`: parallel download (semaphore pool)**
 
 ```
-sem = make(chan struct{}, 4)   // 4 concurrent workers
+sem = make(chan struct{}, DownloadWorkers)   // 4 concurrent workers
 
-for each ri in toDownload:
+for each r in todo:
+    if ctx.Err() != nil: led.cancel(); break   // checked BEFORE the select
     select { <-ctx.Done → cancel; sem← → acquire slot }
-    if canceled: release orphaned slot if any; break
     wg.Add(1)
-    go worker(ri):
+    go one(r):
         defer wg.Done(); defer <-sem
-        track in activeProgress
-        DownloadTarget(ctx, ri, ...)
-        if profile verifies: compare the file against the object's checksum
-        update sum, completedBytes, completedCount
+        live[key] = 0                       // under mu, for the gauge
+        Fetcher.DownloadTarget(ctx, ...)
+        if Verify: compare the file against the object's checksum
+        led.ok(n, overwrote); report()
 wg.Wait()
-showSummary()
 ```
+
+The context check before the `select` is not redundant: with a free slot and a dead context both ready, `select` picks at random, so a cancelled run could keep handing out work for several more objects.
 
 Cancellation flow:
-1. User clicks Cancel → tview `SetDoneFunc` fires → `cancel()` called → ctx cancelled
-2. Next semaphore `select` picks `<-ctx.Done()`, sets `canceled = true`, breaks loop
+1. User clicks Cancel → the Runner's `SetDoneFunc` fires → `cancel()` → ctx cancelled
+2. Dispatch stops at the check above and the loop breaks; the modal says "Canceling, please wait…"
 3. Running workers see `ctx.Err() != nil` after `DownloadTarget` returns; `DownloadTarget` itself cancels the S3 download and removes its temp file (the target file — old content included — is never touched by a canceled transfer)
+4. `wg.Wait()` drains the workers, so the ledger the Runner reads is complete rather than racing the stragglers
 
 A worker's last step, when the profile asks for it, is the **post-transfer
 verify**: the file on disk is re-read and compared against the object's
@@ -159,20 +180,25 @@ additional checksum) is counted separately and disclosed as "not verifiable"
 rather than being quietly called verified. The setting is read once, on the UI
 goroutine, and carried into the transfer: a profile switch mid-download must
 not change the rules a running transfer is playing by.
-4. `wg.Wait()` drains workers; `showSummary()` shows the final report
+
+Whatever failed is kept with its size, so `finish` can stamp the result with a
+retry operation covering exactly those objects — a 5 000-object download that
+lost twelve to a flaky link costs twelve transfers to finish, not another full
+run.
 
 ### Progress display (parallel)
 
-`showProgress` is called from multiple worker goroutines concurrently. It:
-1. Acquires `sumMu` to snapshot `completedBytes`, `completedCount`, and the `activeProgress` map
-2. Releases `sumMu` before calling `QueueUpdateDraw` (holding a lock across a channel send would deadlock if the UI goroutine tried to acquire it)
-3. Throttled at 100 ms to avoid flooding the event queue
+`transfer`'s `report` closure is called from every worker concurrently. It:
+1. Takes the pool's `mu` to sum `doneBytes` plus the `live` map (bytes moved by transfers that have not finished yet), so the gauge stays honest while four run at once
+2. **Releases it before** `rep.Progress(p)` — the reporter forwards to the UI, and holding a lock across that would invite a deadlock with anything the UI goroutine wants
+3. Is throttled by the reporter (`drawEvery`, 100 ms), not by the operation: `ops.Reporter` documents throttling as the implementation's job, so no operation has to re-invent it
 
 Displayed format:
 ```
-Downloading [4 workers]
+Download
 12 / 47 done
 1.2 GiB / 3.4 GiB (35.2%)
+4.1 MiB/s · ETA 8:21
 
 file1.txt  report.zip
 ```
@@ -184,9 +210,9 @@ file1.txt  report.zip
 `updateList()` and `renderList()` are split so the list can re-render without hitting the network:
 
 - **`updateList()`** — takes `refreshMu`, calls `makeObjectMap()` (network `ListStream` / `ListBuckets`, page by page with a live count and a cancellable context — see *Streamed, cancellable listings*), then `renderList()`. Use it whenever the object set changes (navigation, delete, upload, rename, copy/move). For a local pane it reads one directory instead (`makeLocalObjectMap`), which needs no pagination and no cancellation.
-- **`renderList()`** — pure re-render from the in-memory `objs` map: applies the active filter and the active sort (`filterSortObjects`, see *Listing order* below), then rebuilds the list widget inside a single `QueueUpdateDraw`. No network. Cheap enough to call on every keystroke.
+- **`renderList()`** — pure re-render from the in-memory `objs` map: applies the active filter and the active sort (`filterSortObjects`, see *Listing order* below), then rebuilds the list widget inside a single `shell.Do` closure. No network. Cheap enough to call on every keystroke.
 
-Selection toggles (`ToggleSelectCurrent`, `SelectAllVisible`, `ClearSelection`), the live filter and the sort keys call `renderList()` directly, avoiding a redundant `List` round-trip on every Space / `/` / `s` press. `Refresh` (`r`/F5) is the one binding that deliberately goes back to the network via `updateList()`. All cursor/list reads now happen **inside** the `QueueUpdateDraw` closure on the UI goroutine (this also removed the earlier off-goroutine read of list state).
+Selection toggles (`ToggleSelectCurrent`, `SelectAllVisible`, `ClearSelection`), the live filter and the sort keys call `renderList()` directly, avoiding a redundant `List` round-trip on every Space / `/` / `s` press. `Refresh` (`r`/F5) is the one binding that deliberately goes back to the network via `updateList()`. All cursor/list reads now happen **inside** that closure, on the UI goroutine (this also removed the earlier off-goroutine read of list state).
 
 ## In-listing filter
 
@@ -810,11 +836,18 @@ expanded) and `escapeForTextView` (`[` doubled), or a log line containing
 inside `ModalClamped`, not a `Modal`: a Modal's text cannot scroll, and a
 preview that shows only what fits is not a preview.
 
-`unifiedDiff` is a plain LCS walk rather than Myers — the inputs are capped at
-1 MiB, where the quadratic table costs nothing worth optimising — and shows
-full context, because a version diff is usually a config file where the
-surrounding lines are the point. Identical bodies produce empty output, which
-is what lets the caller say "identical" instead of opening an empty window.
+`unifiedDiff` is a plain LCS walk rather than Myers, and shows full context,
+because a version diff is usually a config file where the surrounding lines
+are the point. Identical bodies produce empty output, which is what lets the
+caller say "identical" instead of opening an empty window.
+
+The walk is quadratic in **lines**, which is why the 1 MiB cap on the bodies
+bounds nothing useful on its own: a 1 MiB CSV of 40-byte rows is ~26 000 lines
+a side, and the table for it is ~5 GiB of `int`. `maxDiffCells` (4 Mi cells,
+~32 MiB, two 2 000-line files) is the real bound; past it the diff declines
+with a message naming both line counts and suggests downloading the versions.
+That covers every config file a version diff is for, and declining beats
+taking the process down.
 
 ## Trash (`internal/controller/trash.go`)
 
@@ -932,8 +965,111 @@ would look like the filter had been applied and found everything.
 | **`GetObjectAttributes` support varies** | S3-compatible backends may not implement it; `ObjectChecksum` then falls back to the HEAD ETag, which limits verification to single-part objects. Reported, not silently degraded. |
 | **The keymap is app-wide, not per-screen** | `keys.json` rebinds the browser's actions; the profiles screen and the modal overlays keep their built-in keys. Rebinding a chord the modals also use (Esc, Enter) affects only the browser. |
 | **The activity log is append-only and unencrypted** | It records bucket and object names (never credentials) at mode 0600, rotated once at 2 MiB. Delete the file to clear it; there is no in-app purge. |
+| **The version diff is bounded by line count** | `unifiedDiff`'s LCS table is quadratic in lines, so `maxDiffCells` (4 Mi cells, two ~2 000-line files) bounds it rather than the 1 MiB body cap, which would permit a multi-gigabyte table. A larger pair is declined with both line counts named; download the two versions and diff them locally. |
 
 ---
+
+## Fixed in the 0.10.2 deep review
+
+A second read-through of the whole tree, after 0.10.1's. The first four are
+failures a user can hit — one of them fatal to the process; the rest are
+places where the code and this document had stopped agreeing about what the
+code does.
+
+- **Properties over a local file crashed the app.** `ShowFileProperties` read
+  `*c.pane().Bucket().Key` — and then the object's `Size` and `Etag` — without
+  a `remoteOnly` guard. A local pane holds `model.File` objects but no bucket,
+  no ETag and no S3 link, so `Ctrl+L` (or *Properties* in the palette) over any
+  file in a local pane dereferenced nil and took the whole TUI down, losing
+  every in-flight background transfer with it. Every other object action had
+  the guard; this one and `PresignLink` were the two that did not. Both now
+  have it, the optional fields are no longer dereferenced blind, and a
+  regression test drives the local-pane path (it panics against the old code).
+- **The batch-rename progress counter was a data race.** The loop wrote
+  `n, label := i+1, op.label`, queued a closure reading `n`, and then wrote
+  `n, err := mdl.MoveKeys(...)` — which *assigns* to the same `n`, since only
+  `err` is new in that scope. The UI goroutine therefore read a variable the
+  worker was still writing, and displayed the object count the move returned
+  instead of the item index. Renamed apart, which is the whole fix; the
+  compiler caught a second shadowing of the outer `moved` ledger on the way.
+- **A version diff could exhaust memory.** See *Preview and version diff*: the
+  LCS table is quadratic in lines, not bytes, so the `editMaxSize` cap on the
+  bodies did not bound it. `maxDiffCells` does.
+- **Folder markers written by an upload skipped the profile's write options.**
+  This document said `WriteOptions` is "applied at every creation point …
+  folder markers" and that "folder markers are encrypted but not typed".
+  `CreateFolder` did that; the marker `PutObject` inside `Model.Upload` — the
+  one that represents an empty local directory — did not. On a bucket policy
+  requiring SSE, uploading a tree containing an empty directory failed with a
+  policy error naming a key the user never typed. The doc described the
+  intent; the code now matches it.
+- **A listing that finished late could unregister the one that replaced it.**
+  `listingState.end` took a `context.Context` and cleared `l.cancel`
+  unconditionally, despite a comment claiming the argument was what kept it
+  from retiring a newer listing. It never checked identity, so the newer
+  listing's cancel func was dropped and `Esc` had nothing to cancel. Only
+  `refreshMu`'s serialisation kept this unreachable. `begin` now returns a
+  generation token that `end` must quote.
+- **Renaming a profile could duplicate a name.** Creating and copying both
+  refuse a name already in use, because the details pane and the options form
+  look profiles up *by name*; the edit form did not check, so renaming one
+  profile onto another's name made every name-keyed lookup resolve to the
+  first of the two.
+- **The controller still carried the sync scheduler the refactor had moved.**
+  `splitSyncPhases`, `syncWorkerCount`, `indexedOp` and `syncWorkers` lived on
+  in `internal/controller/sync.go` with tests of their own, duplicating
+  `ops.SplitSyncPhases` / `ops.SyncWorkerCount` — which is what actually runs.
+  Two copies of a writes-before-deletes barrier, one of them dead and both
+  tested, is exactly the drift the refactor existed to remove. Deleted, along
+  with `getPosition` (a lookup that reported "not found" as index 0).
+
+### Documentation that had stopped describing the code
+
+The guard tests cover the contracts a *user* types — key bindings, action
+names, profile fields, the version string — and all of those were in step.
+What had drifted is the part only a reader checks: three sections of this
+document still described the pre-`ops`, pre-`session` controller.
+
+- **The mutex table listed four locks, two of which no longer exist.**
+  `Controller.jobsMu` and the per-download `sumMu` (with `activeProgress` and
+  `completedBytes`) went in the `jobs` and `ops` moves; `Controller.mu` was
+  described as guarding the object map, the selection sets, the filter and the
+  partial flag, all of which belong to `session.Pane` now — it guards
+  `sortBy`/`sortDesc` and nothing else. Rewritten as an inventory of owners,
+  which is what the refactor actually produced, and extended to the locks that
+  were never listed (`activityMu`, `undoMu`, the shell, the ledger).
+- **The goroutine table and the UI-update rule contradicted each other** two
+  paragraphs apart: the table said results come back via `QueueUpdateDraw`,
+  the rule said nothing calls it any more. The rule was right.
+- **The download-pipeline section documented symbols that are gone** —
+  `toDownload []resolvedItem`, `sum.overwritten`, `showProgress`,
+  `showSummary`. The *reasoning* had survived the move to `ops.Download`
+  intact (two phases, sequential questions, four workers, temp-file-then-
+  rename, verify-counts-as-failure), so it was re-anchored to the names that
+  run, and gained the two invariants the move added: phase 1 runs outside the
+  transfer gate, and the context is checked before the dispatch `select`
+  because a ready channel and a dead context make `select` a coin flip.
+
+Worth noting what this says about the guards: a test can pin a string a user
+types, but not a paragraph's claim about structure. The cheap check that found
+all three was mechanical — grep every identifier the docs name and see whether
+it still exists in the tree — and the half of it that generalises is now
+`TestDocsOnlyNameFilesThatExist`: every backticked `internal/…` path in the
+four documents has to resolve. It cannot see a stale *claim*, only a stale
+*pointer*, but a renamed file is how most stale claims begin.
+
+### Reviewed and deliberately left alone
+
+- **`progressReader.Read` is still non-atomic**, unlike `progressWriterAt`. It
+  is only ever read by one goroutine per transfer (the uploader reads a part
+  at a time), so there is no race to fix — it stays on REFACTOR.md's open list
+  as a consistency item, not a defect.
+- **The transfers panel's ticker outlives a layer closed by anything but
+  `Esc`.** Nothing closes it another way today; worth remembering if a second
+  close path appears.
+- **`searchMatch` is exercised only by tests.** Unlike `getPosition` it states
+  the search predicate in one place and is the thing the test is about, so it
+  stays.
 
 ## Fixed in the 0.10.1 deep review
 

@@ -137,6 +137,22 @@ func (c *Controller) EditConfigEntry() {
 			region = &reg
 		}
 
+		// Creating and copying refuse a name already in use; renaming has to
+		// as well, or two rows share one name and every name-keyed lookup —
+		// the details pane, the options form — resolves to the first of them.
+		if name != entry.Name {
+			if name == "" {
+				lay.Close()
+				c.error("Failed to save config", fmt.Errorf("empty name not allowed"))
+				return
+			}
+			if c.params.NameExists(name) {
+				lay.Close()
+				c.error("Failed to save config", fmt.Errorf("a profile named %q already exists", name))
+				return
+			}
+		}
+
 		entry.Name = name
 		entry.BaseUrl = url
 		entry.Region = region

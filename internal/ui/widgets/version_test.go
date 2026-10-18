@@ -9,14 +9,14 @@ import (
 // The version is stated in three places that cannot import each other: the
 // string the TUI shows, the Makefile's packaging default, and build-deb.sh.
 // The Makefile says to bump all three by hand, which is exactly the kind of
-// duplicated constant that drifts — a .deb labelled 0.10.1 carrying a binary
-// that reports 0.10.0 is a support question nobody can answer.
+// duplicated constant that drifts — a .deb labelled 0.10.2 carrying a binary
+// that reports 0.10.1 is a support question nobody can answer.
 var (
-	// "S3Duck 🦆 TUI v.0.10.1" -> 0.10.1
+	// "S3Duck 🦆 TUI v.0.10.2" -> 0.10.2
 	versionInText = regexp.MustCompile(`v\.(\d+\.\d+\.\d+)`)
-	// "VERSION    ?= 0.10.1"
+	// "VERSION    ?= 0.10.2"
 	versionInMake = regexp.MustCompile(`(?m)^VERSION\s*\?=\s*(\d+\.\d+\.\d+)\s*$`)
-	// "version=0.10.1"
+	// "version=0.10.2"
 	versionInShell = regexp.MustCompile(`(?m)^version=(\d+\.\d+\.\d+)\s*$`)
 )
 

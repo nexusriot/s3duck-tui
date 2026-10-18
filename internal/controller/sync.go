@@ -221,44 +221,6 @@ func syncPlanText(dir syncDirection, srcLabel, dstLabel string, ops []syncOp, ma
 // syncPlanRows is how many operations the preview lists before truncating.
 const syncPlanRows = 40
 
-// syncWorkers is the ceiling on concurrent sync operations, matching the
-// download pool. Aggregate bandwidth is still capped by model.Limiter.
-const syncWorkers = 4
-
-// syncWorkerCount is the pool size for a plan of n operations — never more
-// workers than there is work, and always at least one.
-func syncWorkerCount(n int) int {
-	if n < 1 {
-		return 1
-	}
-	if n < syncWorkers {
-		return n
-	}
-	return syncWorkers
-}
-
-// indexedOp pairs an operation with its position in the plan, so a worker can
-// report progress against a stable slot while running out of order.
-type indexedOp struct {
-	index int
-	op    syncOp
-}
-
-// splitSyncPhases separates the plan into the operations that write to the
-// destination and the ones that remove from it. Deletes run only after every
-// write has finished (see runSync), so a partial run never leaves the
-// destination missing data it hasn't gained a replacement for.
-func splitSyncPhases(ops []syncOp) (writes, deletes []indexedOp) {
-	for i, op := range ops {
-		if op.Kind == syncDelete {
-			deletes = append(deletes, indexedOp{index: i, op: op})
-			continue
-		}
-		writes = append(writes, indexedOp{index: i, op: op})
-	}
-	return writes, deletes
-}
-
 // syncSpec describes one sync run: which way it goes and what the two sides
 // are. Introducing it replaced a growing parameter list — the local↔remote
 // flow only ever needed one bucket, but a remote↔remote run has two, and

@@ -32,29 +32,38 @@ const listProgressEvery = 250 * time.Millisecond
 type listingState struct {
 	mu     sync.Mutex
 	cancel context.CancelFunc
+	// gen identifies the registered listing. end quotes the generation it was
+	// handed, so a listing that finishes late cannot retire — or cancel — the
+	// one that has registered since.
+	gen uint64
 }
 
 // begin registers a new listing, cancelling any predecessor that is somehow
-// still running, and returns its context.
-func (l *listingState) begin() context.Context {
+// still running, and returns its context plus the token end must quote.
+func (l *listingState) begin() (context.Context, uint64) {
 	ctx, cancel := context.WithCancel(context.Background())
 	l.mu.Lock()
 	if l.cancel != nil {
 		l.cancel()
 	}
+	l.gen++
+	gen := l.gen
 	l.cancel = cancel
 	l.mu.Unlock()
-	return ctx
+	return ctx, gen
 }
 
-// end retires the listing. Passing the cancel func back keeps end from
-// cancelling a *newer* listing that has since registered.
-func (l *listingState) end(ctx context.Context) {
+// end retires the listing identified by gen, releasing its context. A stale
+// token is a no-op: clearing l.cancel unconditionally used to drop a newer
+// listing's registration, leaving Esc with nothing to cancel.
+func (l *listingState) end(gen uint64) {
 	l.mu.Lock()
-	if l.cancel != nil && ctx.Err() == nil {
-		l.cancel()
+	if l.gen == gen {
+		if l.cancel != nil {
+			l.cancel()
+		}
+		l.cancel = nil
 	}
-	l.cancel = nil
 	l.mu.Unlock()
 }
 

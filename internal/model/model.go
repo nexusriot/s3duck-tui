@@ -941,11 +941,18 @@ func (m *Model) Upload(
 				s3Key += "/"
 			}
 
-			_, err = m.Client.PutObject(ctx, &s3.PutObjectInput{
+			in := &s3.PutObjectInput{
 				Bucket: aws.String(*bucket.Key),
 				Key:    aws.String(s3Key),
 				Body:   strings.NewReader(""),
-			})
+			}
+			// A marker is not a file, so there is no name to derive a type
+			// from — but a profile that encrypts everything must encrypt this
+			// too, or a bucket policy requiring SSE rejects the marker and the
+			// whole directory upload fails. Same reasoning as CreateFolder,
+			// which is the other way a marker gets written.
+			m.writeOpts().applyPut(in, "")
+			_, err = m.Client.PutObject(ctx, in)
 			if err != nil {
 				return fmt.Errorf("failed to create folder marker %s: %w", s3Key, err)
 			}
