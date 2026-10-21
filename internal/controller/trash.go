@@ -17,12 +17,13 @@ import (
 func trashStamp(t time.Time) string { return t.UTC().Format("20060102-150405") }
 
 // trashKeyFor maps an object key onto its place in the trash. The original
-// key is preserved in full under the stamp folder, so a restore is a move
-// back to the tail after the stamp.
+// key is preserved in full under the stamp folder — a leading "/" included —
+// so a restore is a move back to the tail after the stamp. (Trimming that
+// slash restored "/abs/file" to "abs/file", a different key.)
 //
 //	.s3duck-trash/20260902-181500/docs/report.pdf
 func trashKeyFor(trashPrefix, stamp, key string) string {
-	return trashPrefix + stamp + "/" + strings.TrimPrefix(key, "/")
+	return trashPrefix + stamp + "/" + key
 }
 
 // restoreKeyFrom is trashKeyFor inverted: given a key inside the trash, the

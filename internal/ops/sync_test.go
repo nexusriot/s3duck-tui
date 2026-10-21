@@ -350,3 +350,23 @@ func TestSyncParallelPhaseIsRaceFree(t *testing.T) {
 		t.Errorf("result = done %d / failed %d, want %d / 0", res.Done, res.Failed(), len(units))
 	}
 }
+
+// A unit cut short by the cancel is not a failure. Ledgering it as one offered
+// a "Retry failed" covering only the in-flight unit, silently dropping every
+// unit never dispatched and every delete.
+func TestSyncCancelMidRunIsNotAFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	units := []SyncUnit{write("upload a", 1), write("upload b", 1), del("delete x")}
+	s, h := newSync(units...)
+	h.hook = func(label string) {
+		if label == "upload a" {
+			cancel()
+		}
+	}
+
+	res := s.Run(ctx, &recorder{})
+
+	if !res.Canceled || res.Failed() != 0 || res.Retry != nil {
+		t.Errorf("result = %+v; want cancelled, no failures, no partial retry", res)
+	}
+}

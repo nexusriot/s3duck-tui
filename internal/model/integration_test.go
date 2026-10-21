@@ -5,8 +5,8 @@
 // These are excluded from the default build by the `integration` tag, because
 // they need a live server. Run them with:
 //
-//	make test-integration                      # starts MinIO in Docker
-//	go test -tags integration ./pkg/model/...  # against an endpoint you provide
+//	make test-integration                           # starts MinIO in Docker
+//	go test -tags integration ./internal/model/...  # against an endpoint you provide
 //
 // Configure the target with S3DUCK_TEST_ENDPOINT / _ACCESS_KEY / _SECRET_KEY /
 // _REGION. Without an endpoint the whole file skips, so a tagged run on a

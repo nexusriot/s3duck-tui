@@ -11,9 +11,8 @@ import (
 
 type fakePusher struct {
 	err error
-	// seen records what the operation handed down.
-	seenLocal, seenPrefix string
-	seenSkip              map[string]bool
+	// seen records the targets the operation handed down; nil until called.
+	seen []model.UploadTarget
 	// emit drives the progress callback, standing in for the model's walk.
 	emit []progressCall
 }
@@ -24,14 +23,13 @@ type progressCall struct {
 	local, remote string
 }
 
-func (p *fakePusher) Upload(
+func (p *fakePusher) UploadTargets(
 	ctx context.Context,
-	localPath, s3Prefix string,
 	_ *model.Object,
-	skip map[string]bool,
-	progress func(current, total int64, i, count int, local, remote string),
+	targets []model.UploadTarget,
+	progress func(current, total int64, done, count int, local, remote string),
 ) error {
-	p.seenLocal, p.seenPrefix, p.seenSkip = localPath, s3Prefix, skip
+	p.seen = append([]model.UploadTarget{}, targets...)
 	for _, c := range p.emit {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -46,7 +44,7 @@ func newUpload(p *fakePusher) *Upload {
 		LocalPath:  "/home/u/photos",
 		DstPrefix:  "trip/",
 		Bucket:     bucketObj("b"),
-		Files:      []model.UploadTarget{{LocalPath: "/home/u/photos/a.jpg", Size: 100}},
+		Files:      []model.UploadTarget{{LocalPath: "/home/u/photos/a.jpg", RemotePath: "trip/a.jpg", Size: 100}},
 		TotalBytes: 100,
 		Pusher:     p,
 	}
@@ -123,21 +121,51 @@ func TestUploadCancelIsNotAFailure(t *testing.T) {
 	}
 }
 
-// The skip set has to reach the model: it drops those files before it totals
-// the transfer, which is what keeps the gauge from counting bytes that were
-// never going to be sent.
-func TestUploadPassesTheSkipSetDown(t *testing.T) {
+// The skip set is applied before anything is sent, so a kept destination is
+// never written and the gauge never counts its bytes.
+func TestUploadDropsSkippedTargets(t *testing.T) {
 	p := &fakePusher{}
 	u := newUpload(p)
+	u.Files = append(u.Files, model.UploadTarget{LocalPath: "/home/u/photos/b.jpg", RemotePath: "trip/b.jpg", Size: 7})
 	u.Skip = map[string]bool{"trip/a.jpg": true}
+
+	res := u.Run(context.Background(), &recorder{})
+
+	if len(p.seen) != 1 || p.seen[0].RemotePath != "trip/b.jpg" {
+		t.Errorf("sent %+v, want only trip/b.jpg", p.seen)
+	}
+	if res.Done != 1 || res.Bytes != 7 {
+		t.Errorf("done = %d, bytes = %d; want 1 and 7", res.Done, res.Bytes)
+	}
+}
+
+// The operation sends exactly its targets — it has no directory to walk. The
+// local pane's upload of one marked file used to hand the model the directory
+// the file sat in, and the model uploaded all of it.
+func TestUploadSendsExactlyItsTargets(t *testing.T) {
+	p := &fakePusher{}
+	u := newUpload(p)
+	u.LocalPath = "/home/u" // the pane's directory: a label, never a root
 
 	u.Run(context.Background(), &recorder{})
 
-	if !p.seenSkip["trip/a.jpg"] {
-		t.Errorf("skip set reached the model as %v", p.seenSkip)
+	if len(p.seen) != 1 || p.seen[0].LocalPath != "/home/u/photos/a.jpg" || p.seen[0].RemotePath != "trip/a.jpg" {
+		t.Errorf("sent %+v, want exactly the one confirmed target", p.seen)
 	}
-	if p.seenLocal != u.LocalPath || p.seenPrefix != u.DstPrefix {
-		t.Errorf("model got %q -> %q, want %q -> %q", p.seenLocal, p.seenPrefix, u.LocalPath, u.DstPrefix)
+}
+
+// Every file of a successful multi-file upload is done: a single ok made the
+// report read "Done: 1 of N".
+func TestUploadCountsEveryFile(t *testing.T) {
+	u := newUpload(&fakePusher{})
+	u.Files = append(u.Files,
+		model.UploadTarget{LocalPath: "/x/b", RemotePath: "trip/b", Size: 1},
+		model.UploadTarget{LocalPath: "/x/c", RemotePath: "trip/c", Size: 2})
+
+	res := u.Run(context.Background(), &recorder{})
+
+	if res.Done != 3 || res.Done != u.Describe().TotalItems || res.Bytes != 103 {
+		t.Errorf("done = %d of %d, bytes = %d; want 3 of 3 and 103", res.Done, u.Describe().TotalItems, res.Bytes)
 	}
 }
 
@@ -153,7 +181,7 @@ func TestUploadCancelWhileQueuedBehindTheGate(t *testing.T) {
 	if !res.Canceled {
 		t.Error("a run cancelled while queued should be marked cancelled")
 	}
-	if p.seenLocal != "" {
+	if p.seen != nil {
 		t.Error("the upload started without a transfer slot")
 	}
 }

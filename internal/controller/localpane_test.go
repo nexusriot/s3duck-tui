@@ -59,3 +59,16 @@ func TestLocalModeAndPaneLabel(t *testing.T) {
 		t.Errorf("open label = %q — a toggle has to say which way it goes", c.localPaneLabel())
 	}
 }
+
+// A local pane holds no bucket, and gating marks on one made Space and Ctrl+S
+// do nothing there — so the local pane's multi-file upload was unreachable.
+func TestLocalPaneEntriesCanBeMarked(t *testing.T) {
+	c := newTestController()
+	if c.canMark() {
+		t.Error("the bucket list has nothing to mark")
+	}
+	c.pane().SetLocalDir(t.TempDir())
+	if !c.canMark() {
+		t.Error("a local pane's entries must be markable")
+	}
+}

@@ -60,8 +60,12 @@ func hexdump(data []byte) string {
 // escapeForTextView neutralises tview's colour tags in object content. Without
 // this a log line containing "[red]" would be swallowed as markup — and a
 // preview that silently drops parts of the text is worse than no preview.
+//
+// tview.Escape is the escape this tview understands (a tag is escaped by an
+// "[" before its closing "]"). Doubling every "[" is not one: "[default]"
+// rendered as "[", "[1, 2, 3]" as "[[1, 2, 3]", and "[red]" still coloured.
 func escapeForTextView(s string) string {
-	return strings.ReplaceAll(s, "[", "[[")
+	return tview.Escape(s)
 }
 
 // sanitizeText makes arbitrary bytes safe to render as text: tabs become
@@ -96,7 +100,9 @@ func previewBody(data []byte) (body, label string) {
 		if len(clip) > hexdumpBytes {
 			clip = clip[:hexdumpBytes]
 		}
-		return hexdump(clip), fmt.Sprintf("binary — hexdump of the first %s", humanize.IBytes(uint64(len(clip))))
+		// The gutter shows printable bytes verbatim, so it needs the same
+		// escaping as text: "ab[red]cd" would otherwise lose its tag.
+		return escapeForTextView(hexdump(clip)), fmt.Sprintf("binary — hexdump of the first %s", humanize.IBytes(uint64(len(clip))))
 	}
 	return escapeForTextView(sanitizeText(data)), fmt.Sprintf("text — first %s", humanize.IBytes(uint64(len(data))))
 }

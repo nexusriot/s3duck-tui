@@ -29,8 +29,10 @@ type Location struct {
 	LocalDir string
 }
 
-// Pane is one browser pane. Every field is behind mu: the UI goroutine reads
-// them while listing, transfer and navigation goroutines write them.
+// Pane is one browser pane. Every field but hist is behind mu: the UI
+// goroutine reads them while listing, transfer and navigation goroutines write
+// them. hist is not locked — Hist hands out a pointer — and is only touched by
+// the controller's navigation handlers, on the UI goroutine.
 type Pane struct {
 	mu sync.Mutex
 

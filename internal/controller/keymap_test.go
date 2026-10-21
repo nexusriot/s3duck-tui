@@ -258,3 +258,61 @@ func TestHelpLinesCoverTheBindings(t *testing.T) {
 		t.Errorf("leader bindings are not shown with the leader key:\n%s", joined)
 	}
 }
+
+// Modifiers the canonical form cannot express used to be dropped silently, so a
+// binding landed on a different, already-used key.
+func TestParseChordKeepsOrRefusesModifiers(t *testing.T) {
+	if normalizeChord("Ctrl+Alt+D") == normalizeChord("Ctrl+D") {
+		t.Error("Ctrl+Alt+D normalized to Ctrl+D: binding it would steal download's key")
+	}
+	ev := tcell.NewEventKey(tcell.KeyCtrlD, 0, tcell.ModCtrl|tcell.ModAlt)
+	if chordOf(ev) != normalizeChord("Ctrl+Alt+D") {
+		t.Errorf("a live Ctrl+Alt+D (%s) does not match its binding (%s)", chordOf(ev), normalizeChord("Ctrl+Alt+D"))
+	}
+	for _, spec := range []string{"Ctrl+Down", "Shift+Tab", "Ctrl+F5", "Shift+1", "Ctrl+Space", "Shift+Space"} {
+		if _, err := parseChord(spec); err == nil {
+			t.Errorf("parseChord(%q) accepted a modifier it cannot honour", spec)
+		}
+	}
+	if got, err := parseChord("Shift+s"); err != nil || got.ch != 'S' {
+		t.Errorf("Shift+s = %+v, %v; want S", got, err)
+	}
+}
+
+// Rebinding onto a chord another action holds takes it over, with a warning,
+// and the losing action's help line goes with it.
+func TestKeymapWarnsWhenAChordIsTakenOver(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "keys.json")
+	if err := os.WriteFile(path, []byte(`{"keys": {"download": "r"}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	km := loadKeymap(path)
+	if len(km.warnings) != 1 || !strings.Contains(km.warnings[0], "takes that key") {
+		t.Errorf("warnings = %v, want one take-over warning", km.warnings)
+	}
+	n := 0
+	for _, h := range km.help {
+		if h.Chord == "r" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("help lists %d lines for r, want 1", n)
+	}
+}
+
+// Every default binding owns its chord; two defaults sharing one would make
+// the second silently hide the first.
+func TestDefaultBindingsDoNotCollide(t *testing.T) {
+	seen := map[string]actionID{}
+	for _, b := range defaultBindings() {
+		slot := "d:" + normalizeChord(b.chord)
+		if b.leader {
+			slot = "l:" + normalizeChord(b.chord)
+		}
+		if prev, ok := seen[slot]; ok && prev != b.id {
+			t.Errorf("%s and %s share %q", prev, b.id, b.chord)
+		}
+		seen[slot] = b.id
+	}
+}

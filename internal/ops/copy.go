@@ -32,6 +32,12 @@ type Transfer struct {
 	SrcBucket, DstBucket *model.Object
 	SrcKey, DstKey       string
 	IsFolder             bool
+	// Skip is the run's skip set: destination keys the overwrite scan left
+	// alone. For a folder, the ones under DstKey were NOT moved — their
+	// sources are still in place and their destinations hold what was there
+	// before — so an undo must leave both alone rather than move the whole
+	// destination folder back over the sources the user chose to keep.
+	Skip map[string]bool
 }
 
 // Copy copies — or, with Move set, moves — items between prefixes or buckets
@@ -76,6 +82,9 @@ func (c *Copy) Describe() Descriptor {
 func (c *Copy) Run(ctx context.Context, rep Reporter) Result {
 	led := &ledger{}
 	var moved []Transfer
+	// failed keeps the items themselves: their labels are display names, and
+	// a file "docs" and a folder "docs/" share one.
+	var failed []CopyItem
 
 	for _, it := range c.Items {
 		if ctx.Err() != nil {
@@ -87,21 +96,38 @@ func (c *Copy) Run(ctx context.Context, rep Reporter) Result {
 		if it.IsFolder {
 			dstKey += "/"
 		}
+		if !it.IsFolder && c.Skip[dstKey] {
+			// The user kept the existing destination, so this item is not
+			// written and — on a move — its source stays put. It is counted
+			// once, in Skipped below; counting it as done as well, or
+			// recording it as moved, would make an undo "move it back": copy
+			// the kept destination over the untouched source, then delete it.
+			continue
+		}
 
 		n, err := c.apply(ctx, rep, it, dstKey)
 		if err != nil {
+			if ctx.Err() != nil {
+				// A cancel, not a failure: reporting it as one would offer a
+				// "Retry failed" covering only the item that was in flight and
+				// silently dropping the ones never dispatched.
+				led.cancel()
+				break
+			}
 			// The item itself is kept on the failure, so a retry re-runs
 			// exactly what failed rather than the whole selection.
 			led.fail(it.ShortName, err)
+			failed = append(failed, it)
 			continue
 		}
 
 		led.ok(0, false)
 		led.addObjects(n)
-		if c.Move {
+		if c.Move && n > 0 {
 			moved = append(moved, Transfer{
 				SrcBucket: c.SrcBucket, DstBucket: c.DstBucket,
 				SrcKey: it.SrcKey, DstKey: dstKey, IsFolder: it.IsFolder,
+				Skip: c.Skip,
 			})
 		}
 	}
@@ -118,7 +144,7 @@ func (c *Copy) Run(ctx context.Context, rep Reporter) Result {
 	rep.Log("%s: %d item(s), %d object(s) written, %d failed → %s/%s",
 		c.Title, res.Done, res.Objects, res.Failed(), c.DstBucketName, c.DstPrefix)
 
-	return c.withRetry(res)
+	return c.withRetry(res, failed)
 }
 
 // apply runs one item through the mover, reporting the server's per-object
@@ -152,25 +178,12 @@ func (c *Copy) apply(ctx context.Context, rep Reporter, it CopyItem, dstKey stri
 // which still reverses what the first pass moved. Accumulating across the two
 // would need the undo to know the runs belong together; an unrelated move in
 // between would otherwise be folded into the same entry.
-func (c *Copy) withRetry(res Result) Result {
-	if len(res.Failures) == 0 {
-		return res
-	}
-	byName := make(map[string]CopyItem, len(c.Items))
-	for _, it := range c.Items {
-		byName[it.ShortName] = it
-	}
-	again := make([]CopyItem, 0, len(res.Failures))
-	for _, f := range res.Failures {
-		if it, ok := byName[f.Label]; ok {
-			again = append(again, it)
-		}
-	}
-	if len(again) == 0 {
+func (c *Copy) withRetry(res Result, failed []CopyItem) Result {
+	if len(failed) == 0 {
 		return res
 	}
 	next := *c
-	next.Items = again
+	next.Items = failed
 	next.OnMoved = nil
 	res.Retry = &next
 	return res

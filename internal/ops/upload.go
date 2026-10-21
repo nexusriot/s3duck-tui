@@ -10,22 +10,23 @@ import (
 	"github.com/nexusriot/s3duck-tui/internal/model"
 )
 
-// Upload sends a local file or directory tree to a prefix.
+// Upload sends a resolved set of local files to their remote keys.
 //
 // Unlike Download it has one phase: the destination conflicts were already
 // settled before the operation was built (the overwrite scan runs against the
 // bucket, not the filesystem, so it is a listing rather than a per-file
 // question), and Skip carries the keys the user chose to leave alone.
 type Upload struct {
+	// LocalPath names the source in the job title; nothing is walked from it.
 	LocalPath string
 	DstPrefix string
 	Bucket    *model.Object
-	// Files is the resolved file set, used for the counts and the confirmation.
+	// Files is exactly what is sent: each target's local path and remote key,
+	// as the preview and the overwrite scan saw them.
 	Files      []model.UploadTarget
 	TotalBytes int64
 	// Skip holds destination keys to leave alone, as decided by the overwrite
-	// scan. The model drops them before it totals the transfer, so the gauge
-	// never counts bytes that were never going to be sent.
+	// scan. Files matching it are dropped before anything is sent.
 	Skip map[string]bool
 
 	Pusher Pusher
@@ -45,33 +46,51 @@ func (u *Upload) Describe() Descriptor {
 func (u *Upload) Run(ctx context.Context, rep Reporter) Result {
 	led := &ledger{}
 
+	files := u.Files
+	if len(u.Skip) > 0 {
+		files = make([]model.UploadTarget, 0, len(u.Files))
+		for _, f := range u.Files {
+			if !u.Skip[f.RemotePath] {
+				files = append(files, f)
+			}
+		}
+	}
+	var bytes int64
+	for _, f := range files {
+		bytes += f.Size
+	}
+
 	started := Reserve(ctx, u.Gate, func() {
-		err := u.Pusher.Upload(ctx, u.LocalPath, u.DstPrefix, u.Bucket, u.Skip,
-			func(sent, total int64, i, count int, local, remote string) {
+		err := u.Pusher.UploadTargets(ctx, u.Bucket, files,
+			func(sent, total int64, done, count int, local, _ string) {
 				if ctx.Err() != nil {
 					return
 				}
 				rep.Progress(Progress{
 					Bytes:      sent,
 					TotalBytes: total,
-					Items:      i,
+					Items:      done,
 					TotalItems: count,
 					Active:     []string{filepath.Base(local)},
 				})
-				_ = remote
 			})
 
 		switch {
 		case ctx.Err() != nil:
 			led.cancel()
 		case err != nil:
-			// The model's Upload aborts the whole tree on the first error, so
-			// there is one failure to report rather than a per-file ledger.
+			// The model aborts the whole set on the first error, so there is
+			// one failure to report rather than a per-file ledger.
 			led.fail(u.LocalPath, err)
 		default:
-			led.ok(u.TotalBytes, false)
+			// One ok per file: the report reads "Done: N of N", and a single
+			// ok here made every successful multi-file upload say "1 of N".
+			for range files {
+				led.ok(0, false)
+			}
+			led.addBytes(bytes)
 			rep.Log("uploaded %s (%s) to %s/%s",
-				u.LocalPath, humanize.IBytes(uint64(u.TotalBytes)), *u.Bucket.Key, u.DstPrefix)
+				u.LocalPath, humanize.IBytes(uint64(bytes)), *u.Bucket.Key, u.DstPrefix)
 		}
 	})
 	if !started {

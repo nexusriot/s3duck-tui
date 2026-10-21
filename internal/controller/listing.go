@@ -11,6 +11,7 @@ import (
 	"github.com/rivo/tview"
 
 	"github.com/nexusriot/s3duck-tui/internal/model"
+	"github.com/nexusriot/s3duck-tui/internal/session"
 	"github.com/nexusriot/s3duck-tui/internal/ui/shell"
 )
 
@@ -90,10 +91,15 @@ func (c *Controller) CancelListing() bool { return c.listing.stop() }
 // A cancelled listing is deliberately not an error: whatever arrived is kept
 // and rendered. The alternative (an error and an empty pane) throws away work
 // the user already waited for.
-func (c *Controller) makeObjectMap(ctx context.Context, onProgress func(n int)) (partial bool, err error) {
+//
+// pane is the pane the listing was started for, captured by the caller before
+// the fetch: a Tab during a slow listing must not store one pane's objects in
+// the other, where a delete would resolve them against the wrong bucket.
+func (c *Controller) makeObjectMap(ctx context.Context, pane *session.Pane, onProgress func(n int)) (partial bool, err error) {
 	dirs := make(map[string]*model.Object)
 
-	if c.pane().Bucket() == nil {
+	bucket, prefix := pane.Bucket(), pane.Path()
+	if bucket == nil {
 		list, err := c.model.ListBuckets(ctx)
 		if err != nil {
 			return false, err
@@ -101,12 +107,12 @@ func (c *Controller) makeObjectMap(ctx context.Context, onProgress func(n int)) 
 		for _, obj := range list {
 			dirs[objKey(obj)] = obj
 		}
-		c.pane().SetObjs(dirs)
+		pane.SetObjs(dirs)
 		return false, nil
 	}
 
 	capped := false
-	err = c.model.ListStream(ctx, c.pane().Path(), c.pane().Bucket(), func(page []*model.Object, total int) bool {
+	err = c.model.ListStream(ctx, prefix, bucket, func(page []*model.Object, total int) bool {
 		for _, obj := range page {
 			dirs[objKey(obj)] = obj
 		}
@@ -121,12 +127,12 @@ func (c *Controller) makeObjectMap(ctx context.Context, onProgress func(n int)) 
 	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			c.pane().SetObjs(dirs)
+			pane.SetObjs(dirs)
 			return true, nil
 		}
 		return false, err
 	}
-	c.pane().SetObjs(dirs)
+	pane.SetObjs(dirs)
 	return capped, nil
 }
 

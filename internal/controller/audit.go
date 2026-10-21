@@ -100,15 +100,18 @@ func (c *Controller) rememberLocation() {
 	c.activeConfig.LastPrefix = c.pane().Path()
 }
 
-// persistProfiles writes the profile list back, carrying whatever was recorded
-// into it (the last location). Failures are logged, not shown: the user is
-// usually on their way out when this runs.
+// persistProfiles saves the location rememberLocation recorded for the open
+// profile. Only those two fields of that one profile are written (see
+// config.SaveLocation): this runs on its own, at startup, on Ctrl+P and on
+// exit, so it must never rewrite the whole list. Failures are logged, not
+// shown: the user is usually on their way out when this runs.
 func (c *Controller) persistProfiles() {
-	if c.params == nil {
+	if c.params == nil || c.activeConfig == nil {
 		return
 	}
-	if err := c.params.WriteConfig(); err != nil {
-		c.logActivity("could not save the profile list: %v", err)
+	conf := c.activeConfig
+	if err := c.params.SaveLocation(conf.Name, conf.LastBucket, conf.LastPrefix); err != nil {
+		c.logActivity("could not save the last location: %v", err)
 	}
 }
 

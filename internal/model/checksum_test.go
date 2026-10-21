@@ -101,3 +101,26 @@ func TestNewHashCRC32CIsCastagnoli(t *testing.T) {
 		t.Error("CRC32C and CRC32 must not agree — the polynomial differs")
 	}
 }
+
+// An SSE-KMS object's ETag is not an MD5 of its body: offering it for a
+// comparison reported every intact download as a MISMATCH.
+func TestChecksumRulesOutKMSETags(t *testing.T) {
+	ci := checksumFromETag("\"900150983cd24fb0d6963f7d28e17f72\"", 3)
+	ci.ruleOutKMS("AES256")
+	if !ci.SinglePartETag {
+		t.Error("an SSE-S3 object's single-part ETag is still an MD5")
+	}
+	ci.ruleOutKMS("aws:kms")
+	if ci.SinglePartETag || !ci.KMSETag || ci.Verifiable() {
+		t.Errorf("an SSE-KMS ETag must not be compared: %+v", ci)
+	}
+}
+
+func TestIsMultipartETag(t *testing.T) {
+	if !isMultipartETag("\"d41d8cd98f00b204e9800998ecf8427e-7\"") {
+		t.Error("a part-count suffix marks a multipart ETag")
+	}
+	if isMultipartETag("900150983cd24fb0d6963f7d28e17f72") {
+		t.Error("a plain MD5 is not multipart")
+	}
+}

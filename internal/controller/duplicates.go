@@ -352,16 +352,36 @@ func (c *Controller) confirmDeleteDup(mdl *model.Model, bucket *model.Object, pr
 	if others == 1 {
 		verb = "remains"
 	}
+	// Safe delete covers this delete too: the README promises that only
+	// emptying the trash is never diverted, and this went straight to
+	// DeleteKey on a profile that had asked for every delete to be undoable.
+	trash := c.trashPrefix()
+	how := "It is deleted permanently."
+	if trash != "" && !isTrashed(trash, m.Key) {
+		how = "It is moved to the trash."
+	}
 	confirm := c.view.NewConfirm()
-	confirm.SetText(fmt.Sprintf("Delete this copy?\n\n%s\n\n%d other cop%s of the same content %s.",
-		m.Key, others, pluralYIes(others), verb)).
+	confirm.SetText(fmt.Sprintf("Delete this copy?\n\n%s\n\n%d other cop%s of the same content %s. %s",
+		m.Key, others, pluralYIes(others), verb, how)).
 		SetDoneFunc(func(_ int, label string) {
 			confirmLay.Close()
 			if label != widgets.ConfirmOK {
 				return
 			}
+			// The wait modal takes focus for the round trip. The member list
+			// stays live otherwise, and a second delete on the last other
+			// copy was confirmed against a count — "1 other copy remains" —
+			// that the first delete was about to make false.
+			wait := c.wait("Deleting " + m.Key + "...")
 			go func() {
-				if err := mdl.DeleteKey(context.Background(), m.Key, bucket); err != nil {
+				var err error
+				if trash != "" {
+					err = c.trashTarget(context.Background(), mdl, bucket, deleteTarget{name: m.Key, key: m.Key}, trash)
+				} else {
+					err = mdl.DeleteKey(context.Background(), m.Key, bucket)
+				}
+				c.shell.Do(wait.Close)
+				if err != nil {
 					c.error("Failed to delete duplicate", err)
 					return
 				}

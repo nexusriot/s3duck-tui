@@ -248,6 +248,12 @@ type syncSpec struct {
 	// pointed at any real working tree: .git/, node_modules/ and *.tmp would
 	// all be mirrored.
 	exclude []string
+	// trash is the profile's safe-delete prefix ("" when off), relative to
+	// the bucket root. Remote entries under it are dropped from both sides:
+	// it is the app's own bookkeeping, and a delete-extraneous sync of the
+	// bucket root used to plan — and run, as real deletes — the removal of
+	// everything in the trash.
+	trash string
 }
 
 // prefixesOverlap reports whether one normalized prefix contains the other
@@ -344,14 +350,26 @@ func (c *Controller) showSyncForm(bucket *model.Object, prefix string, bucketNam
 
 	readSpec := func() (syncSpec, error) {
 		dirIdx, _ := form.GetFormItemByLabel(widgets.FieldSyncDirection).(*tview.DropDown).GetCurrentOption()
-		localDir := strings.TrimSpace(form.GetFormItemByLabel(widgets.FieldSyncLocalDir).(*tview.InputField).GetText())
+		// "~" is expanded as everywhere else a directory is typed; left alone
+		// it named a directory literally called "~" under the working
+		// directory, which a download sync then created.
+		localDir := expandHome(strings.TrimSpace(form.GetFormItemByLabel(widgets.FieldSyncLocalDir).(*tview.InputField).GetText()), c.params.HomeDir)
 		_, dstBucketName := form.GetFormItemByLabel(widgets.FieldSyncDstBucket).(*tview.DropDown).GetCurrentOption()
 		dstPfx := model.NormalizePrefix(form.GetFormItemByLabel(widgets.FieldSyncDstPrefix).(*tview.InputField).GetText())
 		del := form.GetFormItemByLabel(widgets.FieldSyncDelete).(*tview.Checkbox).IsChecked()
 		sum := form.GetFormItemByLabel(widgets.FieldSyncChecksum).(*tview.Checkbox).IsChecked()
 		excl := parseExcludes(form.GetFormItemByLabel(widgets.FieldSyncExclude).(*tview.InputField).GetText())
+		// A pattern that does not compile must stop the run, not quietly
+		// match nothing: an exclude is often what keeps a delete-extraneous
+		// sync away from a path, and a typo in it used to put that path in
+		// the delete plan.
+		for _, p := range excl {
+			if _, err := newMatcher(p); err != nil {
+				return syncSpec{}, fmt.Errorf("exclude pattern %q: %w", p, err)
+			}
+		}
 
-		spec := syncSpec{dir: syncDirection(dirIdx), del: del, localDir: localDir, checksum: sum, exclude: excl}
+		spec := syncSpec{dir: syncDirection(dirIdx), del: del, localDir: localDir, checksum: sum, exclude: excl, trash: c.trashPrefix()}
 		switch spec.dir {
 		case syncUpload:
 			if localDir == "" {
@@ -450,6 +468,15 @@ func (c *Controller) collectSides(ctx context.Context, mdl *model.Model, spec sy
 	// neither the diff nor a delete-extraneous pass can see a filtered path.
 	src = applyExcludes(src, spec.exclude)
 	dst = applyExcludes(dst, spec.exclude)
+	switch spec.dir {
+	case syncUpload:
+		dst = dropTrash(dst, spec.dstPrefix, spec.trash)
+	case syncDownload:
+		src = dropTrash(src, spec.srcPrefix, spec.trash)
+	default:
+		src = dropTrash(src, spec.srcPrefix, spec.trash)
+		dst = dropTrash(dst, spec.dstPrefix, spec.trash)
+	}
 
 	if spec.checksum {
 		c.fillSums(ctx, mdl, spec, src, dst)
@@ -511,6 +538,34 @@ func applyExcludes(entries []model.SyncEntry, patterns []string) []model.SyncEnt
 	out := make([]model.SyncEntry, 0, len(entries))
 	for _, e := range entries {
 		if excluded(e.Rel, ms) {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// withoutMtimes returns entries with their timestamps cleared, which makes
+// planSync compare by name and size alone.
+func withoutMtimes(entries []model.SyncEntry) []model.SyncEntry {
+	out := make([]model.SyncEntry, len(entries))
+	for i, e := range entries {
+		e.Mod = time.Time{}
+		out[i] = e
+	}
+	return out
+}
+
+// dropTrash removes the remote entries that live under the trash prefix.
+// prefix is the side's sync prefix: entries are relative to it, the trash
+// prefix to the bucket root.
+func dropTrash(entries []model.SyncEntry, prefix, trash string) []model.SyncEntry {
+	if trash == "" {
+		return entries
+	}
+	out := entries[:0:0]
+	for _, e := range entries {
+		if strings.HasPrefix(prefix+e.Rel, trash) {
 			continue
 		}
 		out = append(out, e)
@@ -735,9 +790,11 @@ func (c *Controller) applySyncOp(ctx context.Context, mdl *model.Model, spec syn
 		if op.Kind == syncDelete {
 			return os.Remove(localPath)
 		}
-		if err := os.MkdirAll(filepath.Dir(localPath), 0760); err != nil {
-			return err
-		}
+		// No MkdirAll here: DownloadTarget creates the parent directories
+		// itself, after SafeLocalPath has checked the key stays inside
+		// localDir. Doing it first created directories outside localDir for
+		// a hostile "../" key before the write was refused.
+		//
 		// The plan already said this file must be replaced. overwrite=true
 		// lets the model swap it atomically once the download succeeded —
 		// pre-removing it here used to destroy the local copy even when the
@@ -755,7 +812,9 @@ func (c *Controller) applySyncOp(ctx context.Context, mdl *model.Model, spec syn
 		}
 		// A server-side copy moves no bytes through this process, so there is no
 		// progress to report — the op counter is the only thing that advances.
-		return mdl.CopyObject(ctx, spec.srcBucket, spec.dstBucket, spec.srcPrefix+op.Rel, dstKey)
+		// The plan carries the source's size, so the copy needs no HEAD to
+		// decide between the single-request and multipart paths.
+		return mdl.CopyObjectSized(ctx, spec.srcBucket, spec.dstBucket, spec.srcPrefix+op.Rel, dstKey, op.Bytes)
 	}
 }
 
@@ -839,7 +898,10 @@ func (c *Controller) ComparePanes() {
 		}
 		// del=true so entries present only on the right are reported too; a
 		// comparison must be symmetric even though the planner is directional.
-		ops := planSync(src, dst, true)
+		// For the same reason the timestamps are dropped: the planner flags a
+		// same-size file only when the SOURCE is newer, so a newer copy on the
+		// right compared as identical. The report promises names and sizes.
+		ops := planSync(withoutMtimes(src), withoutMtimes(dst), true)
 		text := comparePlanText(left.srcLabel(), left.dstLabel(), ops, syncPlanRows)
 
 		c.shell.Do(func() {

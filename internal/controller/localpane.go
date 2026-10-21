@@ -9,6 +9,7 @@ import (
 	"github.com/dustin/go-humanize"
 
 	"github.com/nexusriot/s3duck-tui/internal/model"
+	"github.com/nexusriot/s3duck-tui/internal/session"
 )
 
 // localMode reports whether the active pane is showing a local directory.
@@ -75,7 +76,8 @@ func (c *Controller) ToggleLocalPane() {
 }
 
 // startLocalDir picks where a fresh local pane opens: the profile's download
-// directory if it has one, else the home directory.
+// directory (~/Downloads when it sets none) if that exists, else the home
+// directory.
 func (c *Controller) startLocalDir() string {
 	if dir := strings.TrimSuffix(c.resolveDownloadDir(), string(os.PathSeparator)); dir != "" {
 		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
@@ -88,8 +90,8 @@ func (c *Controller) startLocalDir() string {
 // makeLocalObjectMap fills the object map from the local directory. It mirrors
 // makeObjectMap's contract: the map is replaced wholesale, and an unreadable
 // directory is an error the caller reports.
-func (c *Controller) makeLocalObjectMap() error {
-	list, err := model.WalkDir(c.pane().LocalDir())
+func (c *Controller) makeLocalObjectMap(pane *session.Pane) error {
+	list, err := model.WalkDir(pane.LocalDir())
 	if err != nil {
 		return err
 	}
@@ -97,7 +99,7 @@ func (c *Controller) makeLocalObjectMap() error {
 	for _, o := range list {
 		dirs[objKey(o)] = o
 	}
-	c.pane().SetObjs(dirs)
+	pane.SetObjs(dirs)
 	return nil
 }
 
@@ -195,21 +197,17 @@ func (c *Controller) uploadFromLocalPane() {
 
 	// The keys are known up front, so the overwrite scan needs no listing of
 	// the source — the same shortcut the modal upload takes.
-	plan := func() ([]string, error) {
-		keys := make([]string, 0, len(files))
-		for _, f := range files {
-			keys = append(keys, f.RemotePath)
-		}
-		return keys, nil
-	}
+	plan := func() ([]string, error) { return overwriteCandidates(files), nil }
 	c.confirmOverwrites(mdl, dstBucket, "Upload", plan, func(skip map[string]bool) {
 		kept, keptSize := unskippedUploads(files, skip)
 		if len(kept) == 0 {
 			c.success("Nothing to upload")
 			return
 		}
-		// localPath is the common root for progress labels only; the keys are
-		// already absolute in the target list.
+		// The upload sends exactly kept — the targets just confirmed. The
+		// directory is only the job's label: it used to be handed to a walk,
+		// which uploaded everything in the pane's directory (one marked file
+		// in ~ sent all of ~) past an overwrite scan that never saw those keys.
 		c.runUpload(mdl, filepath.Dir(paths[0]), prefix, dstBucket, kept, keptSize, skip)
 	})
 }

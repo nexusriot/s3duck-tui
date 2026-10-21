@@ -65,12 +65,18 @@ func (m *Model) PlannedCopyKeys(ctx context.Context, srcBucket, dstBucket *Objec
 		return []string{dstKey}, nil
 	}
 
-	src, dst, err := planFolderCopy(*srcBucket.Key == *dstBucket.Key, srcKey, dstKey)
+	sameBucket := *srcBucket.Key == *dstBucket.Key
+	src, dst, err := planFolderCopy(sameBucket, srcKey, dstKey)
 	if err != nil {
 		return nil, err
 	}
 	objs, err := m.ListObjects(ctx, src, srcBucket)
 	if err != nil {
+		return nil, err
+	}
+	// Refused here too, so the user hears it before the overwrite prompt
+	// rather than after confirming it.
+	if err := checkSelfOverlap(sameBucket, src, dst, objs); err != nil {
 		return nil, err
 	}
 

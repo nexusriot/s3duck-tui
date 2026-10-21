@@ -341,7 +341,7 @@ func TestIntegrationSyncChecksumSeesInPlaceEdit(t *testing.T) {
 	}
 }
 
-// TestIntegrationSyncExcludesAreInvisibleToDeletes pins the safety property
+// TestIntegrationSyncExcludesProtectTheDestination pins the safety property
 // applyExcludes exists for: an excluded path must not be seen by the planner
 // at all, or a delete-extraneous run would decide the destination's copy is
 // extraneous and remove it.

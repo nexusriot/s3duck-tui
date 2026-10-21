@@ -26,14 +26,18 @@ type ChecksumInfo struct {
 	Algorithm string
 	// Value is the base64 checksum as S3 reports it.
 	Value string
-	// Composite marks a checksum-of-checksums (a multipart object's, ending
-	// in "-N"), which cannot be compared against a whole-file hash.
+	// Composite marks a checksum-of-checksums (a multipart object's), which
+	// cannot be compared against a whole-file hash.
 	Composite bool
 	// ETag is the object's ETag with quotes stripped.
 	ETag string
 	// SinglePartETag reports that the ETag is a plain MD5 of the body — true
-	// when it carries no "-N" part-count suffix.
+	// when it carries no "-N" part-count suffix and the object is not
+	// SSE-KMS encrypted (whose ETags are not an MD5 of the content).
 	SinglePartETag bool
+	// KMSETag records that the ETag was ruled out because of SSE-KMS, so the
+	// report can say why rather than blaming multipart.
+	KMSETag bool
 	// Size is the object's size as the server reports it.
 	Size int64
 }
@@ -71,15 +75,46 @@ func (m *Model) ObjectChecksum(ctx context.Context, bucket *Object, key string) 
 		if herr != nil {
 			return ChecksumInfo{}, herr
 		}
-		return checksumFromETag(meta.ETag, meta.Size), nil
+		ci := checksumFromETag(meta.ETag, meta.Size)
+		ci.ruleOutKMS(meta.SSE)
+		return ci, nil
 	}
 
 	ci := checksumFromETag(aws.ToString(out.ETag), out.ObjectSize)
 	if out.Checksum != nil {
 		ci.Algorithm, ci.Value = pickChecksum(out.Checksum)
-		ci.Composite = strings.Contains(ci.Value, "-")
+		// GetObjectAttributes reports a multipart object's checksum-of-parts
+		// WITHOUT the "-N" suffix HeadObject shows, so the value alone cannot
+		// tell. The ETag can: a multipart upload's carries the part count.
+		// (Looking for "-" in a base64 value never matched, and every
+		// multipart download with a checksum was reported as a MISMATCH.)
+		ci.Composite = strings.Contains(ci.Value, "-") || isMultipartETag(ci.ETag)
+	}
+	if ci.SinglePartETag && (ci.Algorithm == "" || ci.Composite) {
+		// The ETag is the only thing left to compare, and it is an MD5 only
+		// for SSE-S3 / unencrypted objects. GetObjectAttributes does not say
+		// which, so a HEAD does. A failed HEAD keeps the ETag: no worse than
+		// before, and the common case.
+		if meta, herr := m.HeadObject(ctx, bucket, key); herr == nil {
+			ci.ruleOutKMS(meta.SSE)
+		}
 	}
 	return ci, nil
+}
+
+// isMultipartETag reports a multipart upload's ETag ("<hash>-<parts>").
+func isMultipartETag(etag string) bool {
+	return strings.Contains(strings.Trim(etag, "\""), "-")
+}
+
+// ruleOutKMS drops the ETag as a content hash for an SSE-KMS object: AWS
+// documents that its ETag is not the MD5 of the body, so comparing would
+// report every intact download as corrupt.
+func (ci *ChecksumInfo) ruleOutKMS(sse string) {
+	if strings.HasPrefix(sse, "aws:kms") {
+		ci.SinglePartETag = false
+		ci.KMSETag = true
+	}
 }
 
 // checksumFromETag builds the ETag-only half of a ChecksumInfo.
@@ -89,7 +124,7 @@ func checksumFromETag(etag string, size int64) ChecksumInfo {
 		ETag: e,
 		// A multipart ETag carries "-<partcount>"; anything else is the MD5
 		// of the body.
-		SinglePartETag: e != "" && !strings.Contains(e, "-"),
+		SinglePartETag: e != "" && !isMultipartETag(e),
 		Size:           size,
 	}
 }
@@ -238,8 +273,13 @@ func (m *Model) VerifyLocalFile(ctx context.Context, bucket *Object, key, localP
 		return VerifyResult{Reason: fmt.Sprintf(
 			"the object's %s checksum is a checksum-of-parts, which no whole-file hash can match; size matched",
 			ci.Algorithm)}, nil
+	case ci.KMSETag:
+		return VerifyResult{Reason: "the object is SSE-KMS encrypted, so its ETag is not an MD5 of the content and it carries no additional checksum; size matched"}, nil
 	default:
-		return VerifyResult{Reason: "the object is multipart and carries no whole-object checksum (upload with a checksum algorithm to make it verifiable); size matched"}, nil
+		// No advice to set a checksum algorithm here: with this SDK a
+		// multipart upload stores a checksum-of-parts, which is no more
+		// comparable than the ETag. Only objects written in one part are.
+		return VerifyResult{Reason: "the object is multipart and carries no whole-object checksum; size matched"}, nil
 	}
 }
 

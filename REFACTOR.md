@@ -179,7 +179,7 @@ The organising principle is **not** MVC purity. It is the testability seam:
 |---|---|---|
 | `session`, `jobs` | nothing | plain unit tests |
 | `ops` | narrow S3 ports, `Reporter` | fake store + recording reporter |
-| `ui/*` | tview | by hand / pty harness |
+| `ui/*` | tview | by hand / pty harness (now `e2e/`: the binary in tmux) |
 
 ### A. `ops.Operation` — kills P2 and P6
 
@@ -426,8 +426,9 @@ hard logic is still untested.
   production profile. In the target architecture this belongs in `ops`: a
   read-only `Store` wrapper that rejects `Put`/`Delete`/`Copy`, so forgetting is
   impossible rather than merely unlikely.
-- **The integration CI job does not run `-race`** (`ci.yml:95`) — and it is the
-  one suite that actually exercises concurrent transfer paths.
+- **The integration CI job does not run `-race`** (`ci.yml`, the "integration
+  tests" step) — and it is the one suite that actually exercises concurrent
+  transfer paths.
 
 ## 6. What this refactor deliberately does not do
 
@@ -446,20 +447,27 @@ hard logic is still untested.
 | 1 — `ui/shell` | done | 226 raw page calls → 0; the `go c.error(...)` rule retired |
 | 2 — `jobs` | done | queue, badge and notices lifted off the controller |
 | 3 — `session.Pane` | done | navigation race fixed |
-| 4 — `ops` + Runner | done | `Download`, `Upload`, `Copy`/`Move` and `Sync` converted; Rename/Delete/cross-profile not yet |
+| 4 — `ops` + Runner | done | `Download`, `Upload`, `Copy`/`Move` and `Sync` converted; batch rename, delete, undo, trash restore and cross-profile copy not yet |
 | 5 — package moves | done | `internal/model`, not `internal/s3` (see above); `screens` split is partial |
 
 ### Where it landed
 
 | Metric | Before | After |
 |---|---|---|
-| `controller.go` | 5,648 lines | 4,020 |
-| Fields on `Controller` | 44 | 29 |
-| Methods on `*Controller` | 201 | 184 |
+| `controller.go` | 5,648 lines | 4,196 |
+| Fields on `Controller` | 44 | 30 |
+| Methods on `*Controller` | 201 | 188 |
 | Raw `Pages.*Page` calls | 226 | 2 (both inside `ui/shell`, which owns them) |
 | `QueueUpdateDraw` outside the shell | 92 | 0 |
 | Interfaces in the repo | 0 | 8 |
-| Tests | 247 | 374 |
+| Tests | 247 | 404 |
+
+Recounted after the 2026-10 review's fixes; the version is still 0.10.2,
+whose release read 4,020 lines, 29 fields and 184 methods in the first three
+rows. The growth is those fixes themselves — panes captured on the UI
+goroutine, the undo skip sets, `canMark`, `renderIfActive`, the clipboard
+generation — not new flows. Tests count `func Test…` across the repository,
+the tag-gated integration suite included.
 
 The page-call row read "0" until 0.10.1, because it was only ever counted over
 `internal/controller`. Ten raw `Pages.RemovePage("modal")` calls had been left
@@ -484,24 +492,48 @@ remaining conversions: when a flow becomes an `ops.Operation`, its old
 scheduling helpers go in the same commit, and so do their tests — a test is
 what makes dead code look alive.
 
+The 2026-10 review found a third, and this one lost data. `ops.Upload` was
+handed the confirmed file list, but its port was `Pusher.Upload(ctx,
+localPath, prefix, …)`: what it actually sent was a *root*, which the model
+walked for itself. From the upload dialog the two nearly agreed, because the
+root was what the user picked (only a prefix containing `//` or `..`, which
+the walk's `path.Join` cleaned, wrote other keys than the preview showed).
+From the local pane they did not — the root was the directory the marked
+files sat in, so uploading one marked file from `~` uploaded all of `~`, past
+an overwrite scan that had only seen the marked file's key. The port is now
+`Pusher.UploadTargets(ctx, bucket, targets, progress)`: exact targets, no
+walk, and `ops.Upload` sends exactly its `Files`. `model.Upload` became
+`PrepareUpload` plus `UploadTargets`, so its one remaining direct caller (the
+empty-directory upload) also writes, by construction, the keys a preview
+would show. The rule this adds to the one above: a port takes what the user
+confirmed, never an input it re-derives that from.
+
 ### What is still open
 
-- **Four of seven flows are converted.** `Download`, `Upload`, `Copy`/`Move`
-  and `Sync` are `ops.Operation`s. Still open-coding the pipeline the Runner
-  owns: `runCrossCopy` (221 lines), `runBatchRename` (81), `runUndo` and
-  `runDelete`. The pattern is established — each is a `Describe`/`Run` pair plus
-  a ten-line constructor — and `runUndo`/`runBatchRename` are both really
-  `ops.Copy` with a different label, so they should collapse rather than grow
-  new types. `runCrossCopy` is the one that needs its own op: it streams bytes
-  between two endpoints rather than asking one server to copy.
+- **Four flows are converted; five still open-code the pipeline.**
+  `Download`, `Upload`, `Copy`/`Move` and `Sync` are `ops.Operation`s. Still
+  open-coding what the Runner owns: `runCrossCopy` (221 lines),
+  `runBatchRename` (84), `runDelete` (77), `runUndo` (67) and
+  `runTrashRestore` (34). The pattern is established — each is a
+  `Describe`/`Run` pair plus a ten-line constructor — and `runUndo`,
+  `runBatchRename` and `runTrashRestore` are all a loop of `MoveKeys` over
+  explicit source→destination pairs: `ops.Copy` with per-item destinations and
+  a different label, so they should collapse into one op rather than grow
+  three types. `runCrossCopy` is the one that needs its own op: it streams
+  bytes between two endpoints rather than asking one server to copy. The
+  open-coded flows are also where the failure reporting is thinnest (no Retry
+  or Export on cross-profile copy or undo — ROADMAP.md, Hardening).
 - **`ui/screens` holds one screen.** The browser and the profiles screen still
   share one `tview.List` (what `c.browsing` distinguishes); separating them
   needs a render path that can target a pane rather than always "the active
   one" — which would also fix the inactive-pane column-layout limitation.
-- **The read-only guard is still 18 scattered call sites** in the controller.
-  With `ops` in place it now has a home: a read-only wrapper around the ports
-  that rejects `Put`/`Delete`/`Copy`, so forgetting one becomes impossible
-  rather than merely unlikely.
+- **The read-only guard is still 18 scattered `readOnlyBlocked` calls** in the
+  controller, plus one inline check in `pickCrossDestination`
+  (`internal/controller/crossprofile.go`) — the one write whose guard is about
+  the *destination* profile rather than the open one. With `ops` in place it
+  now has a home: a read-only wrapper around the ports that rejects
+  `Put`/`Delete`/`Copy`, so forgetting one becomes impossible rather than
+  merely unlikely.
 - **`progressReader.Read` is still non-atomic** (`internal/model/model.go`),
   unlike its `progressWriterAt` sibling. Reviewed in 0.10.2 and left: one
   goroutine reads a given reader (the uploader takes a part at a time), so

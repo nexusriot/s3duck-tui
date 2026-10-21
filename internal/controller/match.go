@@ -124,13 +124,16 @@ func globMatch(pattern, s string) bool {
 	star, backtrack := -1, 0
 	for si < len(str) {
 		switch {
-		case pi < len(p) && (p[pi] == '?' || p[pi] == str[si]):
-			pi++
-			si++
+		// "*" is tested first: a key holding a literal "*" at this position
+		// must not consume the wildcard as a plain character, which made
+		// "*" fail to match "*abc".
 		case pi < len(p) && p[pi] == '*':
 			star = pi
 			pi++
 			backtrack = si
+		case pi < len(p) && (p[pi] == '?' || p[pi] == str[si]):
+			pi++
+			si++
 		case star >= 0:
 			// Mismatch, but an earlier "*" can absorb one more character.
 			pi = star + 1

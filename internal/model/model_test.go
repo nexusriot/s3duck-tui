@@ -9,6 +9,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	s3t "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
 // PresignGetURL is pure local crypto (no network), so it can be exercised
@@ -472,45 +475,146 @@ func TestWalkFollowingRootSymlink(t *testing.T) {
 	})
 }
 
-// TestUploadKeyMatchesPrepareUpload pins the two key derivations together.
-// Upload re-derives keys during its walk while PrepareUpload produced them
-// earlier; the skip set is keyed by PrepareUpload's RemotePath, so any drift
-// would make "skip existing" silently skip nothing (or the wrong file).
-func TestUploadKeyMatchesPrepareUpload(t *testing.T) {
-	m := newTestModel(t, NewConfig("https://s3.example.com", nil, "ak", "sk", "", true, 0))
-	bucket := &Object{Key: strPtr("b"), Ot: Bucket}
-
+// TestPrepareUploadListsEmptyDirectories pins the folder markers. Upload sends
+// exactly PrepareUpload's targets (there is no second key derivation to drift
+// from the preview), so an empty directory must be in the list as a "/" key or
+// the upload would silently stop creating it.
+func TestPrepareUploadListsEmptyDirectories(t *testing.T) {
 	root := t.TempDir()
 	tree := filepath.Join(root, "proj")
-	if err := os.MkdirAll(filepath.Join(tree, "sub"), 0755); err != nil {
-		t.Fatal(err)
-	}
-	for rel, body := range map[string]string{"a.txt": "one", "sub/b.txt": "two"} {
-		if err := os.WriteFile(filepath.Join(tree, filepath.FromSlash(rel)), []byte(body), 0600); err != nil {
+	for _, d := range []string{"sub", "empty", "nested/inner"} {
+		if err := os.MkdirAll(filepath.Join(tree, filepath.FromSlash(d)), 0755); err != nil {
 			t.Fatal(err)
 		}
 	}
+	if err := os.WriteFile(filepath.Join(tree, "sub", "b.txt"), []byte("two"), 0600); err != nil {
+		t.Fatal(err)
+	}
 
-	targets, _, err := m.PrepareUpload(tree, "dest", bucket)
+	targets, total, err := (&Model{}).PrepareUpload(tree, "dest", nil)
 	if err != nil {
 		t.Fatalf("PrepareUpload: %v", err)
 	}
-	if len(targets) != 2 {
-		t.Fatalf("got %d targets, want 2", len(targets))
-	}
+	got := map[string]bool{}
 	for _, tg := range targets {
-		if got := uploadKey(tree, NormalizePrefix("dest"), tg.LocalPath, true); got != tg.RemotePath {
-			t.Errorf("uploadKey = %q, PrepareUpload said %q", got, tg.RemotePath)
+		got[tg.RemotePath] = true
+	}
+	want := []string{"dest/proj/sub/b.txt", "dest/proj/empty/", "dest/proj/nested/inner/"}
+	if len(got) != len(want) {
+		t.Fatalf("targets = %v, want %v", got, want)
+	}
+	for _, k := range want {
+		if !got[k] {
+			t.Errorf("missing target %q in %v", k, got)
 		}
 	}
-
-	// The single-file form must agree too.
-	single := filepath.Join(tree, "a.txt")
-	targets, _, err = m.PrepareUpload(single, "dest", bucket)
-	if err != nil {
-		t.Fatalf("PrepareUpload(file): %v", err)
+	if total != 3 {
+		t.Errorf("total = %d, want 3 (markers carry no bytes)", total)
 	}
-	if got := uploadKey(single, NormalizePrefix("dest"), single, false); got != targets[0].RemotePath {
-		t.Errorf("uploadKey = %q, PrepareUpload said %q", got, targets[0].RemotePath)
+
+	// An empty root is one marker: that is the whole upload.
+	vacant := filepath.Join(root, "vacant")
+	if err := os.Mkdir(vacant, 0755); err != nil {
+		t.Fatal(err)
+	}
+	targets, _, err = (&Model{}).PrepareUpload(vacant, "", nil)
+	if err != nil || len(targets) != 1 || targets[0].RemotePath != "vacant/" {
+		t.Errorf("empty root targets = %+v, %v; want one vacant/ marker", targets, err)
+	}
+}
+
+// A same-bucket folder copy whose destination is an ancestor of the source is
+// fine — unless the source holds the sub-path that maps onto itself. Then the
+// first copy overwrites a source object before it is read, and a move deletes
+// the original without it having been written anywhere.
+func TestCheckSelfOverlap(t *testing.T) {
+	objs := func(keys ...string) []s3t.Object {
+		out := make([]s3t.Object, 0, len(keys))
+		for _, k := range keys {
+			out = append(out, s3t.Object{Key: aws.String(k)})
+		}
+		return out
+	}
+	if err := checkSelfOverlap(true, "a/a/", "a/", objs("a/a/f", "a/a/a/f")); err == nil {
+		t.Error("a/a/a/f → a/a/f lands on a source object; want a refusal")
+	}
+	if err := checkSelfOverlap(true, "x/sub/", "x/", objs("x/sub/f", "x/sub/g/h")); err != nil {
+		t.Errorf("moving a folder up into its parent with no self-mapping sub-path: %v", err)
+	}
+	if err := checkSelfOverlap(false, "a/a/", "a/", objs("a/a/f", "a/a/a/f")); err != nil {
+		t.Errorf("a different bucket cannot overlap: %v", err)
+	}
+	if err := checkSelfOverlap(true, "a/", "b/", objs("a/f")); err != nil {
+		t.Errorf("disjoint prefixes cannot overlap: %v", err)
+	}
+}
+
+// The uploader's body is never seekable, so the SDK cannot grow the part size
+// itself; at a fixed 5 MiB an upload over 48.8 GiB failed on its last part.
+func TestUploadPartSizeFitsThePartLimit(t *testing.T) {
+	const mib = int64(1 << 20)
+	for _, size := range []int64{0, -1, 1, 5 * mib, 10000 * 5 * mib, 10000*5*mib + 1, 60 << 30, 5 << 40} {
+		ps := uploadPartSize(size)
+		if ps < 5*mib {
+			t.Errorf("size %d: part %d is below the 5 MiB minimum", size, ps)
+		}
+		if size > 0 && (size+ps-1)/ps > 10000 {
+			t.Errorf("size %d: part %d needs %d parts, over 10 000", size, ps, (size+ps-1)/ps)
+		}
+	}
+}
+
+// A copy that sends no encryption takes the destination bucket's default, so
+// the profile's SSE has to be sent on every copy, and — without one — a copy
+// within the bucket keeps the source's.
+func TestCopyEncryption(t *testing.T) {
+	same := copySpec{srcBucket: "b", dstBucket: "b"}
+	other := copySpec{srcBucket: "b", dstBucket: "c"}
+	kms := &ObjectMeta{SSE: "aws:kms", SSEKMSKeyID: "arn:key"}
+
+	m := &Model{Cf: &Config{Write: WriteOptions{SSE: "AES256"}}}
+	if sse, _ := m.copyEncryption(same, kms); sse != "AES256" {
+		t.Errorf("profile SSE = %q, want the profile's AES256 to win", sse)
+	}
+
+	m = &Model{Cf: &Config{}}
+	if sse, key := m.copyEncryption(same, kms); sse != "aws:kms" || key != "arn:key" {
+		t.Errorf("in-bucket copy = %q/%q, want the source's KMS encryption", sse, key)
+	}
+	if sse, _ := m.copyEncryption(other, kms); sse != "" {
+		t.Errorf("cross-bucket copy = %q, want the destination bucket's default", sse)
+	}
+	if sse, _ := m.copyEncryption(same, nil); sse != "" {
+		t.Errorf("unknown source = %q, want the bucket default", sse)
+	}
+}
+
+// Join cleans "./" away and a root already ends in a separator, so a string
+// prefix test rejected every key when downloading into "." or "/".
+func TestSafeLocalPathAcceptsDotAndRoot(t *testing.T) {
+	if got, err := SafeLocalPath("./", "", "a/x"); err != nil || got != filepath.FromSlash("a/x") {
+		t.Errorf("into ./: %q, %v", got, err)
+	}
+	root := string(os.PathSeparator)
+	if got, err := SafeLocalPath(root, "", "a/x"); err != nil || got != filepath.Join(root, "a", "x") {
+		t.Errorf("into the root: %q, %v", got, err)
+	}
+	for _, key := range []string{"../x", "a/../../x"} {
+		if _, err := SafeLocalPath("./", "", key); err == nil {
+			t.Errorf("%q escapes ./ but was accepted", key)
+		}
+	}
+}
+
+// A backslash is a separator on Windows: a version download must keep only
+// the key's last segment there too, or "..\..\x.bat" names a file outside
+// the download directory.
+func TestVersionFileNameStripsBackslashPaths(t *testing.T) {
+	got := VersionFileName(`..\..\Startup\x.bat`, "abcdef1234")
+	if got != "x.abcdef12.bat" {
+		t.Errorf("VersionFileName = %q, want x.abcdef12.bat", got)
+	}
+	if got := VersionFileName("..", "v"); strings.Contains(got, "..") && !strings.HasPrefix(got, "object") {
+		t.Errorf("VersionFileName(..) = %q", got)
 	}
 }

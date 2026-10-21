@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -24,7 +23,6 @@ import (
 	s3m "github.com/aws/aws-sdk-go-v2/feature/s3/manager"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3t "github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/aws/smithy-go"
 
 	u "github.com/nexusriot/s3duck-tui/internal/utils"
 )
@@ -195,24 +193,45 @@ const uploadMaxAttempts = 3
 // aws.NopRetryer{}, so a single transient network error failed the whole
 // transfer — painful for a multi-file upload and worse for a sync run pushing
 // hundreds of objects. The SDK's standard retryer backs off on throttling and
-// transient 5xx/connection errors; retries are safe here because every part is
-// re-read from the file, not from a consumed buffer.
+// transient 5xx/connection errors; retries are safe here because the uploader
+// buffers each part of a non-seekable body before sending it, so a retry
+// resends the buffered part rather than re-reading a consumed stream.
 func uploadRetryer() aws.Retryer {
 	return retry.NewStandard(func(o *retry.StandardOptions) {
 		o.MaxAttempts = uploadMaxAttempts
 	})
 }
 
-// newUploader builds the shared multipart uploader used by both Upload and
-// UploadFile, so the two paths can't drift on part size or retry policy.
-func newUploader(client *s3.Client) *s3m.Uploader {
+// newUploader builds the shared multipart uploader used by every upload path
+// (UploadFile, and through it UploadTargets; CrossCopy), so they can't drift
+// on part size or retry policy. size is the body's length, or <= 0 if unknown.
+func newUploader(client *s3.Client, size int64) *s3m.Uploader {
 	return s3m.NewUploader(client, func(u *s3m.Uploader) {
-		u.PartSize = 5 * 1024 * 1024
+		u.PartSize = uploadPartSize(size)
 		u.LeavePartsOnError = false
 		u.ClientOptions = append(u.ClientOptions, func(o *s3.Options) {
 			o.Retryer = uploadRetryer()
 		})
 	})
+}
+
+// uploadPartSize picks a part size that fits size into S3's 10 000-part limit.
+//
+// The SDK grows the part size itself only for a seekable body, and every body
+// here is a progressReader, which is not one. At a fixed 5 MiB, anything over
+// 10 000 × 5 MiB (48.8 GiB) ran to the last part and then failed with
+// "exceeded total allowed configured MaxUploadParts", throwing the whole
+// transfer away.
+func uploadPartSize(size int64) int64 {
+	const mib = 1 << 20
+	ps := s3m.MinUploadPartSize
+	if size <= 0 {
+		return ps
+	}
+	if need := (size + int64(s3m.MaxUploadParts) - 1) / int64(s3m.MaxUploadParts); need > ps {
+		ps = (need + mib - 1) / mib * mib
+	}
+	return ps
 }
 
 func GetDownloader(client *s3.Client) *s3m.Downloader {
@@ -295,9 +314,13 @@ func GetConfig(cf Config, update bool) (aws.Config, error) {
 	if err != nil {
 		return cfg, err
 	}
-	// A delegating profile that resolves to nothing is worth catching here,
-	// while the message can still name the profile: the alternative is an
-	// opaque "no EC2 IMDS role found" on the first listing.
+	// A delegating profile that resolves to nothing would be worth catching
+	// here, while the message can still name the profile. This check is only
+	// a backstop, though: the pinned SDK (config v1.18.8) does not leave
+	// Credentials nil for such a profile — it falls back to its default chain,
+	// ending at EC2 IMDS — so the usual symptom is still an opaque credential
+	// error on the first request. Catching it properly means retrieving once
+	// at open, which would run SSO / credential_process / STS right there.
 	if cf.AWSProfile != "" && cfg.Credentials == nil {
 		return cfg, fmt.Errorf("aws profile %q resolved no credentials", cf.AWSProfile)
 	}
@@ -337,8 +360,10 @@ func NewModel(cf Config) (*Model, error) {
 	return &m, nil
 }
 
-// RefreshClient re-pins the client to the bucket's actual region (AWS only —
-// GetConfig ignores the region rebuild for custom endpoints). On any failure it
+// RefreshClient re-pins the client to the bucket's actual region. It runs on
+// every endpoint: for an amazonaws.com URL the rebuilt client uses the SDK's
+// regional endpoint, and for a custom endpoint the URL stays but the signing
+// region becomes the one GetBucketLocation reported. On any failure it
 // leaves the existing client and region untouched and reports the error:
 // mutating them on a failed lookup used to pin every later call — and even
 // CreateBucket — to a wrong us-east-1 default, turning one denied
@@ -845,203 +870,104 @@ func walkFollowingRoot(localPath string, fn filepath.WalkFunc) error {
 	})
 }
 
-// skip, when non-nil, names remote keys the user chose to keep: those files
-// are walked and counted but never sent. The keys match PrepareUpload's
-// RemotePath exactly — the two key derivations are pinned together by test.
-// uploadKey derives the remote key for one walked local file. Upload and the
-// skip filter both go through it, and it must keep matching PrepareUpload's
-// RemotePath — TestIntegrationUploadMatchesPreparedKeys pins the two together.
-func uploadKey(localPath, s3Prefix, fpath string, isDir bool) string {
-	if isDir {
-		parent := filepath.Dir(localPath)
-		relPath, _ := filepath.Rel(parent, fpath)
-		return filepath.ToSlash(path.Join(s3Prefix, relPath))
-	}
-	return path.Join(s3Prefix, filepath.Base(fpath))
-}
-
+// Upload sends a local file or directory tree to s3Prefix.
+//
+// It is PrepareUpload followed by UploadTargets, so the keys it writes are by
+// construction the ones the preview and the overwrite scan were shown. (It
+// used to re-derive them during a walk of its own, with path.Join, which
+// cleans "//" and ".." segments that PrepareUpload keeps: under a prefix like
+// "logs//2024/" the preview promised one key and the upload wrote another —
+// past the overwrite check, and with the user's skip answers matching
+// nothing.)
+//
+// skip, when non-nil, names remote keys the user chose to keep: those targets
+// are never sent, nor counted in the progress totals.
 func (m *Model) Upload(
 	ctx context.Context,
 	localPath, s3Prefix string,
 	bucket *Object,
 	skip map[string]bool,
-	progressCb func(current, total int64, i, count int, local, remote string),
+	progressCb func(current, total int64, done, count int, local, remote string),
 ) error {
-	info, err := os.Stat(localPath)
+	targets, _, err := m.PrepareUpload(localPath, s3Prefix, bucket)
 	if err != nil {
 		return err
 	}
+	if len(skip) > 0 {
+		kept := targets[:0:0]
+		for _, t := range targets {
+			if !skip[t.RemotePath] {
+				kept = append(kept, t)
+			}
+		}
+		targets = kept
+	}
+	return m.UploadTargets(ctx, bucket, targets, progressCb)
+}
 
-	isDir := info.IsDir()
-	var files []string
-	var dirs []string
-	var totalSize int64
+// UploadTargets sends exactly targets: no walk, no key derivation. A target
+// whose RemotePath ends in "/" is a folder marker for an empty directory and
+// is written as a zero-byte object.
+//
+// progressCb reports the bytes sent so far against the targets' total, and
+// how many targets have completed out of how many.
+func (m *Model) UploadTargets(
+	ctx context.Context,
+	bucket *Object,
+	targets []UploadTarget,
+	progressCb func(current, total int64, done, count int, local, remote string),
+) error {
+	if bucket == nil || bucket.Key == nil {
+		return fmt.Errorf("bucket is nil")
+	}
+	var total int64
+	for _, t := range targets {
+		total += t.Size
+	}
 
-	if isDir {
-		err := walkFollowingRoot(localPath, func(p string, fi os.FileInfo, err error) error {
-			if err != nil {
-				return err
-			}
-			if fi.IsDir() {
-				dirs = append(dirs, p)
-				return nil
-			}
-			// Sockets, FIFOs and devices are skipped: opening a FIFO with no
-			// writer blocks forever and the open syscall ignores ctx cancel,
-			// so one stray pipe would hang the whole upload.
-			if !fi.Mode().IsRegular() {
-				return nil
-			}
-			files = append(files, p)
-			totalSize += fi.Size()
-			return nil
-		})
-		if err != nil {
+	var sent int64
+	for i, t := range targets {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
-	} else {
-		files = []string{localPath}
-		totalSize = info.Size()
-	}
-
-	// If uploading a directory, create S3 "folder marker" objects for empty dirs.
-	// S3 has no real folders; empty folders exist only if there's a key ending with "/".
-	if isDir {
-		// Mark all directories that have at least one file somewhere under them.
-		nonEmpty := make(map[string]bool, len(dirs))
-		for _, f := range files {
-			d := filepath.Dir(f)
-			for {
-				nonEmpty[d] = true
-				if d == localPath {
-					break
-				}
-				parent := filepath.Dir(d)
-				if parent == d {
-					break
-				}
-				d = parent
+		if strings.HasSuffix(t.RemotePath, "/") {
+			if err := m.putMarker(ctx, bucket, t.RemotePath); err != nil {
+				return fmt.Errorf("failed to create folder marker %s: %w", t.RemotePath, err)
 			}
-		}
-		// Create markers for dirs that have no file descendants.
-		// Also supports the case when the root folder itself is empty
-		for _, d := range dirs {
-			if nonEmpty[d] {
-				continue
-			}
-
-			parent := filepath.Dir(localPath)
-			relPath, err := filepath.Rel(parent, d)
+		} else {
+			var fileSent int64
+			err := m.UploadFile(ctx, t.LocalPath, t.RemotePath, bucket, func(written, _ int64) {
+				fileSent = written
+				if progressCb != nil {
+					progressCb(sent+written, total, i, len(targets), t.LocalPath, t.RemotePath)
+				}
+			})
 			if err != nil {
 				return err
 			}
-
-			s3Key := filepath.ToSlash(path.Join(s3Prefix, relPath))
-			if !strings.HasSuffix(s3Key, "/") {
-				s3Key += "/"
-			}
-
-			in := &s3.PutObjectInput{
-				Bucket: aws.String(*bucket.Key),
-				Key:    aws.String(s3Key),
-				Body:   strings.NewReader(""),
-			}
-			// A marker is not a file, so there is no name to derive a type
-			// from — but a profile that encrypts everything must encrypt this
-			// too, or a bucket policy requiring SSE rejects the marker and the
-			// whole directory upload fails. Same reasoning as CreateFolder,
-			// which is the other way a marker gets written.
-			m.writeOpts().applyPut(in, "")
-			_, err = m.Client.PutObject(ctx, in)
-			if err != nil {
-				return fmt.Errorf("failed to create folder marker %s: %w", s3Key, err)
-			}
+			sent += fileSent
+		}
+		if progressCb != nil {
+			progressCb(sent, total, i+1, len(targets), t.LocalPath, t.RemotePath)
 		}
 	}
-
-	// Drop the files the user chose to keep BEFORE the totals are used: the
-	// walk counted every file, so leaving them in made the progress gauge
-	// measure bytes that were never going to be sent — a transfer that
-	// finishes at 60%% and an index counting files it skipped.
-	if len(skip) > 0 {
-		kept := files[:0:0]
-		totalSize = 0
-		for _, fpath := range files {
-			if skip[uploadKey(localPath, s3Prefix, fpath, isDir)] {
-				continue
-			}
-			if fi, err := os.Stat(fpath); err == nil {
-				totalSize += fi.Size()
-			}
-			kept = append(kept, fpath)
-		}
-		files = kept
-	}
-
-	uploader := newUploader(m.Client)
-
-	var uploadedTotal int64
-
-	for i, fpath := range files {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		s3Key := uploadKey(localPath, s3Prefix, fpath, isDir)
-
-		stat, err := os.Stat(fpath)
-		if err != nil {
-			return fmt.Errorf("stat failed for %s: %w", fpath, err)
-		}
-
-		fp, err := os.Open(fpath)
-		if err != nil {
-			return fmt.Errorf("failed to open file %s: %w", fpath, err)
-		}
-
-		reader := &progressReader{
-			r:     fp,
-			total: stat.Size(),
-			update: func(written, _ int64) {
-				if progressCb != nil {
-					progressCb(uploadedTotal+written, totalSize, i+1, len(files), fpath, s3Key)
-				}
-			},
-			limiter: m.Limiter,
-		}
-
-		uploadCtx, cancel := context.WithCancel(ctx)
-
-		in := &s3.PutObjectInput{
-			Bucket: aws.String(*bucket.Key),
-			Key:    aws.String(s3Key),
-			Body:   reader,
-		}
-		// Content-Type is derived from the local file (name first, then a
-		// sniff for extensionless ones) rather than left to the server's
-		// octet-stream default; encryption and checksum come from the profile.
-		m.writeOpts().applyPut(in, fpath)
-		_, err = uploader.Upload(uploadCtx, in)
-		fp.Close()
-		cancel() // release per-file context immediately, not at Upload() return
-
-		if err != nil {
-			if errors.Is(err, context.Canceled) {
-				return fmt.Errorf("upload canceled for %s", fpath)
-			}
-			var apiErr smithy.APIError
-			if errors.As(err, &apiErr) {
-				return fmt.Errorf("upload failed for %s: %s - %s", fpath, apiErr.ErrorCode(), apiErr.ErrorMessage())
-			}
-			return fmt.Errorf("upload failed for %s: %w", fpath, err)
-		}
-
-		uploadedTotal += stat.Size()
-	}
-
 	return nil
+}
+
+// putMarker writes the zero-byte object that represents an empty folder.
+// A marker is not a file, so there is no name to derive a type from — but a
+// profile that encrypts everything must encrypt this too, or a bucket policy
+// requiring SSE rejects the marker and the whole directory upload fails.
+// CreateFolder is the other way a marker gets written.
+func (m *Model) putMarker(ctx context.Context, bucket *Object, key string) error {
+	in := &s3.PutObjectInput{
+		Bucket: aws.String(*bucket.Key),
+		Key:    aws.String(key),
+		Body:   strings.NewReader(""),
+	}
+	m.writeOpts().applyPut(in, "")
+	_, err := m.Client.PutObject(ctx, in)
+	return err
 }
 
 // PrepareUpload returns list of files to upload with remote keys and total size.
@@ -1067,22 +993,31 @@ func (m *Model) PrepareUpload(localPath string, currentPath string, bucket *Obje
 	}
 
 	// Keys are relative to the PARENT of localPath, so the uploaded tree keeps
-	// its top-level directory name — this must match Upload's key derivation
-	// exactly, or the preview promises destinations the objects never land on.
+	// its top-level directory name. These targets are exactly what Upload
+	// sends: the preview and the transfer share one derivation.
 	base := filepath.Dir(localPath)
 	err = walkFollowingRoot(localPath, func(p string, fi os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
-		// Mirror Upload's walk: directories contribute nothing here and
-		// non-regular files would hang the transfer (see Upload).
-		if fi.IsDir() || !fi.Mode().IsRegular() {
-			return nil
-		}
-
 		rel, err := filepath.Rel(base, p)
 		if err != nil {
 			return err
+		}
+		if fi.IsDir() {
+			// S3 has no real folders: an empty directory exists only as a
+			// key ending in "/". A non-empty one needs nothing of its own.
+			// (Same convention as LocalTargets.)
+			if isEmptyDir(p) {
+				targets = append(targets, UploadTarget{LocalPath: p, RemotePath: prefix + filepath.ToSlash(rel) + "/"})
+			}
+			return nil
+		}
+		// Sockets, FIFOs and devices are skipped: opening a FIFO with no
+		// writer blocks forever and the open syscall ignores ctx cancel, so
+		// one stray pipe would hang the whole upload.
+		if !fi.Mode().IsRegular() {
+			return nil
 		}
 		remote := prefix + filepath.ToSlash(rel)
 
@@ -1171,8 +1106,12 @@ func SafeLocalPath(destPath, currentPath, s3Key string) (string, error) {
 	}
 
 	p := filepath.Join(destPath, filepath.FromSlash(relativeKey))
-	base := filepath.Clean(destPath)
-	if p != base && !strings.HasPrefix(p, base+string(os.PathSeparator)) {
+	// Containment is decided by Rel, not by a string prefix: Join cleans "./"
+	// away and a root already ends in a separator, so a prefix test against
+	// "."+sep or "/"+sep rejected every key when downloading into the working
+	// directory or a filesystem root.
+	rel, err := filepath.Rel(filepath.Clean(destPath), p)
+	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
 		return "", fmt.Errorf("object key %q escapes the download directory", s3Key)
 	}
 	return p, nil
@@ -1212,11 +1151,19 @@ func (m *Model) DownloadTarget(
 	// the body is fully on disk: a failed or canceled transfer must never leave
 	// the target missing or truncated, and an overwrite must not destroy the
 	// existing file before its replacement exists.
-	tmpPath := downloadPath + ".s3duck-part"
-	fp, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
+	//
+	// The temp name is unique per transfer. Two keys can land on one local
+	// path ("a//b" and "a/b", or "Report.pdf" and "report.pdf" on a
+	// case-insensitive filesystem); with a fixed name, two workers truncated
+	// and wrote into the same temp file and the result was an interleaving of
+	// both objects, reported as a success.
+	fp, err := os.CreateTemp(filepath.Dir(downloadPath), filepath.Base(downloadPath)+".*.s3duck-part")
 	if err != nil {
 		return 0, err
 	}
+	tmpPath := fp.Name()
+	// CreateTemp makes the file 0600; a download keeps the mode it always had.
+	_ = fp.Chmod(0644)
 
 	writerAt := &progressWriterAt{
 		w:     fp,
@@ -1327,6 +1274,35 @@ func remapKey(src, dst, key string) string {
 	return dst + strings.TrimPrefix(key, src)
 }
 
+// checkSelfOverlap refuses a same-bucket folder copy whose destination keys
+// land on the source's own objects. planFolderCopy already refuses a
+// destination inside the source; the other way round — the destination an
+// ancestor of the source, as in moving "a/a/" up to "a/" — is legitimate
+// unless the source holds the sub-path that maps onto itself. Then the copy
+// overwrites a source object before reading it ("a/a/a/f" lists first and
+// lands on "a/a/f"), and a move deletes both: the original content is gone
+// without having been written anywhere.
+func checkSelfOverlap(sameBucket bool, src, dst string, objs []s3t.Object) error {
+	if !sameBucket || !strings.HasPrefix(src, dst) {
+		return nil
+	}
+	keys := make(map[string]bool, len(objs))
+	for _, o := range objs {
+		if o.Key != nil {
+			keys[*o.Key] = true
+		}
+	}
+	for _, o := range objs {
+		if o.Key == nil {
+			continue
+		}
+		if k := remapKey(src, dst, *o.Key); keys[k] {
+			return fmt.Errorf("destination overlaps the source: %s would land on %s, which is itself being copied", *o.Key, k)
+		}
+	}
+	return nil
+}
+
 // CopyObject performs a single server-side object copy. Source and destination
 // may live in different buckets; the copy is issued against the destination
 // bucket with the source expressed as CopySource. (Both must be reachable
@@ -1422,6 +1398,9 @@ func (m *Model) copyKeysTracked(
 
 	objs, err := m.ListObjects(ctx, src, srcBucket)
 	if err != nil {
+		return nil, err
+	}
+	if err := checkSelfOverlap(sameBucket, src, dst, objs); err != nil {
 		return nil, err
 	}
 

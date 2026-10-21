@@ -502,3 +502,20 @@ func TestDownloadPassesTheOverwriteFlagToTheFetcher(t *testing.T) {
 		t.Error("a non-conflicting object was fetched with the overwrite flag set")
 	}
 }
+
+// When every object is skipped there is nothing to transfer, so the run must
+// not queue for a transfer slot: it used to sit "running" behind two long
+// transfers and, if cancelled there, report a download with nothing to do as
+// cancelled.
+func TestDownloadWithNothingLeftSkipsTheGate(t *testing.T) {
+	f := &fakeFetcher{}
+	d := newDownload(t, newMemFS("a"), f, targets("a", 1))
+	d.Gate = blockingGate{}
+	rep := &recorder{fallback: AnswerNoToAll}
+
+	res := d.Run(context.Background(), rep)
+
+	if res.Canceled || res.Skipped != 1 || len(f.keys()) != 0 {
+		t.Errorf("result = %+v, fetched %v; want one skip, nothing fetched, not cancelled", res, f.keys())
+	}
+}

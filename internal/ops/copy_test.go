@@ -343,3 +343,80 @@ func TestCopyRetryDoesNotReplayTheMoveCallback(t *testing.T) {
 		t.Errorf("OnMoved ran %d times in total, want 1: the retry replayed the original run's bookkeeping", runs)
 	}
 }
+
+// A move whose destination the user kept never happened, so it must not be
+// recorded for undo — an undo "moving it back" copied the kept destination over
+// the untouched source and then deleted it — nor counted as done as well as
+// skipped.
+func TestCopySkippedFileIsNeitherDoneNorMoved(t *testing.T) {
+	mv := &fakeMover{}
+	c := newCopy(mv, file("a.txt"), file("b.txt"))
+	c.Move = true
+	c.Skip = map[string]bool{"to/a.txt": true}
+
+	var moved []Transfer
+	c.OnMoved = func(m []Transfer) { moved = m }
+
+	res := c.Run(context.Background(), &recorder{})
+
+	if res.Done != 1 || res.Skipped != 1 {
+		t.Errorf("done = %d, skipped = %d; want 1 and 1", res.Done, res.Skipped)
+	}
+	if len(moved) != 1 || moved[0].SrcKey != "from/b.txt" {
+		t.Fatalf("moved = %+v, want only from/b.txt", moved)
+	}
+}
+
+// A folder move that skipped some of its objects hands the skip set to the
+// undo ledger, which needs it to leave those objects alone.
+func TestCopyFolderMoveCarriesTheSkipSet(t *testing.T) {
+	mv := &fakeMover{}
+	c := newCopy(mv, folder("docs"))
+	c.Move = true
+	c.Skip = map[string]bool{"to/docs/kept.txt": true}
+
+	var moved []Transfer
+	c.OnMoved = func(m []Transfer) { moved = m }
+	c.Run(context.Background(), &recorder{})
+
+	if len(moved) != 1 || !moved[0].Skip["to/docs/kept.txt"] {
+		t.Errorf("moved = %+v, want the folder with its skip set", moved)
+	}
+}
+
+// A cancel is not a failure: reporting the in-flight item as failed offered a
+// retry covering it alone and silently dropped every item never dispatched.
+func TestCopyCancelMidRunIsNotAFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	mv := &fakeMover{}
+	c := newCopy(mv, file("a"), file("b"), file("c"))
+	c.Mover = cancelOnCall{inner: mv, cancel: cancel, at: "from/a"}
+
+	res := c.Run(ctx, &recorder{})
+
+	if !res.Canceled || res.Failed() != 0 || res.Retry != nil {
+		t.Errorf("result = %+v; want canceled with no failures and no retry", res)
+	}
+}
+
+// cancelOnCall cancels the run while the named source is in flight and
+// reports what the model reports then: the context's error.
+type cancelOnCall struct {
+	inner  *fakeMover
+	cancel context.CancelFunc
+	at     string
+}
+
+func (m cancelOnCall) CopyKeys(ctx context.Context, a, b *model.Object, srcKey, dstKey string,
+	isFolder bool, skip map[string]bool, progress func(int, int, string)) (int, error) {
+	return m.MoveKeys(ctx, a, b, srcKey, dstKey, isFolder, skip, progress)
+}
+
+func (m cancelOnCall) MoveKeys(ctx context.Context, a, b *model.Object, srcKey, dstKey string,
+	isFolder bool, skip map[string]bool, progress func(int, int, string)) (int, error) {
+	if srcKey == m.at {
+		m.cancel()
+		return 0, ctx.Err()
+	}
+	return m.inner.MoveKeys(ctx, a, b, srcKey, dstKey, isFolder, skip, progress)
+}

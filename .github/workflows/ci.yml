@@ -55,6 +55,10 @@ jobs:
       - name: type-check integration tests
         run: go vet -tags integration ./...
 
+      # Same for the end-to-end suite, which only the e2e job below runs.
+      - name: type-check e2e tests
+        run: go vet -tags e2e ./...
+
   integration:
     name: Integration (MinIO)
     runs-on: ubuntu-latest
@@ -121,6 +125,20 @@ jobs:
       - name: MinIO logs on failure
         if: failure()
         run: docker logs minio || true
+
+  # The real binary, in a real terminal (tmux), against a real MinIO — the one
+  # place a keypress is followed all the way to what the server holds. Fully
+  # in containers (e2e/docker-compose.yml): the runner image carries Go and
+  # tmux, MinIO runs on a tmpfs, and the network is private, so the job needs
+  # nothing from the host but Docker.
+  e2e:
+    name: End-to-end (binary in tmux, MinIO)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: make e2e
+        run: make e2e
 
   cross-build:
     name: Cross-build ${{ matrix.goos }}/${{ matrix.goarch }}

@@ -55,6 +55,10 @@ func (c *Controller) EditProfileOptions() {
 		}
 		c.logActivity("profile %s options updated (%s)", conf.Name, optionsSummary(c.params.Config[idx]))
 		c.fillConfigData()
+		// fillConfigData rebuilds the list with the cursor on row 0; put it
+		// back on the edited profile, or the details pane (showing this one)
+		// and Enter (opening row 0) would disagree about which is selected.
+		c.view.List.SetCurrentItem(idx)
 		c.fillConfigDetails(conf.Name)
 		c.success("Options saved")
 	})

@@ -137,7 +137,7 @@ func (m *Model) UploadFile(ctx context.Context, localPath, key string, bucket *O
 	}
 	defer fp.Close()
 
-	uploader := newUploader(m.Client)
+	uploader := newUploader(m.Client, stat.Size())
 
 	reader := &progressReader{
 		r:     fp,

@@ -355,3 +355,100 @@ func TestIntegrationSSEOnWrite(t *testing.T) {
 		t.Errorf("ServerSideEncryption = %q, want AES256", out.ServerSideEncryption)
 	}
 }
+
+// UploadTargets sends exactly the list it is given: no walk of any directory.
+// The local pane's upload used to hand the model the directory its one marked
+// file sat in, and the model uploaded everything in it.
+func TestIntegrationUploadTargetsSendsExactlyTheList(t *testing.T) {
+	m := testModel(t)
+	ctx := context.Background()
+	bucket := freshBucket(t, m, "s3duck-it-targets")
+
+	dir := t.TempDir()
+	for name, body := range map[string]string{"a.txt": "send me", "b.txt": "leave me"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.Mkdir(filepath.Join(dir, "empty"), 0700); err != nil {
+		t.Fatal(err)
+	}
+
+	targets := []model.UploadTarget{
+		{LocalPath: filepath.Join(dir, "a.txt"), RemotePath: "pre/a.txt", Size: 7},
+		{LocalPath: filepath.Join(dir, "empty"), RemotePath: "pre/empty/"},
+	}
+	if err := m.UploadTargets(ctx, bucket, targets, nil); err != nil {
+		t.Fatalf("UploadTargets: %v", err)
+	}
+
+	objs, err := m.ListObjects(ctx, "", bucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := map[string]bool{}
+	for _, o := range objs {
+		got[*o.Key] = true
+	}
+	if len(got) != 2 || !got["pre/a.txt"] || !got["pre/empty/"] {
+		t.Errorf("bucket holds %v, want exactly pre/a.txt and the pre/empty/ marker", got)
+	}
+}
+
+// A multipart object's stored checksum is a checksum-of-parts, and
+// GetObjectAttributes reports it without the "-N" suffix, so it must be
+// recognised from the ETag. Reading it as a whole-object checksum reported
+// every intact multipart download as a MISMATCH.
+func TestIntegrationMultipartChecksumIsNotAMismatch(t *testing.T) {
+	m := testModelWithWrites(t, model.WriteOptions{ChecksumAlgorithm: "CRC32C"})
+	ctx := context.Background()
+	bucket := freshBucket(t, m, "s3duck-it-mpsum")
+
+	local := filepath.Join(t.TempDir(), "big.bin")
+	// Over the uploader's 5 MiB part size, so the upload goes multipart.
+	if err := os.WriteFile(local, []byte(strings.Repeat("multipart", (11<<20)/9)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.UploadFile(ctx, local, "big.bin", bucket, nil); err != nil {
+		t.Fatalf("UploadFile: %v", err)
+	}
+
+	res, err := m.VerifyLocalFile(ctx, bucket, "big.bin", local)
+	if err != nil {
+		t.Fatalf("VerifyLocalFile: %v", err)
+	}
+	if res.Mismatch {
+		t.Errorf("an untouched multipart upload verified as a mismatch: %s", res)
+	}
+}
+
+// A profile with checksum_algo must still be able to copy. A multipart upload
+// that declares a checksum needs one with every part, which UploadPartCopy
+// cannot send, so every copy above the threshold used to fail; the single
+// request path must accept the algorithm too.
+func TestIntegrationMultipartCopyWithChecksum(t *testing.T) {
+	m := testModelWithWrites(t, model.WriteOptions{ChecksumAlgorithm: "CRC32C"})
+	ctx := context.Background()
+	bucket := freshBucket(t, m, "s3duck-it-mpcopysum")
+
+	threshold, part := model.MultipartCopyThreshold, model.MultipartCopyPartSize
+	t.Cleanup(func() {
+		model.MultipartCopyThreshold, model.MultipartCopyPartSize = threshold, part
+	})
+	model.MultipartCopyThreshold = 5 << 20
+	model.MultipartCopyPartSize = 5 << 20
+
+	const size = 6 << 20
+	putObject(t, m, bucket, "src.bin", strings.Repeat("s3duck!!", size/8))
+	if err := m.CopyObjectSized(ctx, bucket, bucket, "src.bin", "dst.bin", size); err != nil {
+		t.Fatalf("multipart copy with a checksum algorithm: %v", err)
+	}
+	if got, err := m.HeadObject(ctx, bucket, "dst.bin"); err != nil || got.Size != size {
+		t.Errorf("copy = %+v, %v", got, err)
+	}
+
+	putObject(t, m, bucket, "small.txt", "small")
+	if err := m.CopyObject(ctx, bucket, bucket, "small.txt", "small-copy.txt"); err != nil {
+		t.Fatalf("single-request copy with a checksum algorithm: %v", err)
+	}
+}

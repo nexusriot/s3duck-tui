@@ -61,7 +61,7 @@ func (c *Controller) selectedCount() int { return c.pane().SelectedCount() }
 type Controller struct {
 	view *widgets.View
 	// shell owns every overlay and every UI update made off the UI
-	// goroutine. See pkg/ui/shell: Do is safe from anywhere, so no caller
+	// goroutine. See internal/ui/shell: Do is safe from anywhere, so no caller
 	// has to know which goroutine it is on.
 	shell  *shell.Shell
 	model  *model.Model
@@ -124,6 +124,8 @@ type Controller struct {
 
 	// clip is the object clipboard (yank/cut → paste).
 	clip clipboard
+	// clipGen numbers clipboard fills (see clipboard.gen). UI goroutine only.
+	clipGen uint64
 
 	// lastUndo is the one-step undo of the last move/rename (reverse ops, ready
 	// to apply). Guarded by undoMu since it is written from transfer goroutines.
@@ -265,6 +267,10 @@ func (c *Controller) wireFilter(filter *tview.InputField) {
 		case tcell.KeyEsc:
 			c.clearFilterUI()
 			c.view.App.SetFocus(c.view.List)
+			// clearFilterUI suppresses the changed handler's render, so this
+			// caller has to render: without it the list stayed filtered after
+			// Esc had cleared the filter.
+			go c.renderList()
 			return nil
 		}
 		return event
@@ -602,13 +608,23 @@ func (c *Controller) resolveDownloadDir() string {
 	}
 	if dir == "" {
 		dir = filepath.Join(c.params.HomeDir, "Downloads")
-	} else if dir == "~" {
-		dir = c.params.HomeDir
-	} else if strings.HasPrefix(dir, "~/") {
-		dir = filepath.Join(c.params.HomeDir, dir[2:])
+	} else {
+		dir = expandHome(dir, c.params.HomeDir)
 	}
 	if !strings.HasSuffix(dir, string(os.PathSeparator)) {
 		dir += string(os.PathSeparator)
+	}
+	return dir
+}
+
+// expandHome expands a leading "~" (alone, or followed by a separator) to
+// home. Anything else is returned unchanged.
+func expandHome(dir, home string) string {
+	if dir == "~" {
+		return home
+	}
+	if strings.HasPrefix(dir, "~/") || strings.HasPrefix(dir, "~"+string(os.PathSeparator)) {
+		return filepath.Join(home, dir[2:])
 	}
 	return dir
 }
@@ -734,15 +750,23 @@ func (c *Controller) labelForList(o *model.Object) (primary string, secondary st
 	key := objKey(o)
 
 	selected := false
-	if c.pane().Bucket() != nil && (o.Ot == model.File || o.Ot == model.Folder) {
+	if c.canMark() && (o.Ot == model.File || o.Ot == model.Folder) {
 		selected = c.pane().IsSelected(key)
 	}
 
 	return listRow(o, selected, c.cols), key
 }
 
+// canMark reports whether the active pane holds markable entries: a prefix
+// inside a bucket, or a local directory. (Gating on the bucket alone made the
+// local pane — which has none — refuse every mark, so its advertised
+// "[Space] Mark" did nothing and a multi-file upload was impossible.)
+func (c *Controller) canMark() bool {
+	return c.pane().Bucket() != nil || c.localMode()
+}
+
 func (c *Controller) ToggleSelectCurrent() {
-	if c.pane().Bucket() == nil || c.view.List.GetItemCount() == 0 {
+	if !c.canMark() || c.view.List.GetItemCount() == 0 {
 		return
 	}
 
@@ -774,32 +798,48 @@ func (c *Controller) updateList() error {
 	c.refreshMu.Lock()
 	defer c.refreshMu.Unlock()
 
-	if c.localMode() {
+	// The pane is captured before the fetch and the result is stored in it,
+	// not in whichever pane is active when the fetch returns: after a Tab
+	// mid-listing, writing to c.pane() put one pane's objects in the other,
+	// where a delete or move resolved them against the wrong bucket.
+	pane := c.pane()
+
+	if pane.IsLocal() {
 		// A local listing is one ReadDir: no pagination, no cancellation to
 		// arrange, nothing to stream.
-		if err := c.makeLocalObjectMap(); err != nil {
+		if err := c.makeLocalObjectMap(pane); err != nil {
 			c.error("Cannot read the directory", err)
 			return err
 		}
-		c.pane().SetPartial(false)
-		c.renderList()
+		pane.SetPartial(false)
+		c.renderIfActive(pane)
 		return nil
 	}
 
 	ctx, gen := c.listing.begin()
 	defer c.listing.end(gen)
 
-	// The pane and title base are captured before the fetch: a Tab during a
-	// slow listing must not redirect the progress counter into the other pane.
+	// The title base is captured before the fetch too: a Tab during a slow
+	// listing must not redirect the progress counter into the other pane.
 	target, base := c.view.List, c.listTitleBase()
-	partial, err := c.makeObjectMap(ctx, c.listProgressReporter(target, base))
+	partial, err := c.makeObjectMap(ctx, pane, c.listProgressReporter(target, base))
 	if err != nil {
 		c.error("Failed to fetch folder", err)
 		return err
 	}
-	c.pane().SetPartial(partial)
-	c.renderList()
+	pane.SetPartial(partial)
+	c.renderIfActive(pane)
 	return nil
+}
+
+// renderIfActive renders pane's listing if it is still the one on screen.
+// renderList always draws the active pane; a pane that lost focus while its
+// listing ran is redrawn by the re-fetch swapAndFocus does when it regains it.
+func (c *Controller) renderIfActive(pane *session.Pane) {
+	if pane != c.pane() {
+		return
+	}
+	c.renderList()
 }
 
 // renderList repopulates the list widget from the in-memory object map,
@@ -1254,7 +1294,7 @@ func (c *Controller) ClearSelection() {
 // SelectAllVisible selects every file/folder currently shown — i.e. matching
 // the active filter, not the whole prefix — so "select all" respects a filter.
 func (c *Controller) SelectAllVisible() {
-	if c.pane().Bucket() == nil {
+	if !c.canMark() {
 		return
 	}
 	sk, sd := c.getSort()
@@ -1300,7 +1340,8 @@ func (c *Controller) currentObject() (string, *model.Object, bool) {
 }
 
 // Rename renames within the current folder. With two or more marked items it
-// opens the batch/pattern form; otherwise it renames the highlighted object.
+// opens the batch/pattern form; otherwise it renames the one marked item, or
+// the highlighted object when nothing is marked.
 func (c *Controller) Rename() {
 	if c.remoteOnly("Rename") {
 		return
@@ -1336,11 +1377,12 @@ func validateEntryName(name string) error {
 func (c *Controller) renameSingle() {
 	// lay is assigned below; every handler here runs after that.
 	var lay *shell.Layer
-	_, obj, ok := c.currentObject()
+	obj, ok := c.renameTarget()
 	if !ok {
 		return
 	}
 	isFolder := obj.Ot == model.Folder
+	oldMark := objKey(obj)
 	short := *obj.Key       // display name shown in the form
 	srcKey := *obj.FullPath // full key; already ends with "/" for folders
 
@@ -1362,7 +1404,8 @@ func (c *Controller) renameSingle() {
 			dstKey += "/"
 		}
 
-		bucket := c.pane().Bucket()
+		pane := c.pane()
+		bucket := pane.Bucket()
 		mdl := c.model
 		item := copyMoveItem{shortName: newName, srcKey: srcKey, isFolder: isFolder}
 		c.confirmOverwrites(mdl, bucket, "Rename",
@@ -1379,11 +1422,15 @@ func (c *Controller) renameSingle() {
 						return
 					}
 					c.setUndo(&undoOp{
-						items: invertOps([]transferPair{{srcBucket: bucket, dstBucket: bucket, srcKey: srcKey, dstKey: dstKey, isFolder: isFolder}}),
+						items: invertOps([]transferPair{{srcBucket: bucket, dstBucket: bucket, srcKey: srcKey, dstKey: dstKey, isFolder: isFolder, skip: skip}}),
 						desc:  "rename " + short,
+						mdl:   mdl,
 					})
 					c.logActivity("renamed %s → %s", short, newName)
-					c.pane().SetRestoreNext(dstKey) // unique objKey of the renamed item
+					// A mark on the old name would now point at nothing, and
+					// marks take priority over the cursor for every action.
+					pane.Unselect(oldMark)
+					pane.SetRestoreNext(dstKey) // unique objKey of the renamed item
 					c.updateList()
 					c.success("Renamed")
 				}()
@@ -1395,6 +1442,22 @@ func (c *Controller) renameSingle() {
 
 	form.SetInputCapture(escapeCloses(&lay))
 	lay = c.pushModal(form, 65, 9)
+}
+
+// renameTarget is the object a single rename acts on: the one marked item,
+// like every other action that prefers the marks, or the highlighted one when
+// nothing is marked. (It always took the cursor, so with one item marked a
+// rename hit a different object than a delete or a move would have.)
+func (c *Controller) renameTarget() (*model.Object, bool) {
+	if names := c.selectedNames(); len(names) == 1 {
+		o, ok := c.pane().Lookup(names[0])
+		if ok && (o.Ot == model.File || o.Ot == model.Folder) {
+			return o, true
+		}
+		return nil, false
+	}
+	_, o, ok := c.currentObject()
+	return o, ok
 }
 
 // renameItem is one object selected for batch rename.
@@ -1578,7 +1641,10 @@ func (c *Controller) runBatchRename(ops []renameOp, skip map[string]bool) {
 		})
 	lay = c.pushRaw(progress)
 
-	bucket := c.pane().Bucket()
+	// The pane is captured here, on the UI goroutine, for the same reason as
+	// the bucket: the worker below must not read c.active.
+	pane := c.pane()
+	bucket := pane.Bucket()
 	mdl := c.model
 	go func() {
 		// failures keep the item descriptor, so the report can re-run exactly
@@ -1617,11 +1683,11 @@ func (c *Controller) runBatchRename(ops []renameOp, skip map[string]bool) {
 				continue
 			}
 			okCount++
-			moved = append(moved, transferPair{srcBucket: bucket, dstBucket: bucket, srcKey: op.srcKey, dstKey: op.dstKey, isFolder: op.isFolder})
+			moved = append(moved, transferPair{srcBucket: bucket, dstBucket: bucket, srcKey: op.srcKey, dstKey: op.dstKey, isFolder: op.isFolder, skip: skip})
 		}
 
 		if len(moved) > 0 {
-			c.setUndo(&undoOp{items: invertOps(moved), desc: fmt.Sprintf("batch rename of %d item(s)", len(moved))})
+			c.setUndo(&undoOp{items: invertOps(moved), desc: fmt.Sprintf("batch rename of %d item(s)", len(moved)), mdl: mdl})
 			c.logActivity("batch renamed %d item(s)", len(moved))
 		}
 
@@ -1629,7 +1695,7 @@ func (c *Controller) runBatchRename(ops []renameOp, skip map[string]bool) {
 			c.updateList()
 			return
 		}
-		c.pane().ClearSelected()
+		pane.ClearSelected()
 
 		res := &opResult{name: "Rename", okCount: okCount, failures: failed}
 		c.reportOpResult(lay, progress, res, false, func(items []retryItem) {
@@ -1665,7 +1731,15 @@ type clipboard struct {
 	bucket *model.Object
 	prefix string // path the items were yanked from (same-destination guard)
 	scope  string // selection-scope key at yank time (marks cleared after a cut-paste)
-	items  []copyMoveItem
+	// pane is the pane the items were yanked in, whose marks a cut-paste
+	// clears. Captured at yank time: by the time the paste finishes, the
+	// active pane may be either one.
+	pane  *session.Pane
+	items []copyMoveItem
+	// gen identifies this fill of the clipboard, so a cut-paste that
+	// finishes in the background consumes its own cut and not one yanked
+	// while it ran.
+	gen uint64
 }
 
 // transferPair is one src→dst object move (used for undo bookkeeping).
@@ -1673,12 +1747,21 @@ type transferPair struct {
 	srcBucket, dstBucket *model.Object
 	srcKey, dstKey       string
 	isFolder             bool
+	// skip names destination keys this move leaves alone, in the same sense
+	// as MoveKeys' skip. For a recorded move it is the overwrite scan's
+	// answer; invertOps turns it into the undo's (see undoSkip).
+	skip map[string]bool
 }
 
 // undoOp is a one-step undo: reverse moves (already inverted) plus a label.
 type undoOp struct {
 	items []transferPair
 	desc  string
+	// mdl is the client the move ran through. A backgrounded move (or a
+	// folder rename, which has no modal at all) can finish after a profile
+	// switch; replaying its inverse through c.model would move same-named
+	// keys in the OTHER profile's buckets.
+	mdl *model.Model
 }
 
 // invertOps returns the reverse of each move (swap src/dst) so applying the
@@ -1690,7 +1773,36 @@ func invertOps(ops []transferPair) []transferPair {
 			srcBucket: o.dstBucket, dstBucket: o.srcBucket,
 			srcKey: o.dstKey, dstKey: o.srcKey,
 			isFolder: o.isFolder,
+			skip:     undoSkip(o),
 		}
+	}
+	return out
+}
+
+// undoSkip is the skip set that reverses a folder move without touching what
+// the move left alone. A destination key the user chose to keep was never
+// written, so its source is still in place and the destination still holds
+// what was there before. Reversing the folder wholesale would copy that
+// pre-existing object over the kept source and then delete it — both of the
+// user's "keep" answers undone destructively. Mapping each kept destination
+// key back to its source key and skipping it leaves both where they are.
+//
+// A file move whose destination was kept is never recorded at all (nothing
+// moved), so only folders need this.
+func undoSkip(o transferPair) map[string]bool {
+	if !o.isFolder || len(o.skip) == 0 {
+		return nil
+	}
+	src, dst := model.NormalizePrefix(o.srcKey), model.NormalizePrefix(o.dstKey)
+	var out map[string]bool
+	for k := range o.skip {
+		if !strings.HasPrefix(k, dst) {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]bool)
+		}
+		out[src+strings.TrimPrefix(k, dst)] = true
 	}
 	return out
 }
@@ -1705,6 +1817,16 @@ func (c *Controller) takeUndo() *undoOp {
 	c.undoMu.Lock()
 	defer c.undoMu.Unlock()
 	return c.lastUndo
+}
+
+// consumeUndo clears the undo entry if it is still op. A move that finished
+// while the undo ran has recorded a newer entry, which must survive.
+func (c *Controller) consumeUndo(op *undoOp) {
+	c.undoMu.Lock()
+	defer c.undoMu.Unlock()
+	if c.lastUndo == op {
+		c.lastUndo = nil
+	}
 }
 
 // copyOrMove copies (isMove=false) or moves (isMove=true) the marked items, or
@@ -1769,8 +1891,16 @@ func (c *Controller) copyOrMove(isMove bool) {
 		return
 	}
 
-	srcBucketName := *c.pane().Bucket().Key
-	srcPrefix := c.pane().Path()
+	// The source is captured here, on the UI goroutine, before the bucket
+	// listing below: the form appears only after a network round trip, and a
+	// Tab (or a Backspace) in that gap made the handler read the source
+	// bucket from whatever pane was then active — copying, and on a move
+	// deleting, same-named keys in the wrong bucket.
+	srcPane := c.pane()
+	srcBucket := srcPane.Bucket()
+	srcScope := srcPane.ScopeKey()
+	srcBucketName := *srcBucket.Key
+	srcPrefix := srcPane.Path()
 
 	// In dual-pane mode the destination defaults to the OTHER pane's location
 	// (the Midnight-Commander copy-to-other-panel workflow); otherwise it
@@ -1820,18 +1950,16 @@ func (c *Controller) copyOrMove(isMove bool) {
 					return
 				}
 
-				dstBucket := c.pane().Bucket()
+				dstBucket := srcBucket
 				if !sameBucket {
 					bn := dstBucketName
 					dstBucket = &model.Object{Key: &bn, Ot: model.Bucket}
 				}
-				srcBucket := c.pane().Bucket()
-				scope := c.pane().ScopeKey()
 				mdl := c.model
 				c.confirmOverwrites(mdl, dstBucket, title,
 					plannedCopyKeys(mdl, srcBucket, dstBucket, items, dstPrefix),
 					func(skip map[string]bool) {
-						c.runCopyOrMove(isMove, title, items, srcBucket, dstBucket, dstBucketName, dstPrefix, scope, nil, skip)
+						c.runCopyOrMove(isMove, title, items, srcBucket, dstBucket, dstBucketName, dstPrefix, srcPane, srcScope, nil, skip)
 					})
 			})
 			form.AddButton("Cancel", func() {
@@ -1848,7 +1976,12 @@ func (c *Controller) copyOrMove(isMove bool) {
 // failure ledger and the retry set — is ops.Copy, which knows nothing about
 // the terminal. What stays here is what is genuinely the controller's: the
 // one-step undo, the cut clipboard, and the marks in the source scope.
-func (c *Controller) runCopyOrMove(isMove bool, title string, items []copyMoveItem, srcBucket, dstBucket *model.Object, dstBucketName, dstPrefix, srcScope string, afterMove func(), skip map[string]bool) {
+//
+// srcPane is the pane the items were marked in, captured by the caller on the
+// UI goroutine. OnMoved runs on the operation's goroutine, where reading
+// c.active would race a Tab — and, after one, clear the marks in the wrong
+// pane.
+func (c *Controller) runCopyOrMove(isMove bool, title string, items []copyMoveItem, srcBucket, dstBucket *model.Object, dstBucketName, dstPrefix string, srcPane *session.Pane, srcScope string, afterMove func(), skip map[string]bool) {
 	// Runs on the UI goroutine: capture the client before spawning, so a
 	// profile switch can't retarget the transfer mid-run.
 	mdl := c.model
@@ -1869,6 +2002,7 @@ func (c *Controller) runCopyOrMove(isMove bool, title string, items []copyMoveIt
 			c.setUndo(&undoOp{
 				items: invertOps(opsToTransferPairs(moved)),
 				desc:  fmt.Sprintf("%s of %d item(s)", title, len(moved)),
+				mdl:   mdl,
 			})
 			// A cut clipboard is consumed only when something actually moved:
 			// a fully failed (or same-place) paste keeps the cut so it can be
@@ -1880,7 +2014,9 @@ func (c *Controller) runCopyOrMove(isMove bool, title string, items []copyMoveIt
 			// current scope: a paste finishes in the destination listing, and
 			// clearing there left phantom marks in the source folder that made
 			// later commands silently operate on nothing.
-			c.pane().ClearSelectedIn(srcScope)
+			if srcPane != nil {
+				srcPane.ClearSelectedIn(srcScope)
+			}
 		}
 	}
 	c.runner().Start(op)
@@ -1904,6 +2040,7 @@ func opsToTransferPairs(moved []ops.Transfer) []transferPair {
 		out = append(out, transferPair{
 			srcBucket: m.SrcBucket, dstBucket: m.DstBucket,
 			srcKey: m.SrcKey, dstKey: m.DstKey, isFolder: m.IsFolder,
+			skip: m.Skip,
 		})
 	}
 	return out
@@ -1952,7 +2089,8 @@ func (c *Controller) yank(op string) {
 	if len(items) == 0 {
 		return
 	}
-	c.clip = clipboard{op: op, bucket: c.pane().Bucket(), prefix: c.pane().Path(), scope: c.pane().ScopeKey(), items: items}
+	c.clipGen++
+	c.clip = clipboard{op: op, bucket: c.pane().Bucket(), prefix: c.pane().Path(), scope: c.pane().ScopeKey(), pane: c.pane(), items: items, gen: c.clipGen}
 	verb := "Copied"
 	if op == "cut" {
 		verb = "Cut"
@@ -1984,6 +2122,8 @@ func (c *Controller) paste() {
 	dstBucket := c.pane().Bucket()
 	dstPrefix := c.pane().Path()
 	scope := c.clip.scope
+	srcPane := c.clip.pane
+	gen := c.clip.gen
 	mdl := c.model
 	c.confirmOverwrites(mdl, dstBucket, "Paste",
 		plannedCopyKeys(mdl, srcBucket, dstBucket, items, dstPrefix),
@@ -1991,7 +2131,11 @@ func (c *Controller) paste() {
 			// The cut is consumed by the runner once something actually moved,
 			// so a failed or canceled paste keeps the clipboard for a retry.
 			c.runCopyOrMove(isMove, "Paste", items, srcBucket, dstBucket, dstBucketName, dstPrefix,
-				scope, func() { c.clip = clipboard{} }, skip)
+				srcPane, scope, func() {
+					if c.clip.gen == gen {
+						c.clip = clipboard{}
+					}
+				}, skip)
 		})
 }
 
@@ -2010,6 +2154,10 @@ func (c *Controller) Undo() {
 		c.success("Nothing to undo")
 		return
 	}
+	if op.mdl != c.model {
+		c.success("Nothing to undo in this profile")
+		return
+	}
 	confirm := c.view.NewConfirm()
 	confirm.SetText(fmt.Sprintf("Undo %s?", op.desc)).
 		SetDoneFunc(func(_ int, label string) {
@@ -2026,7 +2174,7 @@ func (c *Controller) Undo() {
 func (c *Controller) runUndo(op *undoOp) {
 	// lay is assigned below; every handler here runs after that.
 	var lay *shell.Layer
-	mdl := c.model
+	mdl := op.mdl
 	ctx, cancel := context.WithCancel(context.Background())
 	progress := tview.NewModal().
 		SetText("Undoing...\n").
@@ -2053,17 +2201,23 @@ func (c *Controller) runUndo(op *undoOp) {
 				progress.SetText(fmt.Sprintf("Undoing %d/%d\n%s", n, len(op.items), line))
 			})
 			// No overwrite prompt here: undo has its own confirmation and puts
-			// objects back where they were moments ago.
-			if _, err := mdl.MoveKeys(ctx, it.srcBucket, it.dstBucket, it.srcKey, it.dstKey, it.isFolder, nil, nil); err != nil {
+			// objects back where they were moments ago. it.skip holds what the
+			// original move left alone, which must stay where it is.
+			if _, err := mdl.MoveKeys(ctx, it.srcBucket, it.dstBucket, it.srcKey, it.dstKey, it.isFolder, it.skip, nil); err != nil {
 				failed = append(failed, fmt.Sprintf("%s: %v", it.srcKey, err))
 				continue
 			}
 			okCount++
 		}
-		c.setUndo(nil) // one-step undo, now consumed
+		c.consumeUndo(op) // one-step undo, now consumed
 		c.logActivity("undo %s: %d ok, %d failed", op.desc, okCount, len(failed))
 
 		c.shell.Do(func() {
+			// Cancel closed the modal; focusing it now would strand the
+			// keyboard on a widget that is no longer on screen.
+			if !lay.IsOpen() {
+				return
+			}
 			status := "Undo complete."
 			if len(failed) > 0 {
 				status = "Undo finished with errors."
@@ -2456,7 +2610,14 @@ func (c *Controller) listInputCapture(event *tcell.EventKey) *tcell.EventKey {
 	// A leader press arms the second namespace; the next key resolves there.
 	if c.leaderArmed {
 		c.leaderArmed = false
-		c.view.SetStatus("")
+		// Put back what the status ticker last published (the transfer badge
+		// or a notice): clearing it hid the badge until the queue's status
+		// next changed, which for a byte-less transfer could be never.
+		status := ""
+		if c.queue != nil {
+			status = c.queue.Status()
+		}
+		c.view.SetStatus(status)
 		if id, ok := c.keys.lookupLeader(event); ok {
 			if run, ok := table[id]; ok {
 				run()
@@ -2505,8 +2666,9 @@ func (c *Controller) leaderHint() string {
 	return " " + strings.Join(chords, " · ") + " "
 }
 
-// swapPane snapshots the active pane into panes[active], loads the other pane,
-// and repoints the active-widget pointers. It performs no rendering.
+// swapPane makes the other pane the addressed one and repoints the
+// active-widget pointers (List, Filter, Header) at its widgets. Both panes
+// already live in c.panes, so nothing is copied. It performs no rendering.
 func (c *Controller) swapPane() {
 	// Swapping is now just a change of which pane is addressed: there is no
 	// twelve-field copy to race a navigation goroutine writing the same
@@ -2915,9 +3077,10 @@ func (c *Controller) Upload(localPath string) {
 		return
 	}
 	// Capture the destination now, on the UI goroutine. The byte phase starts
-	// only after a jobSem slot frees, which can be minutes later — reading
-	// c.pane().Bucket() then would panic on the buckets screen, or silently
-	// upload into whatever bucket the user happens to be viewing.
+	// only after a transfer slot frees (the jobs.Queue gate, taken through
+	// ops.Reserve), which can be minutes later — reading c.pane().Bucket()
+	// then would panic on the buckets screen, or silently upload into
+	// whatever bucket the user happens to be viewing.
 	dstBucket := c.pane().Bucket()
 	dstPath := c.pane().Path()
 	// The client too: a profile switch while this job is queued must not
@@ -2925,14 +3088,12 @@ func (c *Controller) Upload(localPath string) {
 	mdl := c.model
 
 	files, _, err := mdl.PrepareUpload(localPath, dstPath, dstBucket)
-	if err == nil && len(files) == 0 {
-		// A directory with no files is still uploadable: Upload creates its
-		// folder-marker object. Only a non-directory with nothing to send is
-		// an error.
-		if fi, statErr := os.Stat(localPath); statErr == nil && fi.IsDir() {
-			c.uploadEmptyDir(localPath, dstPath, dstBucket)
-			return
-		}
+	if err == nil && len(files) > 0 && len(overwriteCandidates(files)) == 0 {
+		// A directory with no files is still uploadable: its targets are
+		// folder markers only. There are no bytes to meter, so it skips the
+		// progress modal.
+		c.uploadEmptyDir(localPath, dstPath, dstBucket)
+		return
 	}
 	if err != nil || len(files) == 0 {
 		if err == nil {
@@ -2944,13 +3105,7 @@ func (c *Controller) Upload(localPath string) {
 
 	// PrepareUpload already knows every key this would write, so the overwrite
 	// scan needs no extra listing of the source.
-	plan := func() ([]string, error) {
-		keys := make([]string, 0, len(files))
-		for _, f := range files {
-			keys = append(keys, f.RemotePath)
-		}
-		return keys, nil
-	}
+	plan := func() ([]string, error) { return overwriteCandidates(files), nil }
 	c.confirmOverwrites(mdl, dstBucket, "Upload", plan, func(skip map[string]bool) {
 		kept, keptSize := unskippedUploads(files, skip)
 		if len(kept) == 0 {
@@ -2959,6 +3114,20 @@ func (c *Controller) Upload(localPath string) {
 		}
 		c.runUpload(mdl, localPath, dstPath, dstBucket, kept, keptSize, skip)
 	})
+}
+
+// overwriteCandidates is an upload's plan for the overwrite scan: the keys of
+// the files it writes. Folder markers are left out — a zero-byte marker
+// replaces no content, and probing a "/" key reports everything already
+// under that folder as something it would overwrite.
+func overwriteCandidates(files []model.UploadTarget) []string {
+	keys := make([]string, 0, len(files))
+	for _, f := range files {
+		if !strings.HasSuffix(f.RemotePath, "/") {
+			keys = append(keys, f.RemotePath)
+		}
+	}
+	return keys
 }
 
 // unskippedUploads drops the targets the user chose to keep and re-totals the
@@ -2985,7 +3154,7 @@ func unskippedUploads(files []model.UploadTarget, skip map[string]bool) ([]model
 
 // runUpload hands the approved files to the shared runner as an ops.Upload.
 // Everything that used to be open-coded here — the job, the Background/Cancel
-// modal, the throttle, the summary — now lives once in pkg/ui/flows.
+// modal, the throttle, the summary — now lives once in internal/ui/flows.
 func (c *Controller) runUpload(mdl *model.Model, localPath, dstPath string, dstBucket *model.Object, files []model.UploadTarget, totalSize int64, skip map[string]bool) {
 	c.runner().Start(&ops.Upload{
 		LocalPath:  localPath,
@@ -3000,7 +3169,7 @@ func (c *Controller) runUpload(mdl *model.Model, localPath, dstPath string, dstB
 }
 
 // uploadEmptyDir uploads a directory that contains no files: Upload creates
-// its folder-marker object. There are no bytes to meter, so this skips the
+// its folder-marker objects. There are no bytes to meter, so this skips the
 // progress modal and the transfer queue entirely.
 func (c *Controller) uploadEmptyDir(localPath, dstPath string, dstBucket *model.Object) {
 	mdl := c.model
@@ -3484,6 +3653,13 @@ func (c *Controller) jumpTo(bucketName, prefix, selectKey string) {
 		bucket := c.findBucketByName(context.Background(), bucketName)
 		if bucket == nil {
 			c.error("Jump", fmt.Errorf("bucket %q not found", bucketName))
+			// The pane stays where it was, but it still has to be listed:
+			// opening a profile skips its own listing in favour of this jump,
+			// so a remembered bucket that has since gone left the PROFILE
+			// rows on screen — and Enter on one opened that profile.
+			if pane == c.pane() {
+				c.updateList()
+			}
 			return
 		}
 		if err := c.model.RefreshClient(&bucketName); err != nil {

@@ -12,7 +12,7 @@ import (
 // changing, and a test fake is a dozen lines rather than a mock of sixty
 // methods.
 
-// Fetcher downloads one object to its place under destDir and reports the bytes
+// Fetcher downloads one object to its place under destPath and reports the bytes
 // written. It is model.Model.DownloadTarget.
 type Fetcher interface {
 	DownloadTarget(
@@ -25,15 +25,19 @@ type Fetcher interface {
 	) (int64, error)
 }
 
-// Pusher uploads a local tree and reports progress per file. It is
-// model.Model.Upload.
+// Pusher uploads exactly the given targets — local path to remote key, already
+// resolved — and reports progress as it goes. It is model.Model.UploadTargets.
+//
+// It deliberately takes no directory to walk: what the user confirmed is the
+// target list, so that is what is sent. A port that walked a root of its own
+// is how the local pane's upload of one marked file sent the whole directory
+// it sat in.
 type Pusher interface {
-	Upload(
+	UploadTargets(
 		ctx context.Context,
-		localPath, s3Prefix string,
 		bucket *model.Object,
-		skip map[string]bool,
-		progress func(current, total int64, i, count int, local, remote string),
+		targets []model.UploadTarget,
+		progress func(current, total int64, done, count int, local, remote string),
 	) error
 }
 

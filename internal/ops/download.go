@@ -80,7 +80,11 @@ func (d *Download) Run(ctx context.Context, rep Reporter) Result {
 	led := &ledger{}
 
 	todo, ok := d.plan(ctx, rep, led)
-	if !ok {
+	if !ok || len(todo) == 0 {
+		// Nothing survived phase 1 (all skipped, or only directory markers):
+		// there are no bytes to move, so there is no reason to queue for a
+		// transfer slot — and a cancel while queued would report a download
+		// that had nothing left to do as cancelled.
 		return d.finish(led)
 	}
 

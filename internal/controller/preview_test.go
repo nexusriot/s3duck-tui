@@ -2,6 +2,7 @@ package controller
 
 import (
 	"errors"
+	"github.com/rivo/tview"
 	"strings"
 	"testing"
 )
@@ -36,10 +37,15 @@ func TestHexdumpLayout(t *testing.T) {
 }
 
 func TestEscapeForTextView(t *testing.T) {
-	// A log line containing a colour tag must survive verbatim, not be eaten
-	// as markup by the viewer.
-	if got := escapeForTextView("level=[red] msg"); got != "level=[[red] msg" {
-		t.Errorf("escapeForTextView = %q", got)
+	// Text containing tag-like brackets must render verbatim, not be eaten as
+	// markup — asserted through a real TextView, because a string transform
+	// can look right and still render wrong (doubling "[" did exactly that).
+	for _, in := range []string{"level=[red] msg", "[default]", "[1, 2, 3]", "a[b]c[]", "|ab[red]cd|"} {
+		tv := tview.NewTextView().SetDynamicColors(true)
+		tv.SetText(escapeForTextView(in))
+		if got := strings.TrimRight(tv.GetText(true), "\n"); got != in {
+			t.Errorf("%q renders as %q", in, got)
+		}
 	}
 }
 
@@ -134,8 +140,11 @@ func TestUnifiedDiff(t *testing.T) {
 	}
 
 	// Tags inside content must be escaped, or the viewer would eat them.
-	if got := diff("[red]\n", "[blue]\n", "v1", "current"); !strings.Contains(got, "[[red]") {
-		t.Errorf("content tags not escaped: %q", got)
+	got = diff("[red]\n", "[blue]\n", "v1", "current")
+	tv := tview.NewTextView().SetDynamicColors(true)
+	tv.SetText(got)
+	if shown := tv.GetText(true); !strings.Contains(shown, "- [red]") || !strings.Contains(shown, "+ [blue]") {
+		t.Errorf("content tags not escaped: %q renders as %q", got, shown)
 	}
 }
 

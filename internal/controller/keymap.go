@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/gdamore/tcell/v2"
 )
@@ -138,10 +139,11 @@ func defaultBindings() []defaultBinding {
 		{actHotkeys, "Ctrl+H", false, "this panel"},
 		{actAbout, "Ctrl+A", false, "about"},
 		{actQuit, "Ctrl+Q", false, "quit"},
+		// Trash restore is a direct key, listed next to its leader sibling.
+		{actTrashRestore, "R", false, "restore from the trash"},
 
 		// Behind the leader: everything that arrived after the direct keys ran
 		// out, plus the actions that were already palette-only.
-		{actTrashRestore, "R", false, "restore from the trash"},
 		{actTrashEmpty, "t", true, "empty the trash"},
 		{actActivityLog, "a", true, "activity log"},
 		{actBucketConfig, "b", true, "bucket configuration"},
@@ -180,6 +182,9 @@ type keymap struct {
 type keyHelp struct {
 	Chord string
 	Help  string
+	// slot is the namespace-qualified canonical chord, so a binding that
+	// takes a chord over can drop the help line of the action that lost it.
+	slot string
 }
 
 // keysFileName is the override file, alongside the profile config.
@@ -295,6 +300,16 @@ func loadKeymap(path string) keymap {
 				km.warnings = append(km.warnings, fmt.Sprintf("%s = %q: %v", name, chord, err))
 				continue
 			}
+			// A chord another action already holds is taken over — that is
+			// what rebinding means — but never silently: the other action
+			// loses its key.
+			ns := km.direct
+			if leader {
+				ns = km.leader
+			}
+			if prev, taken := ns[normalizeChord(chord)]; taken && prev != id {
+				km.warnings = append(km.warnings, fmt.Sprintf("%s = %q takes that key from %s", name, chord, prev))
+			}
 			km.bind(leader, chord, id, helpFor[id])
 		}
 	}
@@ -307,13 +322,26 @@ func loadKeymap(path string) keymap {
 // bind records one chord→action mapping and its help line.
 func (k *keymap) bind(leader bool, chord string, id actionID, help string) {
 	c := normalizeChord(chord)
+	slot := "d:" + c
+	if leader {
+		slot = "l:" + c
+	}
+	// The chord now belongs to id alone; a help line still advertising it for
+	// the previous holder would describe a key that no longer does that.
+	kept := k.help[:0]
+	for _, h := range k.help {
+		if h.slot != slot {
+			kept = append(kept, h)
+		}
+	}
+	k.help = kept
 	if leader {
 		k.leader[c] = id
-		k.help = append(k.help, keyHelp{Chord: k.leaderSpec + " " + chord, Help: help})
+		k.help = append(k.help, keyHelp{Chord: k.leaderSpec + " " + chord, Help: help, slot: slot})
 		return
 	}
 	k.direct[c] = id
-	k.help = append(k.help, keyHelp{Chord: chord, Help: help})
+	k.help = append(k.help, keyHelp{Chord: chord, Help: help, slot: slot})
 }
 
 // lookup resolves a key event in the direct namespace.
@@ -405,9 +433,21 @@ done:
 		return parsedChord{}, fmt.Errorf("modifier with no key")
 	}
 	if strings.EqualFold(s, "space") {
+		// Ctrl+Space arrives as its own key (KeyCtrlSpace) and Shift+Space as
+		// a plain space, so neither spelling could ever match what it says.
+		if mods&(tcell.ModCtrl|tcell.ModShift) != 0 {
+			return parsedChord{}, fmt.Errorf("Ctrl+/Shift+ cannot be combined with Space (only Alt+ can)")
+		}
 		return parsedChord{key: tcell.KeyRune, ch: ' ', mods: mods}, nil
 	}
 	if k, ok := namedKeys[strings.ToLower(s)]; ok && k != tcell.KeyRune {
+		// Only Alt survives into the canonical form of a named key (see
+		// chordKey), so Ctrl+ or Shift+ on one used to be dropped silently:
+		// "Ctrl+Down" bound plain Down and took the cursor key away. Refused
+		// instead, which leaves that action's default in place.
+		if mods&(tcell.ModCtrl|tcell.ModShift) != 0 {
+			return parsedChord{}, fmt.Errorf("Ctrl+/Shift+ cannot be combined with a key name (only Alt+ can)")
+		}
 		return parsedChord{key: k, mods: mods}, nil
 	}
 	runes := []rune(s)
@@ -422,7 +462,19 @@ done:
 		if err != nil {
 			return parsedChord{}, err
 		}
-		return parsedChord{key: k, mods: tcell.ModCtrl}, nil
+		// Alt is kept: dropping it made "Ctrl+Alt+D" bind plain Ctrl+D,
+		// stealing the download key while the real chord did nothing.
+		return parsedChord{key: k, mods: mods &^ tcell.ModShift}, nil
+	}
+	if mods&tcell.ModShift != 0 {
+		// Shift is carried by the rune itself ("S", not "s"). "Shift+s" used
+		// to bind lowercase s; it now means S, and anything without an
+		// upper case of its own is refused rather than guessed at.
+		up := unicode.ToUpper(r)
+		if up == r {
+			return parsedChord{}, fmt.Errorf("write the shifted character itself, not Shift+%c", r)
+		}
+		r, mods = up, mods&^tcell.ModShift
 	}
 	return parsedChord{key: tcell.KeyRune, ch: r, mods: mods}, nil
 }

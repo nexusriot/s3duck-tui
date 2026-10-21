@@ -604,8 +604,39 @@ func TestInvertOps(t *testing.T) {
 	}
 	// invert twice is identity.
 	back := invertOps(inv)
-	if back[0] != fwd[0] || back[1] != fwd[1] {
+	same := func(a, b transferPair) bool {
+		return a.srcBucket == b.srcBucket && a.dstBucket == b.dstBucket &&
+			a.srcKey == b.srcKey && a.dstKey == b.dstKey && a.isFolder == b.isFolder
+	}
+	if !same(back[0], fwd[0]) || !same(back[1], fwd[1]) {
 		t.Errorf("double invert not identity: %+v", back)
+	}
+}
+
+// TestUndoSkipLeavesKeptObjectsAlone pins the undo of a move that skipped some
+// destinations. The kept destination still holds what was there before and its
+// source never moved, so the undo must skip the source key: reversing the
+// folder wholesale copied the pre-existing destination object over the kept
+// source and then deleted it.
+func TestUndoSkipLeavesKeptObjectsAlone(t *testing.T) {
+	b := &model.Object{Key: strptr("b"), Ot: model.Bucket}
+	fwd := []transferPair{{
+		srcBucket: b, dstBucket: b,
+		srcKey: "from/d/", dstKey: "to/d/", isFolder: true,
+		// The run's whole skip set: one key under this folder, one belonging
+		// to another item of the same run.
+		skip: map[string]bool{"to/d/x.txt": true, "to/other.txt": true},
+	}}
+	inv := invertOps(fwd)
+	if got := inv[0].skip; len(got) != 1 || !got["from/d/x.txt"] {
+		t.Errorf("undo skip = %v, want exactly from/d/x.txt", got)
+	}
+
+	// A file pair carries no undo skip: a kept file is never recorded.
+	file := invertOps([]transferPair{{srcBucket: b, dstBucket: b, srcKey: "a", dstKey: "b",
+		skip: map[string]bool{"b": true}}})
+	if file[0].skip != nil {
+		t.Errorf("file undo skip = %v, want nil", file[0].skip)
 	}
 }
 

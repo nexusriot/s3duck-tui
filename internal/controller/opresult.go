@@ -144,10 +144,19 @@ func (r *opResult) writeFailureReport(dir string, now time.Time) (string, error)
 // retry may be nil for flows where re-running a single unit makes no sense.
 //
 // Called from a transfer goroutine, so all widget work goes through the UI
-// queue; the buttons' handlers then run on the UI goroutine, which is why the
-// retry callback is invoked in a goroutine of its own.
+// queue. The buttons' handlers then run on the UI goroutine, and so does the
+// retry callback: every retry builds its progress modal and reads the active
+// pane before spawning its own worker, and doing that from a goroutine of its
+// own raced tview (which has no locking) and c.active.
 func (c *Controller) reportOpResult(lay *shell.Layer, progress *tview.Modal, res *opResult, canceled bool, retry func([]retryItem)) {
 	c.shell.Do(func() {
+		// A Cancel (or Esc) that landed during the last item already closed
+		// the modal. Rebuilding and focusing it then put focus on a widget no
+		// longer on screen, and tview delivered no key to anything after
+		// that — only Ctrl+Q still worked.
+		if !lay.IsOpen() {
+			return
+		}
 		buttons := []string{"Done"}
 		if res.failed() > 0 {
 			if retry != nil {
@@ -162,8 +171,7 @@ func (c *Controller) reportOpResult(lay *shell.Layer, progress *tview.Modal, res
 			switch {
 			case strings.HasPrefix(label, "Retry failed"):
 				lay.Close()
-				items := res.retryItems()
-				go retry(items)
+				retry(res.retryItems())
 			case label == "Export list":
 				dir := c.resolveDownloadDir()
 				path, err := res.writeFailureReport(dir, time.Now())

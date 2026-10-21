@@ -160,8 +160,15 @@ func (s *Sync) runPhase(ctx context.Context, rep Reporter, led *ledger, tracker 
 
 			tracker.finish(it.Index)
 			if err != nil {
-				led.fail(it.Unit.Label, err)
 				tracker.done(0)
+				if ctx.Err() != nil {
+					// A cancel, not a failure: apply marks the run cancelled.
+					// Ledgering the in-flight units as failed offered a "Retry
+					// failed" covering only them, silently dropping every unit
+					// never dispatched and every delete.
+					return
+				}
+				led.fail(it.Unit.Label, err)
 				return
 			}
 			led.ok(it.Unit.Bytes, false)

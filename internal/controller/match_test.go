@@ -169,3 +169,13 @@ func TestFilterSortObjectsHonoursGlob(t *testing.T) {
 		t.Errorf("broken filter kept %d objects, want 0", n)
 	}
 }
+
+// A literal "*" in the key must not make the wildcard match as a plain
+// character.
+func TestGlobMatchStarAgainstALiteralStar(t *testing.T) {
+	for _, c := range [][2]string{{"*", "*abc"}, {"a*", "a*b"}, {"*.log", "*x.log"}} {
+		if !globMatch(c[0], c[1]) {
+			t.Errorf("globMatch(%q, %q) = false, want true", c[0], c[1])
+		}
+	}
+}

@@ -171,3 +171,13 @@ func TestTrashKeyMapping(t *testing.T) {
 		t.Error("isTrashed misclassified a key")
 	}
 }
+
+// A key with a leading slash is a different key from the one without; the trash
+// round trip must keep it.
+func TestTrashRoundTripKeepsALeadingSlash(t *testing.T) {
+	trash := ".s3duck-trash/"
+	key := trashKeyFor(trash, "20260902-181500", "/abs/file")
+	if got := restoreKeyFrom(trash, key); got != "/abs/file" {
+		t.Errorf("restoreKeyFrom(%q) = %q, want /abs/file", key, got)
+	}
+}

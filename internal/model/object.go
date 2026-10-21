@@ -19,7 +19,19 @@ type ObjectMeta struct {
 	CacheControl       string
 	ContentDisposition string
 	ContentEncoding    string
-	StorageClass       string
+	// ContentLanguage, Expires and WebsiteRedirectLocation are not editable
+	// here, but a replace-copy discards every header it does not send, so
+	// they are carried so a metadata save (or any multipart copy) keeps them.
+	ContentLanguage         string
+	Expires                 *time.Time
+	WebsiteRedirectLocation string
+	StorageClass            string
+	// SSE / SSEKMSKeyID are the source's encryption, as HEAD reports it. A
+	// copy without encryption headers takes the destination bucket's default,
+	// so a rewrite in place re-encrypted an SSE-KMS object under whatever the
+	// bucket says unless these are sent back (see Model.copyEncryption).
+	SSE         string
+	SSEKMSKeyID string
 	// UserMetadata holds the x-amz-meta-* pairs with the prefix stripped; the
 	// SDK adds and removes it, so keys here are the bare names.
 	UserMetadata map[string]string
@@ -154,16 +166,21 @@ func (m *Model) HeadObject(ctx context.Context, bucket *Object, key string) (Obj
 // metaFromHead lifts a HeadObject response into an ObjectMeta.
 func metaFromHead(out *s3.HeadObjectOutput) ObjectMeta {
 	meta := ObjectMeta{
-		ContentType:        aws.ToString(out.ContentType),
-		CacheControl:       aws.ToString(out.CacheControl),
-		ContentDisposition: aws.ToString(out.ContentDisposition),
-		ContentEncoding:    aws.ToString(out.ContentEncoding),
-		StorageClass:       string(out.StorageClass),
-		UserMetadata:       map[string]string{},
-		Size:               out.ContentLength,
-		ETag:               strings.Trim(aws.ToString(out.ETag), `"`),
-		LastModified:       out.LastModified,
-		Restore:            aws.ToString(out.Restore),
+		ContentType:             aws.ToString(out.ContentType),
+		CacheControl:            aws.ToString(out.CacheControl),
+		ContentDisposition:      aws.ToString(out.ContentDisposition),
+		ContentEncoding:         aws.ToString(out.ContentEncoding),
+		ContentLanguage:         aws.ToString(out.ContentLanguage),
+		Expires:                 out.Expires,
+		WebsiteRedirectLocation: aws.ToString(out.WebsiteRedirectLocation),
+		StorageClass:            string(out.StorageClass),
+		SSE:                     string(out.ServerSideEncryption),
+		SSEKMSKeyID:             aws.ToString(out.SSEKMSKeyId),
+		UserMetadata:            map[string]string{},
+		Size:                    out.ContentLength,
+		ETag:                    strings.Trim(aws.ToString(out.ETag), `"`),
+		LastModified:            out.LastModified,
+		Restore:                 aws.ToString(out.Restore),
 	}
 	for k, v := range out.Metadata {
 		meta.UserMetadata[k] = v

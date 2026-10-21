@@ -51,7 +51,8 @@ DESIGN.md, and the new limitations they carry are in its table.
 - **Trash / safe delete** — delete becomes a move under `.s3duck-trash/<ts>/`,
   with restore (`R`) and an explicit empty.
 - **Glob / regex queries** — one matcher for the filter, the recursive search
-  and sync's new **exclude list** (which also closes the sync-globs item below).
+  and sync's new **exclude list** (which also closed the roadmap's old
+  sync-globs item).
 
 ## Next
 
@@ -69,20 +70,24 @@ DESIGN.md, and the new limitations they carry are in its table.
 - **Enable bucket versioning from the dashboard** `[S]` — the bucket dashboard reports
   versioning read-only and the version browser requires it; the app should be able to
   turn it on (`PutBucketVersioning`).
-- **Show deleted objects + undelete** `[M]` — `ListObjectsV2` hides delete-marked keys,
-  so nothing can be undeleted unless you already know the key. A "show deleted" listing
-  toggle plus a remove-the-marker action closes the loop the version browser opened.
+- **Show deleted objects** `[M]` — undelete itself exists: `d` on a delete marker in the
+  version browser removes it, and the version underneath becomes current again. What is
+  missing is reaching a deleted key: `ListObjectsV2` hides it, and the version browser
+  opens only on a listed object. A "show deleted" listing toggle (keys whose latest
+  version is a marker) closes the loop the version browser opened.
 - **Deep duplicate scan** `[M]` — the finder groups by (size, ETag), which cannot see
-  two identical files uploaded with different part sizes. With `ObjectChecksum` in
-  place, a second pass over same-size groups that differ only by ETag would close
-  that documented blind spot; the cost is one request per candidate, so it wants to
-  be opt-in the way sync's checksum mode is.
+  two identical files uploaded with different part sizes. `ObjectChecksum` alone does
+  not close that blind spot: a multipart object's stored checksum is a
+  checksum-of-parts, which depends on the part size just as the ETag does. It wants
+  part-aware checksums (or a streamed hash of the candidates), one request or more per
+  candidate, so it should be opt-in the way sync's checksum mode is.
 
 ## Soon
 
 - **Batch dedupe** `[S–M]` — the duplicate finder (`D`, v0.6.0) deletes one copy at a
-  time; a "keep the oldest, delete the rest" action per group (and one for all groups,
-  with a totals confirm like the delete flow's) is its natural completion.
+  time (through the trash on a safe-delete profile); a "keep the oldest, delete the
+  rest" action per group (and one for all groups, with a totals confirm like the
+  delete flow's) is its natural completion.
   `findDuplicates` already orders members keeper-first, so the plan is `Members[1:]`.
 - **Duplicate scan across all buckets** `[S]` — same checkbox the recursive search
   already has; stale cross-bucket copies (migrations, abandoned backups) are the
@@ -133,7 +138,8 @@ DESIGN.md, and the new limitations they carry are in its table.
 
 ## Hardening (verified, not yet fixed)
 
-From the 2026-08 functional reviews; the fixed ones are listed in DESIGN.md's history.
+From the 2026-08 functional reviews and the 2026-10 review; the fixed ones are
+listed in DESIGN.md's history.
 
 - ~~**Navigation race, dual-pane variant**~~ — **fixed.** Pane state moved into
   `session.Pane`; the controller addresses `panes[active]` instead of mirroring the
@@ -143,7 +149,11 @@ From the 2026-08 functional reviews; the fixed ones are listed in DESIGN.md's hi
   `m.Client`/`m.Downloader` in place, so a running transfer *on the same profile* can
   see the region swap under it (cross-profile retargeting is fixed — clients are
   captured at entry — this is the same-profile variant). Wants navigation to build a
-  new Model instead of mutating the shared one.
+  new Model instead of mutating the shared one. It also runs on every bucket entry
+  whatever the endpoint: it overwrites `m.Cf.Region` (which `CreateBucket` then uses,
+  below), a backend without `GetBucketLocation` shows "Failed to resolve bucket region"
+  on each entry, and for an `amazonaws.com` URL the rebuilt client uses the SDK's
+  regional endpoint instead of `base_url`.
 - **Download throttle is bursty** — throttling sleeps after each 5 MiB buffer flush, so
   at low caps the socket sits idle for tens of seconds between full-speed bursts (long
   enough for some proxies to drop the connection; SDK chunk retries then double-count
@@ -158,13 +168,18 @@ From the 2026-08 functional reviews; the fixed ones are listed in DESIGN.md's hi
 - **Upload direction ignores the destination fields** — in the sync form the dest
   bucket/prefix apply only to remote → remote (labels say so; the mandatory preview
   shows the real destination). Consider greying the rows out per direction instead.
-- **Profile edit can still create a duplicate name** `[S]` — creation and copy now
-  reject duplicates; renaming an existing profile onto another's name does not.
+- ~~**Profile edit can still create a duplicate name**~~ — **fixed** (0.10.2). The
+  edit form now refuses a rename onto another profile's name, as creation and copy
+  already did.
 - **Undo doesn't check its destination** `[S]` — every other remote write now
   confirms before replacing an existing object (0.8.0); undo goes straight
   through on the grounds that it has its own confirmation and restores objects
   to where they were moments ago. If something took that key meanwhile, it is
-  overwritten silently.
+  overwritten silently. What the move itself left alone is safe now: an undo
+  carries the move's skip set, so objects kept by "Skip existing" stay put
+  (an undo used to copy the kept destination over the untouched source and
+  then delete it), and an undo replays only through the profile it was
+  recorded in.
 - **Same-named items from different folders collide on copy** `[S]` — copying
   `a/report.txt` and `b/report.txt` into one destination writes both to the
   same key, so only the last survives, and the overwrite scan cannot see it
@@ -175,3 +190,89 @@ From the 2026-08 functional reviews; the fixed ones are listed in DESIGN.md's hi
   dry-run plan already lists every update before anything moves, so a second
   confirmation would be redundant. Revisit only if the plan stops being
   mandatory.
+
+Found in the 2026-10 review:
+
+- **Folder undo also moves the destination's other objects** `[M]` — undoing a
+  folder move into a folder that already held other, non-conflicting objects moves
+  those into the source folder too: the undo is per folder, not per object. Nothing
+  is lost (their source-side keys never existed), but it is wrong. Wants `MoveKeys`
+  to report the exact keys it wrote, so the undo can replay just those.
+- **Server-side copies reset the storage class** `[S]` — a copy writes STANDARD
+  unless a class is asked for (S3 copy semantics), so a STANDARD_IA or
+  INTELLIGENT_TIERING object comes back STANDARD after a rename or a trash and
+  restore. GLACIER / DEEP_ARCHIVE objects cannot be trashed or moved until restored
+  (`InvalidObjectState`).
+- **Multipart copies carry no additional checksum** — `UploadPartCopy` cannot send a
+  part checksum, so a copy above 5 GiB is written without the profile's
+  `checksum_algo` (single-request copies do send it). The only fix in reach is
+  streaming the bytes through the client, which is what a server-side copy is for
+  avoiding.
+- **Download verification runs after the rename** `[S]` — on a mismatch with
+  Overwrite chosen, the previous file is already replaced and the corrupt one sits
+  at the target name. Wants the check on the temp file, before the rename.
+- **Download sync and non-canonical keys** `[M]` — a remote `a//b.txt` is planned as
+  create `a//b.txt` plus delete `a/b.txt`, which are the same local file, so the
+  fresh download is deleted again; and writes follow symlinked local subdirectories
+  while the plan says "create".
+- **`CreateBucket` uses the last bucket's region** `[S]` — `RefreshClient` overwrote
+  `m.Cf.Region` on the way into the last bucket opened, so a new bucket lands there
+  rather than in the profile's region.
+- **History in a local pane** `[S]` — back/forward does nothing there
+  (`session.Visit` has no local directory), and toggling the local pane in
+  single-pane mode after dual mode was used can show pane 1's old location.
+- **`jumpTo` always takes focus** `[S]` — a bookmark jump, search reveal or session
+  restore focuses the list when it finishes, whatever has focus by then.
+- **Ctrl+C does not save the location** `[S]` — tview's own Ctrl+C handler stops the
+  app without going through `Controller.Stop`; and `rememberLocation` records
+  nothing while a local pane is active.
+- **Activity-log rotation is not serialized** `[S]` — two writers crossing 2 MiB
+  together, or two instances, can rotate twice and lose the previous generation;
+  `auditLine` folds newlines and tabs but passes ESC sequences in keys through.
+- **Profile names stored untrimmed, looked up trimmed** `[S]` — a profile saved as
+  `"prod "` is looked up as `"prod"`, so its details and options resolve to nothing,
+  or to a different profile of that name.
+- **Usage browser paths for empty segments** `[S]` — a node's `fullPath` is wrong for
+  keys like `/etc/x` or `a//b`.
+- **config.json edge cases** `[S]` — a `null` entry (a hand edit) panics at startup;
+  `WriteConfig` does not fsync before its rename.
+- **No conditional reads on large transfers** `[M]` — a multipart copy sends no
+  `CopySourceIfMatch` and the downloader no `IfMatch`, so an object replaced
+  mid-transfer can produce a mix of two versions.
+- **Incomplete-upload cleanup** `[S]` — `ListMultipartUploads` returns only the first
+  1 000, and "abort all" also aborts uploads this app is still running.
+- **Sync retry drops the skipped deletes** `[S]` — a retry after failed writes does not
+  carry the deletes the barrier held back, and "Retry failed (N)" counts the synthetic
+  "deletes skipped" entry, which has nothing to retry.
+- **Planned folder markers probe as folders** `[S]` — a folder-marker key in a
+  copy/move/restore plan is checked as a folder, so `dst/docs/` reports a conflict
+  whenever anything at all is under it.
+- **Thin failure reporting** `[M]` — cross-profile copy lists the first 8 failures
+  with no Retry or Export, undo has neither, and upload stops at its first error
+  with no retry. The first two still open-code their pipeline and get the Runner's
+  report when they become `ops` (REFACTOR.md §7); upload's is the model aborting
+  the whole set on the first error.
+- **Uncancellable short flows** `[S–M]` — rename, metadata and storage-class rewrites,
+  version actions, edit, and the overwrite and trash-restore pre-scans
+  (`PlannedCopyKeys`) still run on `context.Background()`.
+- **Links and folder names** `[S]` — the Properties link of a plain AWS profile (empty
+  `base_url`) is `/bucket/key`, with keys not URL-escaped; Create folder collapses
+  `a//` through `path.Join`.
+- **Unlocked controller reads** `[M]` — `c.active`, `c.panes`, the `c.view` pane
+  pointers and `c.model` are still read from background goroutines without a lock
+  in places. The reads are word-sized and the wrong-pane bugs they caused are fixed
+  by capturing the pane first, but they remain races. `findBucketByName` likewise
+  writes `c.pane().SetBuckets` from a navigation goroutine.
+- **Navigation lists the active pane, not the navigated one** `[S]` — `Down`,
+  `jumpTo` and `navigateTo` capture their pane for `Enter`, but the listing that
+  follows lists whichever pane is active by then. Results land in the right pane (the
+  listing captures it), but after a Tab mid-navigation the navigated pane shows its
+  old rows until it is focused again and re-listed.
+- **Editor save drops some headers** `[S]` — `PutBytes` carries Content-Type,
+  Cache-Control, Content-Disposition, Content-Encoding, Content-Language, metadata,
+  class and tags, but not Expires, the website redirect or the source's own KMS key
+  (it takes the profile's SSE, else the bucket default).
+- **A delegating `aws_profile` that resolves to nothing opens anyway** `[S]` — with the
+  pinned SDK (config v1.18.8) `LoadDefaultConfig` falls back to an IMDS-backed
+  provider, so `GetConfig`'s no-credentials check never fires and the first request
+  fails with the SDK's own credential error.

@@ -59,7 +59,8 @@ func (c *Controller) readOnly() bool {
 
 // readOnlyBlocked reports the profile's read-only state to the user and
 // returns true when the caller must stop. Called from key handlers on the UI
-// goroutine, hence the goroutine around c.error.
+// goroutine. c.error is called inline: its toast goes through Shell.Toast,
+// which is safe from any goroutine.
 func (c *Controller) readOnlyBlocked(action string) bool {
 	if !c.readOnly() {
 		return false

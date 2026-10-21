@@ -137,7 +137,7 @@ func (m *Model) runCopy(ctx context.Context, sp copySpec) error {
 	}
 
 	if size <= MultipartCopyThreshold {
-		return m.copySingle(ctx, sp)
+		return m.copySingle(ctx, sp, head)
 	}
 
 	// The multipart path builds a brand-new object, so whatever the single
@@ -172,12 +172,28 @@ func (m *Model) headForCopy(ctx context.Context, sp copySpec) (ObjectMeta, error
 	return metaFromHead(out), nil
 }
 
-// copySingle is the ordinary one-request copy.
-func (m *Model) copySingle(ctx context.Context, sp copySpec) error {
+// copySingle is the ordinary one-request copy. head is the source's HEAD when
+// the caller already made one (nil otherwise); it supplies the source's
+// encryption when the profile names none.
+func (m *Model) copySingle(ctx context.Context, sp copySpec, head *ObjectMeta) error {
 	in := &s3.CopyObjectInput{
 		Bucket:     aws.String(sp.dstBucket),
 		Key:        aws.String(sp.dstKey),
 		CopySource: aws.String(sp.copySourceValue()),
+	}
+	src := head
+	if sp.meta != nil {
+		src = sp.meta
+	}
+	sse, kmsKey := m.copyEncryption(sp, src)
+	if sse != "" {
+		in.ServerSideEncryption = s3t.ServerSideEncryption(sse)
+		if kmsKey != "" {
+			in.SSEKMSKeyId = aws.String(kmsKey)
+		}
+	}
+	if algo := m.writeOpts().ChecksumAlgorithm; algo != "" {
+		in.ChecksumAlgorithm = s3t.ChecksumAlgorithm(algo)
 	}
 	if sp.meta != nil {
 		in.MetadataDirective = s3t.MetadataDirectiveReplace
@@ -194,6 +210,13 @@ func (m *Model) copySingle(ctx context.Context, sp copySpec) error {
 		if sp.meta.ContentEncoding != "" {
 			in.ContentEncoding = aws.String(sp.meta.ContentEncoding)
 		}
+		if sp.meta.ContentLanguage != "" {
+			in.ContentLanguage = aws.String(sp.meta.ContentLanguage)
+		}
+		if sp.meta.WebsiteRedirectLocation != "" {
+			in.WebsiteRedirectLocation = aws.String(sp.meta.WebsiteRedirectLocation)
+		}
+		in.Expires = sp.meta.Expires
 	}
 	if class := sp.destinationClass(); class != "" {
 		in.StorageClass = s3t.StorageClass(class)
@@ -201,6 +224,29 @@ func (m *Model) copySingle(ctx context.Context, sp copySpec) error {
 
 	_, err := m.Client.CopyObject(ctx, in)
 	return err
+}
+
+// copyEncryption is the encryption a server-side copy asks for. A copy that
+// sends none gets the destination bucket's default — not the source's — so
+// without this every copy, move, rename, trash, metadata save and version
+// restore up to 5 GiB dropped the profile's SSE (failing outright under a
+// bucket policy that requires the header, the case the option exists for)
+// and re-encrypted an SSE-KMS object under the bucket default.
+//
+// The profile's choice wins, as on every other write. Without one, a copy
+// within the same bucket (a rewrite in place, a rename, trash and restore)
+// keeps the source's encryption when it is known (src, from a HEAD). A copy
+// into another bucket — or one whose caller skipped the HEAD — gets that
+// bucket's default, which is S3's own rule for a copy and avoids depending on
+// the source's KMS key being usable over there.
+func (m *Model) copyEncryption(sp copySpec, src *ObjectMeta) (sse, kmsKey string) {
+	if w := m.writeOpts(); w.SSE != "" {
+		return w.SSE, w.SSEKMSKeyID
+	}
+	if sp.srcBucket == sp.dstBucket && src != nil && src.SSE != "" {
+		return src.SSE, src.SSEKMSKeyID
+	}
+	return "", ""
 }
 
 // destinationClass is the storage class to write, if any was asked for.
@@ -241,6 +287,13 @@ func (m *Model) copyMultipart(ctx context.Context, sp copySpec, size int64, attr
 	if attrs.ContentEncoding != "" {
 		create.ContentEncoding = aws.String(attrs.ContentEncoding)
 	}
+	if attrs.ContentLanguage != "" {
+		create.ContentLanguage = aws.String(attrs.ContentLanguage)
+	}
+	if attrs.WebsiteRedirectLocation != "" {
+		create.WebsiteRedirectLocation = aws.String(attrs.WebsiteRedirectLocation)
+	}
+	create.Expires = attrs.Expires
 	if class := sp.destinationClass(); class != "" {
 		create.StorageClass = s3t.StorageClass(class)
 	}
@@ -255,9 +308,24 @@ func (m *Model) copyMultipart(ctx context.Context, sp copySpec, size int64, attr
 	if tagging, err := getObjectTagging(ctx, m.Client, sp.srcBucket, sp.srcKey, sp.srcVersion); err == nil && tagging != "" {
 		create.Tagging = aws.String(tagging)
 	}
-	// A bare multipart upload also loses the encryption the single-request
-	// path would have inherited, so the profile's choice is re-applied here.
+	// A fresh multipart upload starts with no encryption of its own, so the
+	// profile's choice — or, without one, the source's — is applied here, the
+	// same rule copySingle follows.
 	m.writeOpts().applyCreateMultipart(create)
+	// No additional checksum, though: an upload that declares one needs a
+	// checksum with every part, and UploadPartCopy has no way to send one —
+	// MinIO refuses each part and AWS the completion, so with checksum_algo
+	// set every copy above the threshold failed. The copy carries no
+	// additional checksum instead, which verification reports honestly.
+	create.ChecksumAlgorithm = ""
+	if create.ServerSideEncryption == "" {
+		if sse, kmsKey := m.copyEncryption(sp, &attrs); sse != "" {
+			create.ServerSideEncryption = s3t.ServerSideEncryption(sse)
+			if kmsKey != "" {
+				create.SSEKMSKeyId = aws.String(kmsKey)
+			}
+		}
+	}
 
 	started, err := m.Client.CreateMultipartUpload(ctx, create)
 	if err != nil {

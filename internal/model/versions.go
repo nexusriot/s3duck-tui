@@ -199,7 +199,14 @@ func (m *Model) DownloadVersion(ctx context.Context, bucket *Object, key, versio
 // object's base name with a short version suffix, so several versions of the
 // same object can sit in one directory without colliding.
 func VersionFileName(key, versionID string) string {
-	base := path.Base(key)
+	// A backslash is an ordinary key character to S3 but a separator to
+	// filepath.Join on Windows, so "..\..\x.bat" would name a file outside the
+	// download directory. Treating both as separators keeps only the last
+	// segment on every platform.
+	base := path.Base(strings.ReplaceAll(key, "\\", "/"))
+	if base == "." || base == ".." || base == "/" {
+		base = "object"
+	}
 	ext := path.Ext(base)
 	stem := strings.TrimSuffix(base, ext)
 

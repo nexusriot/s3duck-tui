@@ -170,6 +170,12 @@ func (l *ledger) ok(bytes int64, overwrote bool) {
 	l.mu.Unlock()
 }
 
+func (l *ledger) addBytes(n int64) {
+	l.mu.Lock()
+	l.res.Bytes += n
+	l.mu.Unlock()
+}
+
 func (l *ledger) addObjects(n int) {
 	l.mu.Lock()
 	l.res.Objects += n

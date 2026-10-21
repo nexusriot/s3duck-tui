@@ -296,3 +296,47 @@ func TestDocsOnlyNameFilesThatExist(t *testing.T) {
 		t.Errorf("only %d repository paths found across the docs; the regex has stopped matching", checked)
 	}
 }
+
+// TestReadmeNamesEveryAction pins the README's action-name table to the
+// keymap. keys.json is keyed by these names, and the hotkey panel shows chords
+// and help text but not the names, so this table is the only place a user can
+// learn what to write — the README once pointed at the panel for them, which
+// never listed a single one.
+func TestReadmeNamesEveryAction(t *testing.T) {
+	readme := readDoc(t, "README.md")
+	// Rows of three or more cells whose first cell is one backticked
+	// action-shaped token: `cross-profile-copy` | ... | ... |
+	rows := regexp.MustCompile("(?m)^\\| `([a-z][a-z0-9-]*)` \\|[^\\n]*\\|[^\\n]*\\|$").FindAllStringSubmatch(readme, -1)
+	documented := map[string]bool{}
+	for _, r := range rows {
+		documented[r[1]] = true
+	}
+
+	known := map[string]bool{}
+	var missing []string
+	for _, b := range defaultBindings() {
+		id := string(b.id)
+		if known[id] {
+			continue
+		}
+		known[id] = true
+		if !documented[id] {
+			missing = append(missing, id)
+		}
+	}
+	sort.Strings(missing)
+	if len(missing) > 0 {
+		t.Errorf("README's action-name table is missing %v", missing)
+	}
+
+	var unknown []string
+	for id := range documented {
+		if !known[id] {
+			unknown = append(unknown, id)
+		}
+	}
+	sort.Strings(unknown)
+	if len(unknown) > 0 {
+		t.Errorf("README's action-name table lists names the keymap does not have: %v", unknown)
+	}
+}

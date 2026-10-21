@@ -36,8 +36,11 @@ type Config struct {
 	// credentials (assume-role, SSO, MFA). Empty for long-lived key pairs.
 	SessionToken string `json:"session_token,omitempty"`
 	IgnoreSsl    bool   `json:"ignore_ssl"`
-	// DownloadDir is the destination for downloads. Empty -> ~/Downloads.
-	// A leading "~" is expanded to the user's home directory.
+	// DownloadDir is the destination for downloads. Empty: a download asks
+	// with a directory picker, and ~/Downloads stands in wherever nothing
+	// asks — verify, version downloads, failure-list exports, the sync form's
+	// local default and a new local pane's start. A leading "~" is expanded
+	// to the user's home directory.
 	DownloadDir string `json:"download_dir,omitempty"`
 	// MaxBytesPerSec caps transfer throughput (upload + download) for this
 	// profile. 0 (the default) means unlimited.
@@ -115,6 +118,9 @@ type Bookmark struct {
 	Prefix string `json:"prefix"`
 }
 
+// WriteConfig saves the whole in-memory profile list. It is for explicit user
+// edits (create, edit, copy, delete, options, bookmarks); the automatic save
+// of the last location goes through SaveLocation instead.
 func (p *Params) WriteConfig() error {
 	// If the last load failed, the in-memory list does NOT reflect what the
 	// file held — saving would overwrite every previously stored profile with
@@ -122,27 +128,83 @@ func (p *Params) WriteConfig() error {
 	// stays recoverable by hand.
 	if p.LoadErr != nil {
 		if _, err := os.Stat(p.FileName); err == nil {
-			if err := os.Rename(p.FileName, p.FileName+".bak"); err != nil {
+			bak := backupName(p.FileName)
+			if err := os.Rename(p.FileName, bak); err != nil {
 				return fmt.Errorf("failed to back up unreadable config before overwriting: %w", err)
 			}
 		}
+		// Cleared only once the original is safe: a failed rename above
+		// leaves the guard in place for the next attempt.
 		p.LoadErr = nil
 	}
+	return writeConfigFile(p.FileName, p.Config)
+}
 
-	file, err := json.Marshal(p.Config)
+// backupName picks where an unreadable config is moved before the first save
+// over it. config.json.bak when that is free; otherwise a numbered sibling, so
+// a second corruption can never overwrite the first backup — which may be the
+// only remaining copy of every stored credential.
+func backupName(fileName string) string {
+	bak := fileName + ".bak"
+	for i := 1; ; i++ {
+		if _, err := os.Stat(bak); os.IsNotExist(err) {
+			return bak
+		}
+		bak = fmt.Sprintf("%s.bak.%d", fileName, i)
+	}
+}
+
+// writeConfigFile marshals list into fileName.
+func writeConfigFile(fileName string, list []*Config) error {
+	file, err := json.Marshal(list)
 	if err != nil {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
 	// Write-then-rename, never truncate-in-place: a crash or full disk midway
 	// through os.WriteFile would leave a partial config.json holding every
 	// profile's credentials, and the next save would wipe them all.
-	tmp := p.FileName + ".tmp"
+	tmp := fileName + ".tmp"
 	if err := os.WriteFile(tmp, file, 0600); err != nil {
 		return fmt.Errorf("failed to write config file %s: %w", tmp, err)
 	}
-	if err := os.Rename(tmp, p.FileName); err != nil {
+	if err := os.Rename(tmp, fileName); err != nil {
 		_ = os.Remove(tmp)
-		return fmt.Errorf("failed to replace config file %s: %w", p.FileName, err)
+		return fmt.Errorf("failed to replace config file %s: %w", fileName, err)
+	}
+	return nil
+}
+
+// SaveLocation records where the named profile was last browsing. It is the
+// one save the app makes on its own — on every exit and every return to the
+// profiles screen — so it touches nothing but those two fields of that one
+// profile, as they are on disk now:
+//
+//   - A config that failed to load is never written: the startup save used to
+//     go through WriteConfig, which moved the unreadable file aside, replaced
+//     it with an empty list and cleared the error before it was shown, so a
+//     single typo in config.json silently cost every profile.
+//   - The file is re-read rather than overwritten from memory, so quitting one
+//     instance no longer erases the profiles and bookmarks another instance
+//     saved since this one started.
+//
+// Nothing is written when the location has not changed.
+func (p *Params) SaveLocation(name, bucket, prefix string) error {
+	if p.LoadErr != nil || p.FileName == "" {
+		return nil
+	}
+	onDisk, err := LoadConfiguration(p.FileName)
+	if err != nil {
+		return err
+	}
+	for _, c := range onDisk {
+		if c == nil || c.Name != name {
+			continue
+		}
+		if c.LastBucket == bucket && c.LastPrefix == prefix {
+			return nil
+		}
+		c.LastBucket, c.LastPrefix = bucket, prefix
+		return writeConfigFile(p.FileName, onDisk)
 	}
 	return nil
 }

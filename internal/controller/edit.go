@@ -168,8 +168,19 @@ func (c *Controller) EditObject() {
 		// in the temp file, whose path the error reports. (A HEAD-compare,
 		// not If-Match: conditional PUT support is spotty across
 		// S3-compatible backends.)
-		if cur, headErr := mdl.CurrentETag(context.Background(), bucket, key); headErr == nil &&
-			content.ETag != "" && cur != content.ETag {
+		//
+		// The guard fails closed: an object deleted meanwhile, or a HEAD that
+		// could not be answered, is a version we never saw just as much as a
+		// changed ETag is, and saving anyway silently recreated or overwrote
+		// the key.
+		cur, headErr := mdl.CurrentETag(context.Background(), bucket, key)
+		if headErr != nil {
+			keepTemp = true
+			c.error("Edit: not saved", fmt.Errorf(
+				"could not confirm %s is unchanged on the server (%v); your version is kept at %s", key, headErr, tmpPath))
+			return
+		}
+		if content.ETag != "" && cur != content.ETag {
 			keepTemp = true
 			c.error("Edit: not saved", fmt.Errorf(
 				"%s changed on the server while you were editing; your version is kept at %s", key, tmpPath))
