@@ -177,3 +177,31 @@ func TestValidChecksumAndSummary(t *testing.T) {
 		}
 	}
 }
+
+// A key is not a local path: deriving its type must never open a file of the
+// same name (a key like "Makefile" sniffed ./Makefile; one naming a FIFO hung).
+func TestApplyPutForKeyNeverTouchesTheFilesystem(t *testing.T) {
+	// A local file the old sniff would have opened and typed as HTML. The key
+	// names it by absolute path — keys may begin with a slash — which the
+	// sniff resolved exactly as it resolved a relative one against the cwd.
+	key := filepath.Join(t.TempDir(), "Makefile")
+	if err := os.WriteFile(key, []byte("<!DOCTYPE html><html></html>"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	w := WriteOptions{DetectMime: true, SSE: "AES256"}
+
+	in := &s3.PutObjectInput{}
+	w.applyPutForKey(in, filepath.ToSlash(key))
+	if in.ContentType != nil {
+		t.Errorf("extensionless key typed as %q — the local file was sniffed", *in.ContentType)
+	}
+	if in.ServerSideEncryption != "AES256" {
+		t.Error("the profile's encryption must still be applied")
+	}
+
+	in = &s3.PutObjectInput{}
+	w.applyPutForKey(in, "site/index.html")
+	if got := aws.ToString(in.ContentType); !strings.HasPrefix(got, "text/html") {
+		t.Errorf("index.html typed as %q, want text/html from the name", got)
+	}
+}

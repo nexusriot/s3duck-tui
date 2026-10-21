@@ -60,7 +60,7 @@ func (u *Upload) Run(ctx context.Context, rep Reporter) Result {
 		bytes += f.Size
 	}
 
-	started := Reserve(ctx, u.Gate, func() {
+	started := Reserve(ctx, u.Gate, rep, func() {
 		err := u.Pusher.UploadTargets(ctx, u.Bucket, files,
 			func(sent, total int64, done, count int, local, _ string) {
 				if ctx.Err() != nil {

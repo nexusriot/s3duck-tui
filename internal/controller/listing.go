@@ -84,31 +84,31 @@ func (l *listingState) stop() bool {
 // otherwise does nothing in the browser.
 func (c *Controller) CancelListing() bool { return c.listing.stop() }
 
-// makeObjectMap fetches the current location into the object map, streaming
-// page by page. It reports whether the listing is *partial* — cancelled by the
-// user or stopped at listCap — which the title then discloses.
+// makeObjectMap fetches loc into a fresh object map, streaming page by page.
+// It reports whether the listing is *partial* — cancelled by the user or
+// stopped at listCap — which the title then discloses.
 //
 // A cancelled listing is deliberately not an error: whatever arrived is kept
 // and rendered. The alternative (an error and an empty pane) throws away work
 // the user already waited for.
 //
-// pane is the pane the listing was started for, captured by the caller before
-// the fetch: a Tab during a slow listing must not store one pane's objects in
-// the other, where a delete would resolve them against the wrong bucket.
-func (c *Controller) makeObjectMap(ctx context.Context, pane *session.Pane, onProgress func(n int)) (partial bool, err error) {
+// loc is read from the pane once, by the caller, before the fetch: reading the
+// bucket and the prefix separately could pair one navigation's bucket with
+// another's prefix. The caller stores the result with Pane.SetListing, which
+// refuses it if the pane has moved on meanwhile.
+func (c *Controller) makeObjectMap(ctx context.Context, loc session.Location, onProgress func(n int)) (objs map[string]*model.Object, partial bool, err error) {
 	dirs := make(map[string]*model.Object)
 
-	bucket, prefix := pane.Bucket(), pane.Path()
+	bucket, prefix := loc.Bucket, loc.Path
 	if bucket == nil {
 		list, err := c.model.ListBuckets(ctx)
 		if err != nil {
-			return false, err
+			return nil, false, err
 		}
 		for _, obj := range list {
 			dirs[objKey(obj)] = obj
 		}
-		pane.SetObjs(dirs)
-		return false, nil
+		return dirs, false, nil
 	}
 
 	capped := false
@@ -126,14 +126,16 @@ func (c *Controller) makeObjectMap(ctx context.Context, pane *session.Pane, onPr
 		return true
 	})
 	if err != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			pane.SetObjs(dirs)
-			return true, nil
+		// A server that stopped handing out continuation tokens leaves the
+		// pages that did arrive browsable: partial, and saying so, like a
+		// cancelled listing.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+			errors.Is(err, model.ErrTruncatedListing) {
+			return dirs, true, nil
 		}
-		return false, err
+		return nil, false, err
 	}
-	pane.SetObjs(dirs)
-	return capped, nil
+	return dirs, capped, nil
 }
 
 // listProgressReporter builds the throttled progress callback. It writes to

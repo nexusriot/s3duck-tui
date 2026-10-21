@@ -1,8 +1,10 @@
 package controller
 
 import (
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -140,5 +142,19 @@ func TestPartialNote(t *testing.T) {
 	// Cancelled: retrying is the way out.
 	if got := partialNote(true, 12); !strings.Contains(got, "retry") {
 		t.Errorf("cancelled note = %q", got)
+	}
+}
+
+// The export goes to the download directory, which need not exist yet
+// (~/Downloads is absent on many servers); it used to fail there.
+func TestWriteFailureReportCreatesItsDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "Downloads", "nested")
+	r := &opResult{name: "Sync", failures: []opFailure{{item: retryItem{label: "a.txt"}, err: errors.New("boom")}}}
+	path, err := r.writeFailureReport(dir, time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("writeFailureReport into a missing directory: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Errorf("report not written: %v", err)
 	}
 }

@@ -160,6 +160,11 @@ func writeConfigFile(fileName string, list []*Config) error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal config: %w", err)
 	}
+	return writeConfigBytes(fileName, file)
+}
+
+// writeConfigBytes replaces fileName with file.
+func writeConfigBytes(fileName string, file []byte) error {
 	// Write-then-rename, never truncate-in-place: a crash or full disk midway
 	// through os.WriteFile would leave a partial config.json holding every
 	// profile's credentials, and the next save would wipe them all.
@@ -186,27 +191,61 @@ func writeConfigFile(fileName string, list []*Config) error {
 //   - The file is re-read rather than overwritten from memory, so quitting one
 //     instance no longer erases the profiles and bookmarks another instance
 //     saved since this one started.
+//   - The two fields are patched into the file's own JSON, not round-tripped
+//     through Config: decoding into the struct and re-encoding it silently
+//     dropped every field this build does not know — one a newer s3duck
+//     wrote, say — from every profile, on every quit.
 //
 // Nothing is written when the location has not changed.
 func (p *Params) SaveLocation(name, bucket, prefix string) error {
 	if p.LoadErr != nil || p.FileName == "" {
 		return nil
 	}
-	onDisk, err := LoadConfiguration(p.FileName)
+	raw, err := os.ReadFile(p.FileName)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to read config file %s: %w", p.FileName, err)
 	}
-	for _, c := range onDisk {
-		if c == nil || c.Name != name {
+	var entries []map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		return fmt.Errorf("failed to parse config file %s: %w", p.FileName, err)
+	}
+	for _, e := range entries {
+		if e == nil || rawString(e["name"]) != name {
 			continue
 		}
-		if c.LastBucket == bucket && c.LastPrefix == prefix {
+		if rawString(e["last_bucket"]) == bucket && rawString(e["last_prefix"]) == prefix {
 			return nil
 		}
-		c.LastBucket, c.LastPrefix = bucket, prefix
-		return writeConfigFile(p.FileName, onDisk)
+		setRawString(e, "last_bucket", bucket)
+		setRawString(e, "last_prefix", prefix)
+		file, err := json.Marshal(entries)
+		if err != nil {
+			return fmt.Errorf("failed to marshal config: %w", err)
+		}
+		return writeConfigBytes(p.FileName, file)
 	}
 	return nil
+}
+
+// rawString decodes a JSON string field, reading a missing or non-string one
+// as "".
+func rawString(v json.RawMessage) string {
+	var s string
+	if len(v) == 0 || json.Unmarshal(v, &s) != nil {
+		return ""
+	}
+	return s
+}
+
+// setRawString stores s under key, or removes the key for "" — the omitempty
+// the Config struct would have applied.
+func setRawString(e map[string]json.RawMessage, key, s string) {
+	if s == "" {
+		delete(e, key)
+		return
+	}
+	b, _ := json.Marshal(s)
+	e[key] = b
 }
 
 // NameExists reports whether a profile with the given name is already stored.
@@ -229,8 +268,21 @@ func (p *Params) NewConfiguration(config *Config) error {
 		return fmt.Errorf("a profile named %q already exists", config.Name)
 	}
 
-	p.Config = append(p.Config, config)
-	return p.WriteConfig()
+	return p.adopt(append(p.Config[:len(p.Config):len(p.Config)], config))
+}
+
+// adopt saves next as the profile list and keeps it only if the save worked.
+// Appending first and saving second left a failed create or copy (full disk,
+// read-only directory) listed anyway: openable, refusing a retry under the
+// same name as "already exists", and written out by the next unrelated save.
+func (p *Params) adopt(next []*Config) error {
+	prev := p.Config
+	p.Config = next
+	if err := p.WriteConfig(); err != nil {
+		p.Config = prev
+		return err
+	}
+	return nil
 }
 
 func LoadConfiguration(fileName string) ([]*Config, error) {
@@ -242,7 +294,16 @@ func LoadConfiguration(fileName string) ([]*Config, error) {
 	if err := json.Unmarshal(configFile, &config); err != nil {
 		return nil, fmt.Errorf("failed to parse config file %s: %w", fileName, err)
 	}
-	return config, nil
+	// A null entry ("[null]", a stray comma fixed by hand) decodes as a nil
+	// profile, and every screen that lists profiles dereferences them: the
+	// app panicked at startup instead of reaching its config-error path.
+	kept := config[:0]
+	for _, c := range config {
+		if c != nil {
+			kept = append(kept, c)
+		}
+	}
+	return kept, nil
 }
 
 func FileExist(fileName string) (bool, error) {
@@ -268,8 +329,7 @@ func (p *Params) CopyConfig(conf Config) error {
 	if p.NameExists(conf.Name) {
 		return fmt.Errorf("a profile named %q already exists", conf.Name)
 	}
-	p.Config = append(p.Config, conf.clone())
-	return p.WriteConfig()
+	return p.adopt(append(p.Config[:len(p.Config):len(p.Config)], conf.clone()))
 }
 
 // clone returns an independent copy of c: no slice or pointer field is shared
@@ -342,6 +402,11 @@ func NewParams() *Params {
 			return params
 		}
 	}
+
+	// The file holds secret keys and is documented as 0600, but only a save
+	// wrote that mode: a hand-made config.json, or one from builds that
+	// wrote it 0700, stayed as it was until the first edit. Best effort.
+	_ = os.Chmod(configFile, 0600)
 
 	config, err := LoadConfiguration(configFile)
 	if err != nil {

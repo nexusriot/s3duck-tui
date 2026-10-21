@@ -71,8 +71,40 @@ func (p *Pane) Loc() Location {
 // the narrower setters below.
 func (p *Pane) SetLoc(l Location) {
 	p.mu.Lock()
-	p.loc = l
+	p.relocateLocked(l)
 	p.mu.Unlock()
+}
+
+// relocateLocked points the pane at l and, when that is a different listing,
+// drops the objects listed at the old one. Callers must hold mu.
+//
+// The object map is what every action resolves a row against — Lookup turns
+// the highlighted or marked name into the object to delete, move or download —
+// while the bucket it acts in comes from loc. Keeping the old map across a
+// move to another bucket paired the previous bucket's rows with the new
+// bucket: until the new listing landed (or for good, when it failed), Delete
+// on a folder still showing from bucket A removed the same-named prefix in
+// bucket B. An empty map makes a stale row resolve to nothing instead.
+func (p *Pane) relocateLocked(l Location) {
+	if !SameLoc(p.loc, l) {
+		p.objs = nil
+		p.partial = false
+	}
+	p.loc = l
+}
+
+// SameLoc reports whether two locations name the same listing. Buckets compare
+// by name: navigation builds a fresh *model.Object for a bucket it re-enters.
+func SameLoc(a, b Location) bool {
+	return bucketName(a.Bucket) == bucketName(b.Bucket) &&
+		a.Path == b.Path && a.LocalDir == b.LocalDir
+}
+
+func bucketName(b *model.Object) string {
+	if b == nil || b.Key == nil {
+		return ""
+	}
+	return *b.Key
 }
 
 // Bucket is the open bucket, or nil on the buckets screen.
@@ -84,7 +116,9 @@ func (p *Pane) Bucket() *model.Object {
 
 func (p *Pane) SetBucket(b *model.Object) {
 	p.mu.Lock()
-	p.loc.Bucket = b
+	l := p.loc
+	l.Bucket = b
+	p.relocateLocked(l)
 	p.mu.Unlock()
 }
 
@@ -97,7 +131,9 @@ func (p *Pane) Path() string {
 
 func (p *Pane) SetPath(s string) {
 	p.mu.Lock()
-	p.loc.Path = s
+	l := p.loc
+	l.Path = s
+	p.relocateLocked(l)
 	p.mu.Unlock()
 }
 
@@ -106,8 +142,10 @@ func (p *Pane) SetPath(s string) {
 // prefix.
 func (p *Pane) Enter(b *model.Object, path, restore string) {
 	p.mu.Lock()
-	p.loc.Bucket = b
-	p.loc.Path = path
+	l := p.loc
+	l.Bucket = b
+	l.Path = path
+	p.relocateLocked(l)
 	p.restoreNext = restore
 	p.mu.Unlock()
 }
@@ -121,7 +159,9 @@ func (p *Pane) LocalDir() string {
 
 func (p *Pane) SetLocalDir(d string) {
 	p.mu.Lock()
-	p.loc.LocalDir = d
+	l := p.loc
+	l.LocalDir = d
+	p.relocateLocked(l)
 	p.mu.Unlock()
 }
 
@@ -165,6 +205,22 @@ func (p *Pane) SetObjs(m map[string]*model.Object) {
 	p.mu.Lock()
 	p.objs = m
 	p.mu.Unlock()
+}
+
+// SetListing stores a listing taken at l, with its partial flag — but only if
+// the pane is still pointed there, and reports whether it did. A listing that
+// finishes after the pane has moved on (a cancelled one keeps what arrived)
+// must not land under the new location, where its rows would resolve against
+// the wrong bucket; the newer location's own listing follows anyway.
+func (p *Pane) SetListing(l Location, m map[string]*model.Object, partial bool) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !SameLoc(p.loc, l) {
+		return false
+	}
+	p.objs = m
+	p.partial = partial
+	return true
 }
 
 // Lookup finds one listed object by its key.
@@ -340,6 +396,16 @@ func (p *Pane) Unselect(name string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if m := p.selLocked(); m != nil {
+		delete(m, name)
+	}
+}
+
+// UnselectIn drops one mark from a given scope — for an operation that
+// finishes after the user may have navigated away from where it was marked.
+func (p *Pane) UnselectIn(scope, name string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if m, ok := p.selectedByScope[scope]; ok {
 		delete(m, name)
 	}
 }

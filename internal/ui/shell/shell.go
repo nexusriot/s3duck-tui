@@ -185,11 +185,12 @@ func (s *Shell) PushFocus(p, focus tview.Primitive) *Layer {
 	s.stack = append(s.stack, l)
 	s.mu.Unlock()
 
-	// AddPage already hands focus to the topmost visible page when Pages has
-	// it, which is what every call site relied on before. Only an explicit
-	// focus target overrides that.
+	// AddPage hands focus to the topmost visible page only when Pages already
+	// has it. Focus stranded on a widget that left the layout (a collapsed
+	// pane, say) would leave the new overlay on screen but deaf to every key,
+	// so the overlay is always focused explicitly.
 	s.pages.AddPage(l.name, p, true, true)
-	if focus != nil && focus != p {
+	if focus != nil {
 		s.app.SetFocus(focus)
 	}
 	return l

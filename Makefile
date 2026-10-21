@@ -20,9 +20,11 @@
 # where build-deb.sh links a native-arch build statically through cgo):
 #   deb-amd64  deb-arm64  deb-armhf  deb-riscv64   ->  build/<pkg>.deb
 #
-# Override version:   make debs VERSION=0.0.40
-# The version is also hard-coded in internal/ui/widgets/view.go and build-deb.sh;
-# bump all three. TestVersionMatchesPackaging fails the build if one is missed.
+# The version is hard-coded in three places — VERSION here, versionText in
+# internal/ui/widgets/view.go and version= in build-deb.sh — so a release bumps
+# all three; TestVersionMatchesPackaging fails the build if one is missed.
+# `make debs VERSION=x.y.z` relabels the package and file names ONLY: the
+# binary inside still reports the compiled-in versionText.
 
 APP        := s3duck-tui
 PKG        := ./cmd/s3duck-tui
@@ -118,9 +120,13 @@ test-integration:
 		$(MINIO_IMAGE) server /data --address :9000
 	@echo "waiting for MinIO on :$(MINIO_PORT)..."
 	@for i in $$(seq 1 60); do \
-		curl -sf http://localhost:$(MINIO_PORT)/minio/health/live >/dev/null && break; \
+		curl -sf http://localhost:$(MINIO_PORT)/minio/health/live >/dev/null && exit 0; \
 		sleep 1; \
-	done
+	done; \
+	echo "MinIO did not become ready in time" >&2; \
+	docker logs $(MINIO_CONTAINER) || true; \
+	docker rm -f $(MINIO_CONTAINER) >/dev/null 2>&1 || true; \
+	exit 1
 	@S3DUCK_TEST_ENDPOINT=http://localhost:$(MINIO_PORT) \
 		S3DUCK_TEST_ACCESS_KEY=minioadmin S3DUCK_TEST_SECRET_KEY=minioadmin \
 		S3DUCK_TEST_REGION=us-east-1 \

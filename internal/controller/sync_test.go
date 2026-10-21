@@ -478,3 +478,45 @@ func TestPlanSyncChecksumComparison(t *testing.T) {
 		t.Errorf("one-sided sum should leave the old rule in charge, got %+v", ops)
 	}
 }
+
+func TestDropUnder(t *testing.T) {
+	entries := []model.SyncEntry{{Rel: "photos"}, {Rel: "photos/a.jpg"}, {Rel: "photos2/b.jpg"}, {Rel: "keep.txt"}}
+	got := dropUnder(entries, []string{"photos"})
+	var rels []string
+	for _, e := range got {
+		rels = append(rels, e.Rel)
+	}
+	// "photos2/" merely shares a name prefix and must survive.
+	if strings.Join(rels, ",") != "photos2/b.jpg,keep.txt" {
+		t.Errorf("dropUnder = %v, want [photos2/b.jpg keep.txt]", rels)
+	}
+	if len(dropUnder(entries, nil)) != len(entries) {
+		t.Error("no paths must drop nothing")
+	}
+}
+
+func TestDropTrashLeavesASyncRootedInTheTrash(t *testing.T) {
+	const trash = ".s3duck-trash/"
+	entries := []model.SyncEntry{{Rel: "docs/a.txt"}, {Rel: "keep.txt"}}
+	// A side whose prefix is itself inside the trash is the trash being
+	// synced on purpose; filtering emptied it, and delete-extraneous then
+	// planned deleting everything at the destination.
+	if got := dropTrash(entries, trash+"20261021-101010/", trash); len(got) != 2 {
+		t.Errorf("a sync rooted in the trash lost %d entries", 2-len(got))
+	}
+	// At the bucket root the trash folder itself is still dropped.
+	mixed := []model.SyncEntry{{Rel: trash + "20261021-101010/x"}, {Rel: "keep.txt"}}
+	if got := dropTrash(mixed, "", trash); len(got) != 1 || got[0].Rel != "keep.txt" {
+		t.Errorf("dropTrash at the root = %v, want only keep.txt", got)
+	}
+}
+
+func TestExcludedMatchesTopLevelDirectory(t *testing.T) {
+	ms := []matcher{mustMatcher("re:^build/$")}
+	if !excluded("build/out.bin", ms) {
+		t.Error(`"re:^build/$" must exclude the top-level build/ tree`)
+	}
+	if excluded("build", ms) {
+		t.Error(`a FILE named build is not the directory "build/"`)
+	}
+}

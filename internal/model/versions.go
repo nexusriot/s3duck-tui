@@ -105,11 +105,29 @@ func (m *Model) ListVersions(ctx context.Context, bucket *Object, key string) ([
 		if !page.IsTruncated {
 			break
 		}
+		// A truncated page whose continuation markers are missing, or are the
+		// ones just sent, would request the same page forever and hang the
+		// version browser behind its wait modal. Some S3-compatible backends
+		// omit the markers; refuse rather than spin.
+		if !versionMarkersAdvance(keyMarker, versionMarker, page.NextKeyMarker, page.NextVersionIdMarker) {
+			return nil, fmt.Errorf("listing versions of %s: the server reported more results but no new continuation marker", key)
+		}
 		keyMarker, versionMarker = page.NextKeyMarker, page.NextVersionIdMarker
 	}
 
 	SortVersions(out)
 	return out, nil
+}
+
+// versionMarkersAdvance reports whether a truncated ListObjectVersions page
+// handed back continuation markers that move the listing forward: at least
+// one present, and not both identical to the markers that produced the page.
+func versionMarkersAdvance(prevKey, prevVersion, nextKey, nextVersion *string) bool {
+	if nextKey == nil && nextVersion == nil {
+		return false
+	}
+	return aws.ToString(nextKey) != aws.ToString(prevKey) ||
+		aws.ToString(nextVersion) != aws.ToString(prevVersion)
 }
 
 // versionCopySource builds the CopySource for a specific version: the usual

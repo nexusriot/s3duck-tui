@@ -148,6 +148,16 @@ func (c *Controller) EditObject() {
 			return
 		}
 		if runErr != nil {
+			// A failing exit does not mean nothing was written (":w" then
+			// ":cq", a wrapper script erroring after the save): if the file
+			// changed, the edit is the user's work, kept rather than deleted
+			// with the temp file.
+			if edited, rerr := os.ReadFile(tmpPath); rerr == nil && !bytes.Equal(edited, content.Data) {
+				keepTemp = true
+				c.error(fmt.Sprintf("Edit: %s failed", editor), fmt.Errorf(
+					"%v\nnothing was uploaded; your changes are kept at %s", runErr, tmpPath))
+				return
+			}
 			c.error(fmt.Sprintf("Edit: %s failed", editor), runErr)
 			return
 		}

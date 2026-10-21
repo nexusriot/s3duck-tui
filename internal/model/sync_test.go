@@ -13,8 +13,12 @@ import (
 
 func TestNormalizePrefix(t *testing.T) {
 	cases := map[string]string{
-		"":              "",
-		"/":             "",
+		"": "",
+		// A browsing path of "/" is the folder holding keys that start with a
+		// slash, not the root: reading it as the root aimed uploads and syncs
+		// started inside it at the whole bucket.
+		"/":             "/",
+		"/x":            "/x/",
 		"  ":            "",
 		"photos":        "photos/",
 		"photos/":       "photos/",
@@ -25,6 +29,24 @@ func TestNormalizePrefix(t *testing.T) {
 	for in, want := range cases {
 		if got := NormalizePrefix(in); got != want {
 			t.Errorf("NormalizePrefix(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestNormalizeTypedPrefix(t *testing.T) {
+	// Typed into a destination field, a bare "/" is the user naming the root.
+	cases := map[string]string{
+		"":         "",
+		"/":        "",
+		" / ":      "",
+		"photos":   "photos/",
+		"/photos":  "/photos/",
+		"a/b/":     "a/b/",
+		"  a/b   ": "a/b/",
+	}
+	for in, want := range cases {
+		if got := NormalizeTypedPrefix(in); got != want {
+			t.Errorf("NormalizeTypedPrefix(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

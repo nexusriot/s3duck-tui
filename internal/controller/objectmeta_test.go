@@ -181,3 +181,14 @@ func TestMetaSummary(t *testing.T) {
 		t.Errorf("a STANDARD object should carry no restore note: %s", plain)
 	}
 }
+
+// S3 counts tag limits in characters. Counted in bytes, a 150-character
+// Cyrillic value (300 bytes) was refused as over the 256 limit.
+func TestValidateTagsCountsCharacters(t *testing.T) {
+	if err := validateTags(map[string]string{"env": strings.Repeat("ж", 150)}); err != nil {
+		t.Errorf("a 150-character value was refused: %v", err)
+	}
+	if err := validateTags(map[string]string{"env": strings.Repeat("ж", maxTagValueLen+1)}); err == nil {
+		t.Error("a value one character over the limit was accepted")
+	}
+}

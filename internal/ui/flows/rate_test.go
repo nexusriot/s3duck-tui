@@ -182,3 +182,16 @@ func TestProgressTextWithNothingInFlight(t *testing.T) {
 		t.Errorf("zero bytes produced a bad percentage: %q", got)
 	}
 }
+
+// A crawling transfer must not overflow the ETA: 1 byte of 5 TiB after 100 s
+// used to wrap int64 into a nonsense (sometimes negative) duration.
+func TestThroughputETADoesNotOverflow(t *testing.T) {
+	_, eta := Throughput(1, 5<<40, 100*time.Second)
+	if eta != -1 {
+		t.Errorf("eta = %v, want unknown (-1) for an estimate past the cap", eta)
+	}
+	_, eta = Throughput(50, 100, 10*time.Second) // 5/s, 50 left
+	if eta != 10*time.Second {
+		t.Errorf("eta = %v, want 10s", eta)
+	}
+}

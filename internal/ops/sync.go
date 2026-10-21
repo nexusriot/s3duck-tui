@@ -77,7 +77,7 @@ func (s *Sync) Describe() Descriptor {
 func (s *Sync) Run(ctx context.Context, rep Reporter) Result {
 	led := &ledger{}
 
-	started := Reserve(ctx, s.Gate, func() { s.apply(ctx, rep, led) })
+	started := Reserve(ctx, s.Gate, rep, func() { s.apply(ctx, rep, led) })
 	if !started {
 		led.cancel()
 	}

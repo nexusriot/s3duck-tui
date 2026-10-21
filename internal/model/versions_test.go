@@ -109,3 +109,26 @@ func TestVersionGuards(t *testing.T) {
 		t.Error("nil bucket: want error")
 	}
 }
+
+func TestVersionMarkersAdvance(t *testing.T) {
+	s := func(v string) *string { return &v }
+	cases := []struct {
+		name             string
+		prevKey, prevVer *string
+		nextKey, nextVer *string
+		want             bool
+	}{
+		{"first page hands back markers", nil, nil, s("doc.txt"), s("v2"), true},
+		{"version marker moves on", s("doc.txt"), s("v2"), s("doc.txt"), s("v3"), true},
+		{"key marker alone moves on", s("a"), nil, s("b"), nil, true},
+		// The two ways a truncated page can make the loop spin forever.
+		{"no markers at all", nil, nil, nil, nil, false},
+		{"the same markers again", s("doc.txt"), s("v2"), s("doc.txt"), s("v2"), false},
+		{"empty markers on the first page", nil, nil, s(""), s(""), false},
+	}
+	for _, tc := range cases {
+		if got := versionMarkersAdvance(tc.prevKey, tc.prevVer, tc.nextKey, tc.nextVer); got != tc.want {
+			t.Errorf("%s: versionMarkersAdvance = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

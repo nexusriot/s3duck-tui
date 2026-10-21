@@ -77,12 +77,13 @@ func (c *Controller) CreateConfigEntry() {
 			DownloadDir:    strings.TrimSpace(downloadDir),
 			MaxBytesPerSec: maxBps,
 		}
-		err := c.params.NewConfiguration(&conf)
-
-		lay.Close()
-		if err != nil {
+		// On an error the form stays open: closing it first threw away
+		// everything typed, secret key included, to report a duplicate name.
+		if err := c.params.NewConfiguration(&conf); err != nil {
 			c.error("Error creating config entry", err)
+			return
 		}
+		lay.Close()
 		c.fillConfigData()
 		c.view.List.SetCurrentItem(len(c.params.Config) - 1)
 	})
@@ -140,19 +141,22 @@ func (c *Controller) EditConfigEntry() {
 		// Creating and copying refuse a name already in use; renaming has to
 		// as well, or two rows share one name and every name-keyed lookup —
 		// the details pane, the options form — resolves to the first of them.
+		// A refused save leaves the form open with what was typed.
 		if name != entry.Name {
 			if name == "" {
-				lay.Close()
 				c.error("Failed to save config", fmt.Errorf("empty name not allowed"))
 				return
 			}
 			if c.params.NameExists(name) {
-				lay.Close()
 				c.error("Failed to save config", fmt.Errorf("a profile named %q already exists", name))
 				return
 			}
 		}
 
+		// Restored if the write fails: an edit kept only in memory (a rename
+		// in particular — SaveLocation finds profiles by name on disk) is not
+		// what the file holds, and would quietly diverge from it.
+		prev := *entry
 		entry.Name = name
 		entry.BaseUrl = url
 		entry.Region = region
@@ -163,11 +167,12 @@ func (c *Controller) EditConfigEntry() {
 		entry.DownloadDir = strings.TrimSpace(downloadDir)
 		entry.MaxBytesPerSec = parseMaxBps(cForm.GetFormItem(8).(*tview.InputField).GetText())
 
-		err := c.params.WriteConfig()
-		lay.Close()
-		if err != nil {
+		if err := c.params.WriteConfig(); err != nil {
+			*entry = prev
 			c.error("Failed to save config", err)
+			return
 		}
+		lay.Close()
 		c.fillConfigData()
 		c.view.List.SetCurrentItem(i)
 	})
@@ -538,6 +543,10 @@ func (c *Controller) Duck() {
 	}
 	mdl, err := model.NewModel(modelConfigFor(c.activeConfig))
 	if err != nil {
+		// The profile never opened, so it must not stay "active": Ctrl+Q
+		// would record the empty browser as where it was left, wiping its
+		// saved last_bucket / last_prefix on disk.
+		c.activeConfig = nil
 		c.error("Cannot open profile", err)
 		return
 	}

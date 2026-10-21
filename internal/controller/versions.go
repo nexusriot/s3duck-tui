@@ -193,7 +193,7 @@ func (c *Controller) confirmRestoreVersion(bucket *model.Object, key, shortName 
 	confirm := c.view.NewConfirm()
 	confirm.SetText(fmt.Sprintf(
 		"Make this version of %s current?\n\nVersion: %s\n\nThis copies it to the top of the history — no version is removed.",
-		shortName, v.VersionID)).
+		tview.Escape(shortName), v.VersionID)).
 		SetDoneFunc(func(_ int, label string) {
 			confirmLay.Close()
 			if label != widgets.ConfirmOK {
@@ -231,7 +231,7 @@ func (c *Controller) confirmDeleteVersion(bucket *model.Object, key, shortName s
 
 	confirm := c.view.NewConfirm()
 	confirm.SetText(fmt.Sprintf("Permanently delete this %s of %s?\n\nVersion: %s%s",
-		what, shortName, v.VersionID, extra)).
+		what, tview.Escape(shortName), v.VersionID, extra)).
 		SetDoneFunc(func(_ int, label string) {
 			confirmLay.Close()
 			if label != widgets.ConfirmOK {

@@ -387,7 +387,10 @@ func deleteConfirmText(targets []deleteTarget) string {
 
 	var b strings.Builder
 	if len(targets) == 1 {
-		fmt.Fprintf(&b, "Delete %s?\n\n", targets[0].key)
+		// Keys are escaped throughout: the modal renders tview tags, and
+		// "backup[old].tar" read as "backup.tar" in the very dialog asking
+		// whether to delete it.
+		fmt.Fprintf(&b, "Delete %s?\n\n", tview.Escape(targets[0].key))
 	} else {
 		fmt.Fprintf(&b, "Delete %d item(s)?\n\n", len(targets))
 		const shown = 6
@@ -396,7 +399,7 @@ func deleteConfirmText(targets []deleteTarget) string {
 				fmt.Fprintf(&b, "  ...and %d more\n", len(targets)-shown)
 				break
 			}
-			fmt.Fprintf(&b, "  - %s\n", t.key)
+			fmt.Fprintf(&b, "  - %s\n", tview.Escape(t.key))
 		}
 		b.WriteString("\n")
 	}
@@ -803,16 +806,25 @@ func (c *Controller) updateList() error {
 	// mid-listing, writing to c.pane() put one pane's objects in the other,
 	// where a delete or move resolved them against the wrong bucket.
 	pane := c.pane()
+	// The location is read once, and the listing is stored only if the pane is
+	// still there when it lands (SetListing): one that finishes after the user
+	// moved on must not file its rows under the new location.
+	loc := pane.Loc()
 
-	if pane.IsLocal() {
+	if loc.LocalDir != "" {
 		// A local listing is one ReadDir: no pagination, no cancellation to
 		// arrange, nothing to stream.
-		if err := c.makeLocalObjectMap(pane); err != nil {
+		objs, err := c.makeLocalObjectMap(loc.LocalDir)
+		if err != nil {
 			c.error("Cannot read the directory", err)
+			// Redraw regardless: navigation already dropped the previous
+			// directory's rows, and they must not stay on screen looking live.
+			c.renderIfActive(pane)
 			return err
 		}
-		pane.SetPartial(false)
-		c.renderIfActive(pane)
+		if pane.SetListing(loc, objs, false) {
+			c.renderIfActive(pane)
+		}
 		return nil
 	}
 
@@ -822,13 +834,18 @@ func (c *Controller) updateList() error {
 	// The title base is captured before the fetch too: a Tab during a slow
 	// listing must not redirect the progress counter into the other pane.
 	target, base := c.view.List, c.listTitleBase()
-	partial, err := c.makeObjectMap(ctx, pane, c.listProgressReporter(target, base))
+	objs, partial, err := c.makeObjectMap(ctx, loc, c.listProgressReporter(target, base))
 	if err != nil {
 		c.error("Failed to fetch folder", err)
+		// Redraw regardless. After a navigation the pane holds no rows for the
+		// new location, and the old location's rows (and the "listing… N"
+		// counter) would otherwise stay on screen as if they were live.
+		c.renderIfActive(pane)
 		return err
 	}
-	pane.SetPartial(partial)
-	c.renderIfActive(pane)
+	if pane.SetListing(loc, objs, partial) {
+		c.renderIfActive(pane)
+	}
 	return nil
 }
 
@@ -953,13 +970,17 @@ func (c *Controller) renderList() {
 // decorations (selection count, filter, sort, listing progress). The listing
 // progress reporter needs it to rewrite the title while a fetch is running.
 func (c *Controller) listTitleBase() string {
-	if c.localMode() {
+	// One read of the location: this runs off the UI goroutine, and checking
+	// Bucket() then dereferencing a second Bucket() call crashed on a Tab or
+	// an Up landing between the two.
+	loc := c.pane().Loc()
+	if loc.LocalDir != "" {
 		return c.localTitle()
 	}
-	if c.pane().Bucket() == nil {
+	if loc.Bucket == nil || loc.Bucket.Key == nil {
 		return "(buckets)"
 	}
-	return fmt.Sprintf("(%s)/%s", *c.pane().Bucket().Key, c.pane().Path())
+	return fmt.Sprintf("(%s)/%s", *loc.Bucket.Key, loc.Path)
 }
 
 // listChrome builds the list title and the frame help line for the current
@@ -1914,12 +1935,20 @@ func (c *Controller) copyOrMove(isMove bool) {
 		}
 	}
 
+	// The client is captured with the source, for the same reason: the form
+	// arrives after a round trip, and a profile switch in that gap made the
+	// button run this profile's bucket and key names through the NEW
+	// profile's client — copying, and on a move deleting, in a same-named
+	// bucket there, past that profile's read-only flag (checked above for
+	// this one only).
+	mdl := c.model
+
 	// List buckets so the destination dropdown offers cross-bucket targets. Off
 	// the UI goroutine (network); if it fails, fall back to the current bucket
 	// only so same-bucket copy/move keeps working.
 	go func() {
 		bucketNames := []string{srcBucketName}
-		if list, err := c.model.ListBuckets(context.Background()); err == nil {
+		if list, err := mdl.ListBuckets(context.Background()); err == nil {
 			bucketNames = bucketNames[:0]
 			seen := false
 			for _, b := range list {
@@ -1937,13 +1966,18 @@ func (c *Controller) copyOrMove(isMove bool) {
 		}
 
 		c.shell.Do(func() {
+			// The profile this was started in has been left: its form would
+			// act on another account.
+			if c.model != mdl || !c.browsing {
+				return
+			}
 			form := c.view.NewCopyMoveForm(title, bucketNames, dstBucketName, dstPrefix)
 			form.AddButton(title, func() {
 				_, dstBucketName := form.GetFormItem(0).(*tview.DropDown).GetCurrentOption()
 				dstPrefix := strings.TrimSpace(form.GetFormItem(1).(*tview.InputField).GetText())
 				lay.Close()
 
-				dstPrefix = model.NormalizePrefix(dstPrefix)
+				dstPrefix = model.NormalizeTypedPrefix(dstPrefix)
 				sameBucket := dstBucketName == srcBucketName
 				if sameBucket && dstPrefix == srcPrefix {
 					c.error(title+" failed", fmt.Errorf("destination equals source"))
@@ -1955,7 +1989,6 @@ func (c *Controller) copyOrMove(isMove bool) {
 					bn := dstBucketName
 					dstBucket = &model.Object{Key: &bn, Ot: model.Bucket}
 				}
-				mdl := c.model
 				c.confirmOverwrites(mdl, dstBucket, title,
 					plannedCopyKeys(mdl, srcBucket, dstBucket, items, dstPrefix),
 					func(skip map[string]bool) {
@@ -2507,8 +2540,9 @@ func (c *Controller) wireListChanged(list *tview.List) {
 
 // actionTable maps every action to what it does. Separating this from the
 // bindings is what makes the keymap configurable: the table is the app's
-// vocabulary, keymap.go decides which keys speak it, and the palette and the
-// hotkey panel are both generated from the pair.
+// vocabulary, keymap.go decides which keys speak it, and the hotkey panel is
+// generated from the pair. (The palette is a hand-written list:
+// paletteActions.)
 func (c *Controller) actionTable() map[actionID]func() {
 	return map[actionID]func(){
 		actUp:             c.Up,
@@ -2728,6 +2762,11 @@ func (c *Controller) resetPanes() {
 	// opened it, and a fresh Pane drops all three at once.
 	c.panes = [2]*session.Pane{session.New(), session.New()}
 	c.view.ShowSinglePane()
+	// Focus must follow the layout. Collapsing from the right pane (Ctrl+P
+	// there, or the palette's "Back to profiles") left focus on list 1, which
+	// is no longer on screen — tview then delivers no key at all, overlays
+	// included, and only the app-level Ctrl+Q still worked.
+	c.view.App.SetFocus(c.view.List)
 	c.filterSuppress = true
 	c.view.PaneFilter(0).SetText("")
 	c.view.PaneFilter(1).SetText("")
@@ -2942,7 +2981,7 @@ func (c *Controller) chooseDir(startPath string, onChosen func(dir string)) {
 func (c *Controller) ShowLocalFSModal(startPath string) {
 	// lay is assigned below; every handler here runs after that.
 	var lay *shell.Layer
-	if c.pane().Bucket() == nil {
+	if c.pane().Bucket() == nil || c.remoteOnly("Upload (Ctrl+U)") {
 		return
 	}
 	currentPath := startPath
@@ -3238,7 +3277,11 @@ func (c *Controller) ShowFileProperties(key string) {
 			lay.Close()
 			switch buttonLabel {
 			case "Copy Link":
-				u.CopyToClipboard(url)
+				if err := u.CopyToClipboard(url); err != nil {
+					// Show the link itself, so it can still be selected by hand.
+					c.error("Clipboard unavailable", fmt.Errorf("%v\n\n%s", err, url))
+					return
+				}
 				c.success("Link copied to clipboard")
 			case "Presign Link":
 				c.PresignLink(key)
@@ -3311,7 +3354,10 @@ func (c *Controller) PresignLink(key string) {
 					c.error("Presign failed", err)
 					return
 				}
-				u.CopyToClipboard(link)
+				if err := u.CopyToClipboard(link); err != nil {
+					c.error("Clipboard unavailable", fmt.Errorf("%v\n\n%s", err, link))
+					return
+				}
 				c.success("Presigned link copied to clipboard")
 			}()
 		})
@@ -3788,13 +3834,24 @@ func (c *Controller) recordHistory() {
 }
 
 // HistoryBack / HistoryForward move through the navigation history.
+//
+// Both are remote-only. The history records bucket+prefix visits, and a pane
+// keeps the ones it made before it became local; replaying one into a local
+// pane set a bucket while the directory stayed, a hybrid that listed the
+// directory but sent Ctrl+U uploads into a bucket shown nowhere.
 func (c *Controller) HistoryBack() {
+	if c.localMode() {
+		return
+	}
 	if loc, ok := c.pane().Hist().Back(c.curLocation()); ok {
 		c.navigateTo(loc)
 	}
 }
 
 func (c *Controller) HistoryForward() {
+	if c.localMode() {
+		return
+	}
 	if loc, ok := c.pane().Hist().Forward(c.curLocation()); ok {
 		c.navigateTo(loc)
 	}

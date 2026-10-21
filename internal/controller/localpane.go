@@ -9,7 +9,6 @@ import (
 	"github.com/dustin/go-humanize"
 
 	"github.com/nexusriot/s3duck-tui/internal/model"
-	"github.com/nexusriot/s3duck-tui/internal/session"
 )
 
 // localMode reports whether the active pane is showing a local directory.
@@ -59,6 +58,20 @@ func (c *Controller) remoteOnly(action string) bool {
 func (c *Controller) ToggleLocalPane() {
 	if !c.dual {
 		c.ToggleDualPane()
+		// A local pane hidden by Ctrl+O is still there: showing it again is
+		// the whole toggle. Carrying on would turn the remaining remote pane
+		// local too, leaving no bucket on screen at all.
+		if c.hasLocalPane() {
+			return
+		}
+	}
+	// Pressed from the local pane itself (its footer offers "l Close local"):
+	// close THIS pane. Acting on the other one unconditionally turned the
+	// remote pane into a second local pane and lost its location.
+	if c.localMode() {
+		c.pane().SetLocalDir("")
+		go c.updateList() // a remote pane again, on the buckets screen
+		return
 	}
 	// After ToggleDualPane the active pane is the newly focused one; act on
 	// whichever pane is inactive now.
@@ -87,20 +100,19 @@ func (c *Controller) startLocalDir() string {
 	return c.params.HomeDir
 }
 
-// makeLocalObjectMap fills the object map from the local directory. It mirrors
-// makeObjectMap's contract: the map is replaced wholesale, and an unreadable
-// directory is an error the caller reports.
-func (c *Controller) makeLocalObjectMap(pane *session.Pane) error {
-	list, err := model.WalkDir(pane.LocalDir())
+// makeLocalObjectMap reads one local directory into a fresh object map. It
+// mirrors makeObjectMap's contract: the caller stores the map with
+// Pane.SetListing, and an unreadable directory is an error the caller reports.
+func (c *Controller) makeLocalObjectMap(dir string) (map[string]*model.Object, error) {
+	list, err := model.WalkDir(dir)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	dirs := make(map[string]*model.Object, len(list))
 	for _, o := range list {
 		dirs[objKey(o)] = o
 	}
-	pane.SetObjs(dirs)
-	return nil
+	return dirs, nil
 }
 
 // localTitle is the pane title for a local directory: the path, plus what it
@@ -170,6 +182,14 @@ func (c *Controller) localSelection() []string {
 // Ctrl+Y that copies between two remote prefixes uploads when the source is
 // local.
 func (c *Controller) uploadFromLocalPane() {
+	// The selection below is read from the ACTIVE pane as local paths. From a
+	// remote pane (the palette offers this entry unconditionally) that turned
+	// object keys into paths relative to the process's working directory —
+	// "Documents/" in a bucket uploaded ~/Documents.
+	if !c.localMode() {
+		c.error("Upload", fmt.Errorf("switch to the local pane first (Tab): the upload sends what is marked there"))
+		return
+	}
 	dstBucket, dstPrefix, ok := c.otherPaneRemote()
 	if !ok {
 		c.error("Upload", fmt.Errorf("the other pane must be inside a bucket to receive files"))

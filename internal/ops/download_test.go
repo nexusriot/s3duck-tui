@@ -519,3 +519,32 @@ func TestDownloadWithNothingLeftSkipsTheGate(t *testing.T) {
 		t.Errorf("result = %+v, fetched %v; want one skip, nothing fetched, not cancelled", res, f.keys())
 	}
 }
+
+// cancelingChecker plays a user pressing Cancel while the verify is running:
+// it cancels the run and fails the way a real checker's request then would.
+type cancelingChecker struct{ cancel context.CancelFunc }
+
+func (c *cancelingChecker) VerifyLocalFile(ctx context.Context, _ *model.Object, _, _ string) (model.VerifyResult, error) {
+	c.cancel()
+	return model.VerifyResult{}, ctx.Err()
+}
+
+// A cancel that lands during the post-download verify is not a failed
+// download: the file is already in place, so ledgering it as a failure offered
+// a Retry that re-downloaded a good file.
+func TestDownloadCancelDuringVerifyIsNotAFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d := newDownload(t, newMemFS(), &fakeFetcher{}, targets("a.txt", 10))
+	d.Verify = true
+	d.Checker = &cancelingChecker{cancel: cancel}
+
+	res := d.Run(ctx, &recorder{})
+
+	if res.Failed() != 0 || res.Retry != nil {
+		t.Errorf("failures = %v (retry offered: %v); a cancelled verify is not a failure", res.Failures, res.Retry != nil)
+	}
+	if !res.Canceled || res.Done != 1 || res.Unverified != 1 {
+		t.Errorf("canceled %v / done %d / unverified %d; want true / 1 / 1", res.Canceled, res.Done, res.Unverified)
+	}
+}

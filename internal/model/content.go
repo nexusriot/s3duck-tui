@@ -296,7 +296,7 @@ func (m *Model) PutBytes(ctx context.Context, bucket *Object, key string, data [
 	// applyAttrs already carried the object's own Content-Type across, so
 	// applyPut only fills one in when the object never had one, and always
 	// applies the profile's encryption/checksum choice.
-	m.writeOpts().applyPut(in, key)
+	m.writeOpts().applyPutForKey(in, key)
 	_, err := m.Client.PutObject(ctx, in)
 	return err
 }
@@ -348,6 +348,7 @@ func CrossCopy(ctx context.Context, src *Model, srcBucket *Object, srcKey string
 		total:   out.ContentLength,
 		update:  update,
 		limiter: src.Limiter,
+		ctx:     ctx,
 	}
 
 	in := &s3.PutObjectInput{
@@ -359,7 +360,7 @@ func CrossCopy(ctx context.Context, src *Model, srcBucket *Object, srcKey string
 	// The destination profile's rules apply, not the source's: encryption is
 	// a property of where the bytes land. The source's Content-Type rides
 	// along in attrs, so the derivation here only fills a gap.
-	dst.writeOpts().applyPut(in, dstKey)
+	dst.writeOpts().applyPutForKey(in, dstKey)
 
 	if _, err := newUploader(dst.Client, out.ContentLength).Upload(ctx, in); err != nil {
 		return fmt.Errorf("writing %s: %w", dstKey, err)

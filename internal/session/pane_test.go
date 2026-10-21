@@ -264,3 +264,92 @@ func TestHistoryIsBounded(t *testing.T) {
 		t.Errorf("back stack = %d entries, want it capped at %d", back, HistMax)
 	}
 }
+
+// A pane's rows belong to the location they were listed at. Every action
+// resolves a row through Lookup but acts in the pane's current bucket, so a
+// listing that survived a move to another bucket paired bucket A's rows with
+// bucket B: Delete on folder "logs/" still showing from A removed B's "logs/".
+func TestRelocationDropsTheOldListing(t *testing.T) {
+	logs := &model.Object{Ot: model.Folder}
+	listed := func() map[string]*model.Object {
+		return map[string]*model.Object{"logs/": logs}
+	}
+	moves := []struct {
+		name string
+		move func(p *Pane)
+	}{
+		{"Enter another bucket", func(p *Pane) { p.Enter(bucket("b"), "", "..") }},
+		{"Enter the buckets screen", func(p *Pane) { p.Enter(nil, "", "") }},
+		{"SetBucket", func(p *Pane) { p.SetBucket(bucket("b")) }},
+		{"SetPath", func(p *Pane) { p.SetPath("logs/") }},
+		{"SetLocalDir", func(p *Pane) { p.SetLocalDir("/tmp") }},
+		{"SetLoc", func(p *Pane) { p.SetLoc(Location{Bucket: bucket("b")}) }},
+	}
+	for _, tc := range moves {
+		p := New()
+		p.Enter(bucket("a"), "", "")
+		p.SetListing(p.Loc(), listed(), true)
+
+		tc.move(p)
+		if _, ok := p.Lookup("logs/"); ok {
+			t.Errorf("%s: a row listed at the old location still resolves", tc.name)
+		}
+		if p.Partial() {
+			t.Errorf("%s: the old listing's partial flag survived", tc.name)
+		}
+	}
+
+	// Staying put keeps the rows: a refresh must not blank the pane, and
+	// re-entering a bucket builds a fresh *Object for the same name.
+	p := New()
+	p.Enter(bucket("a"), "x/", "")
+	p.SetListing(p.Loc(), listed(), false)
+	p.Enter(bucket("a"), "x/", "..")
+	p.SetPath("x/")
+	if _, ok := p.Lookup("logs/"); !ok {
+		t.Error("re-entering the same location dropped its listing")
+	}
+}
+
+// A listing that lands after the pane moved on — a cancelled one keeps what
+// arrived — must not be filed under the new location.
+func TestSetListingRefusesAStaleLocation(t *testing.T) {
+	p := New()
+	p.Enter(bucket("a"), "", "")
+	at := p.Loc()
+
+	p.Enter(bucket("b"), "", "")
+	if p.SetListing(at, map[string]*model.Object{"logs/": {}}, true) {
+		t.Fatal("SetListing stored a listing taken at a location the pane has left")
+	}
+	if _, ok := p.Lookup("logs/"); ok || p.Partial() {
+		t.Error("a refused listing still reached the pane")
+	}
+
+	if !p.SetListing(p.Loc(), map[string]*model.Object{"k": {}}, true) {
+		t.Fatal("SetListing refused the pane's own location")
+	}
+	if _, ok := p.Lookup("k"); !ok || !p.Partial() {
+		t.Error("an accepted listing was not stored with its partial flag")
+	}
+}
+
+// UnselectIn drops a mark where it was made, whichever listing is showing:
+// trash restore finishes after the user may have navigated away.
+func TestUnselectInTargetsItsOwnScope(t *testing.T) {
+	p := New()
+	p.Enter(bucket("b"), "trash/", "")
+	p.ToggleSelected("trash/x")
+	scope := p.ScopeKey()
+
+	p.SetPath("elsewhere/")
+	p.ToggleSelected("trash/x") // the same name, marked in another listing
+	p.UnselectIn(scope, "trash/x")
+
+	if p.HasSelectionIn(scope) {
+		t.Error("the mark in the original scope survived")
+	}
+	if !p.IsSelected("trash/x") {
+		t.Error("UnselectIn reached into the scope now showing")
+	}
+}

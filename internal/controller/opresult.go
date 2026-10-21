@@ -131,6 +131,11 @@ func (r *opResult) writeFailureReport(dir string, now time.Time) (string, error)
 	if len(r.failures) == 0 {
 		return "", fmt.Errorf("nothing to export")
 	}
+	// The directory is the profile's download directory, which need not
+	// exist yet (~/Downloads is absent on many servers).
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
 	path := filepath.Join(dir, failureFileName(r.name, now))
 	body := strings.Join(r.exportLines(), "\n") + "\n"
 	if err := os.WriteFile(path, []byte(body), 0600); err != nil {

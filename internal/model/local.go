@@ -124,6 +124,7 @@ func LocalTargets(paths []string, dstPrefix string) ([]UploadTarget, int64, erro
 			if err != nil {
 				return err
 			}
+			fi = followFileLink(path, fi)
 			rel, rerr := filepath.Rel(clean, path)
 			if rerr != nil {
 				return rerr

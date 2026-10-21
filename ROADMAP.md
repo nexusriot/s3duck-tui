@@ -96,7 +96,8 @@ DESIGN.md, and the new limitations they carry are in its table.
   (`writeFailureReport`) is the shape to copy.
 - **Presigned PUT** `[S]` — `PresignGetURL` exists; the upload counterpart is ~15 lines
   and enables "send me a file" workflows.
-- **Copy `s3://` URI** `[S]` — and fix `CopyToClipboard` swallowing errors while there.
+- **Copy `s3://` URI** `[S]` — `CopyToClipboard` reports its errors now, so this is
+  only the button.
 - **Go-to-path jump** `[S]` — `jumpTo()` exists; needs only an input modal.
 - **CLI flags** `[S]` — `--profile` / `--config` / `--version`; nothing parses args today.
 - **Mouse support** `[S]` — `EnableMouse(true)` plus click-to-select. Now that the
@@ -157,7 +158,8 @@ listed in DESIGN.md's history.
 - **Download throttle is bursty** — throttling sleeps after each 5 MiB buffer flush, so
   at low caps the socket sits idle for tens of seconds between full-speed bursts (long
   enough for some proxies to drop the connection; SDK chunk retries then double-count
-  progress). Wants throttling in smaller quanta on the read side.
+  progress). Wants throttling in smaller quanta on the read side. (The sleep does
+  answer Cancel since the 2026-10-21 review; it used to be waited out.)
 - **Whitespace keys resolve to the wrong object** — every secondary-text reader trims
   the key (`strings.TrimSpace`), so `"dir/report "` is looked up as `"dir/report"`.
   The trimming starts earlier than the readers: `Model.List` itself trims each key
@@ -213,14 +215,15 @@ Found in the 2026-10 review:
   at the target name. Wants the check on the temp file, before the rename.
 - **Download sync and non-canonical keys** `[M]` — a remote `a//b.txt` is planned as
   create `a//b.txt` plus delete `a/b.txt`, which are the same local file, so the
-  fresh download is deleted again; and writes follow symlinked local subdirectories
-  while the plan says "create".
+  fresh download is deleted again. (Writes no longer follow symlinked local
+  subdirectories: sync leaves them out on both sides.)
 - **`CreateBucket` uses the last bucket's region** `[S]` — `RefreshClient` overwrote
   `m.Cf.Region` on the way into the last bucket opened, so a new bucket lands there
   rather than in the profile's region.
-- **History in a local pane** `[S]` — back/forward does nothing there
-  (`session.Visit` has no local directory), and toggling the local pane in
-  single-pane mode after dual mode was used can show pane 1's old location.
+- **History in a local pane** `[S]` — back/forward deliberately does nothing there
+  (`session.Visit` has no local directory; replaying a remote entry built a hybrid
+  pane), and toggling the local pane in single-pane mode after dual mode was used
+  can show pane 1's old location.
 - **`jumpTo` always takes focus** `[S]` — a bookmark jump, search reveal or session
   restore focuses the list when it finishes, whatever has focus by then.
 - **Ctrl+C does not save the location** `[S]` — tview's own Ctrl+C handler stops the
@@ -234,8 +237,13 @@ Found in the 2026-10 review:
   or to a different profile of that name.
 - **Usage browser paths for empty segments** `[S]` — a node's `fullPath` is wrong for
   keys like `/etc/x` or `a//b`.
-- **config.json edge cases** `[S]` — a `null` entry (a hand edit) panics at startup;
-  `WriteConfig` does not fsync before its rename.
+- **config.json edge cases** `[S]` — `WriteConfig` does not fsync before its rename,
+  writes through a fixed `config.json.tmp` that two instances share, and replaces a
+  symlinked `config.json` (dotfile managers) with a regular file. An explicit save
+  also writes the in-memory list, so it drops what another running instance saved
+  since this one started, and fields this build does not know (only the automatic
+  location save patches the file in place). With `$HOME` unset every path becomes
+  relative to the working directory.
 - **No conditional reads on large transfers** `[M]` — a multipart copy sends no
   `CopySourceIfMatch` and the downloader no `IfMatch`, so an object replaced
   mid-transfer can produce a mix of two versions.
@@ -276,3 +284,56 @@ Found in the 2026-10 review:
   pinned SDK (config v1.18.8) `LoadDefaultConfig` falls back to an IMDS-backed
   provider, so `GetConfig`'s no-credentials check never fires and the first request
   fails with the SDK's own credential error.
+
+Found in the 2026-10-21 review (the ones it fixed are in DESIGN.md's history):
+
+- **Version downloads skip the transfer machinery** `[S]` — `DownloadVersion` writes
+  straight to the final name (no temp file and rename), ignores the bandwidth cap,
+  and on Windows a failed download leaves a partial file under that name.
+- **A download can still clobber or collide** `[S]` — `overwrite=false` is checked
+  before the transfer and not at the rename, so a file created meanwhile is replaced
+  without a prompt, and two keys that land on one local path (`a//b` and `a/b`, or
+  names differing only in case on a case-insensitive filesystem) are both reported
+  downloaded while one survives. No fsync before the rename either.
+- **Rewrites reset object ACLs** `[S]` — metadata saves, storage-class changes,
+  version restores, editor saves and moves are copies or PUTs that send no ACL, so on
+  a legacy ACL-enabled AWS bucket a public-read object comes back private.
+- **`BucketConfig` reads any error as "off"** `[S]` — AccessDenied shows
+  "Versioning: off" and "Encryption: none" as facts; only not-implemented and
+  `NoSuch…Configuration` answers should mean the default.
+- **`~/.aws` import differs from the SDK** `[S]` — a `[profile x]` section in the
+  credentials file and a prefix-less section in the config file are taken where the
+  SDK ignores them, `[default]` vs `[profile default]` is resolved in map order,
+  indented sub-properties (`s3 =` blocks) are not ignored, China regions get the
+  `.amazonaws.com` endpoint, and an unreadable credentials file is skipped silently.
+- **Blocking work on the UI goroutine** `[S–M]` — bucket and folder creation call S3
+  from the form's Save handler, and the upload preview (`PrepareUpload`,
+  `LocalTargets`) walks the local tree there: a slow endpoint or a large directory
+  freezes the app with no way to cancel.
+- **Keymap conflicts the warnings miss** `[S]` — a leader that is also an action's
+  chord makes that action unreachable, an action bound to the leader can never fire,
+  and Ctrl+Q is hard-wired at the app level (binding it is dead; rebinding `quit`
+  leaves it quitting).
+- **Progress and display nits** `[S]` — copy/move's object rate divides one item's
+  count by the whole run's time; the byte gauge dips while a file is verified; the
+  resolving counter shows files approved rather than processed; column truncation
+  and padding use different width functions, so emoji presentation sequences spill
+  past their column; tview's URL tags (`[:::https://…]`) survive `tview.Escape`.
+- **`V` looks in one directory** `[S]` — verify checks the profile's download
+  directory, but a download lands in the local pane's directory when one is open, or
+  in the picked one when `download_dir` is unset.
+- **Version diff hides line-ending changes** `[S]` — `splitLines` normalises CRLF and
+  the final newline, so two versions differing only there are "identical".
+- **Esc and focus in reports and overlays** `[S]` — the delete and trash-restore
+  reports keep the wait modal's Esc capture, so Esc does nothing there; the palette,
+  activity log and bucket dashboard force focus to the list when closed, even when
+  another overlay is still open above it.
+- **Selection after renames** `[S]` — a folder rename that finishes after the user
+  navigated away unselects in the new scope, leaving a phantom mark in the old one; a
+  cancelled batch rename keeps marks on the items it already renamed. A successful
+  retry of a failed cut-paste does not consume the cut.
+- **The activity log names the profile open when a job finishes** `[S]` — a transfer
+  backgrounded in one profile and finishing after a switch is logged under the other.
+- **Packaging** `[S]` — `make x86_64` (and so `make all`) forces CGO on, which fails
+  on a non-amd64 host; `Installed-Size` in `DEBIAN/control` is a fixed guess; CI does
+  not run the packaging scripts or the static cgo build.

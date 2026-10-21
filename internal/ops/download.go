@@ -96,7 +96,7 @@ func (d *Download) Run(ctx context.Context, rep Reporter) Result {
 	// Wait for a transfer slot. Phase 1 is deliberately outside the gate: it
 	// is user-interaction time, not bandwidth, and holding a slot through a
 	// pile of overwrite dialogs would stall every other transfer.
-	started := Reserve(ctx, d.Gate, func() {
+	started := Reserve(ctx, d.Gate, rep, func() {
 		d.transfer(ctx, rep, led, todo, effectiveBytes)
 	})
 	if !started {
@@ -298,6 +298,14 @@ func (d *Download) verify(ctx context.Context, led *ledger, t model.DownloadTarg
 	}
 	vr, err := d.Checker.VerifyLocalFile(ctx, d.Bucket, t.Key, local)
 	switch {
+	case err != nil && ctx.Err() != nil:
+		// Cancelled mid-verify. The file is already downloaded and in place,
+		// so this is neither a failure (a Retry would re-download a good
+		// file) nor a verified copy: it is done, unverified, and the run
+		// reports itself cancelled.
+		led.cancel()
+		led.countVerified(false)
+		return true
 	case err != nil:
 		led.fail(t.Key, fmt.Errorf("downloaded, but verification failed: %w", err))
 		return false

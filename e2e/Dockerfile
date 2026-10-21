@@ -3,7 +3,7 @@
 # MinIO through the project's own model package.
 #
 # The base image is pinned by digest, so a run is reproducible and works
-# offline once the image is present. It matches go.mod's toolchain line (1.23);
+# offline once the image is present. It matches go.mod's `go 1.23` directive;
 # move the two together.
 ARG GO_IMAGE=golang:1.23-alpine@sha256:383395b794dffa5b53012a212365d40c8e37109a626ca30d6151c8348d380b5f
 FROM ${GO_IMAGE}

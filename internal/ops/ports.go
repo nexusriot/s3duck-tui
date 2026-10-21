@@ -64,14 +64,32 @@ type Gate interface {
 	Release()
 }
 
+// QueueReporter is implemented by a Reporter that shows when an operation is
+// waiting for a transfer slot. Optional: Reserve checks for it.
+type QueueReporter interface {
+	// Queued is called with true before waiting for a slot and with false
+	// once one is held (or the wait ended).
+	Queued(waiting bool)
+}
+
 // Reserve runs f while holding a slot from g, or reports false if ctx ended
-// while waiting. A nil Gate means "no limit", which is what tests want.
-func Reserve(ctx context.Context, g Gate, f func()) bool {
+// while waiting. A nil Gate means "no limit", which is what tests want. rep,
+// when it is a QueueReporter, is told while the wait lasts — without that a
+// job behind two others read "running" in the transfers panel and the badge.
+func Reserve(ctx context.Context, g Gate, rep Reporter, f func()) bool {
 	if g == nil {
 		f()
 		return true
 	}
-	if !g.Acquire(ctx) {
+	q, _ := rep.(QueueReporter)
+	if q != nil {
+		q.Queued(true)
+	}
+	ok := g.Acquire(ctx)
+	if q != nil {
+		q.Queued(false)
+	}
+	if !ok {
 		return false
 	}
 	defer g.Release()

@@ -139,8 +139,14 @@ func TransferRow(jv jobs.View, elapsed time.Duration) (primary, secondary string
 	if jv.Total > 0 {
 		pct = float64(jv.Done) / float64(jv.Total) * 100
 	}
-	primary = fmt.Sprintf("[%s] %s — %s", jv.Status, jv.Kind, jv.Desc)
-	rate := "done"
+	// Escaped: the list renders tview tags, and "[failed]" is one — an unknown
+	// colour name that swallowed the status entirely, so a failed or
+	// cancelled transfer looked exactly like a finished one. The description
+	// carries bucket and key names, which may hold brackets of their own.
+	primary = tview.Escape(fmt.Sprintf("[%s] %s — %s", jv.Status, jv.Kind, jv.Desc))
+	// Only a running job has a rate; every other state says what it is
+	// rather than claiming "done" for a queued, failed or cancelled one.
+	rate := jv.Status.String()
 	if jv.Status == jobs.Running {
 		rate = flows.ByteRateETA(jv.Done, jv.Total, elapsed)
 	}

@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -267,5 +268,73 @@ func TestWriteConfigNeverOverwritesABackup(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(p.FileName + ".bak.1"); string(b) != "second" {
 		t.Errorf("second backup = %q, want the second unreadable original", b)
+	}
+}
+
+// A null entry used to decode as a nil profile that every profile screen
+// dereferenced, so the app panicked at startup.
+func TestLoadConfigurationDropsNullEntries(t *testing.T) {
+	p := newTestParams(t)
+	if err := os.WriteFile(p.FileName, []byte(`[null, {"name":"a"}, null]`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadConfiguration(p.FileName)
+	if err != nil {
+		t.Fatalf("LoadConfiguration: %v", err)
+	}
+	if len(got) != 1 || got[0] == nil || got[0].Name != "a" {
+		t.Errorf("loaded %v, want just profile a", got)
+	}
+}
+
+// A create or copy whose save fails must not stay listed: it was openable,
+// refused a retry as "already exists", and the next unrelated save wrote it.
+func TestFailedSaveDoesNotKeepTheNewProfile(t *testing.T) {
+	p := newTestParams(t)
+	// A directory where the file should be makes every write fail.
+	p.FileName = t.TempDir()
+
+	if err := p.NewConfiguration(&Config{Name: "a"}); err == nil {
+		t.Fatal("expected the save to fail")
+	}
+	if p.NameExists("a") {
+		t.Error("a profile whose create failed to save is still listed")
+	}
+	if err := p.CopyConfig(Config{Name: "b"}); err == nil {
+		t.Fatal("expected the save to fail")
+	}
+	if p.NameExists("b") {
+		t.Error("a profile whose copy failed to save is still listed")
+	}
+}
+
+// SaveLocation must touch only its two fields. Round-tripping through Config
+// dropped every field this build does not know, from every profile.
+func TestSaveLocationKeepsFieldsItDoesNotKnow(t *testing.T) {
+	p := newTestParams(t)
+	body := `[{"name":"a","future_option":{"x":1}},{"name":"b","another_one":true}]`
+	if err := os.WriteFile(p.FileName, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.SaveLocation("a", "reports", "2026/"); err != nil {
+		t.Fatalf("SaveLocation: %v", err)
+	}
+	raw, err := os.ReadFile(p.FileName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{`"future_option":{"x":1}`, `"another_one":true`, `"last_bucket":"reports"`, `"last_prefix":"2026/"`} {
+		if !strings.Contains(string(raw), want) {
+			t.Errorf("config after SaveLocation lacks %s:\n%s", want, raw)
+		}
+	}
+
+	// Clearing the location removes the keys, as omitempty would.
+	if err := p.SaveLocation("a", "", ""); err != nil {
+		t.Fatalf("SaveLocation: %v", err)
+	}
+	raw, _ = os.ReadFile(p.FileName)
+	if strings.Contains(string(raw), "last_bucket") {
+		t.Errorf("an empty location left the key behind:\n%s", raw)
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/aws/retry"
@@ -31,6 +32,24 @@ import (
 // overwrite an existing local file. Callers that want to replace the file —
 // the overwrite prompt, sync — must remove it first; errors.Is identifies it.
 var ErrFileExists = errors.New("file exists")
+
+// ErrTruncatedListing reports a listing page that said more results follow but
+// carried no new continuation token. The SDK's paginator simply stops there,
+// which handed callers a partial listing with a nil error — the shape a
+// delete-extraneous sync, a bucket empty and a delete-size scan all take as
+// the whole truth. Some S3-compatible backends produce it.
+var ErrTruncatedListing = errors.New("the server reported more results but sent no new continuation token")
+
+// truncatedWithoutToken reports a page the paginator would silently stop
+// after: truncated, with a next token that is missing or repeats the previous
+// page's (prevNext).
+func truncatedWithoutToken(out *s3.ListObjectsV2Output, prevNext string) bool {
+	if out == nil || !out.IsTruncated {
+		return false
+	}
+	next := aws.ToString(out.NextContinuationToken)
+	return next == "" || next == prevNext
+}
 
 type optsFunc = func(*config.LoadOptions) error
 
@@ -110,11 +129,18 @@ func throttleStep(rate, tokens float64, elapsed time.Duration, n int) (sleep tim
 	return sleep, tokens
 }
 
-// wait blocks until n bytes may be transferred under the configured rate. Safe
-// for concurrent use; a nil limiter returns immediately (unlimited).
-func (l *rateLimiter) wait(n int) {
+// wait blocks until n bytes may be transferred under the configured rate, or
+// until ctx is done, whose error it then returns. Safe for concurrent use; a
+// nil limiter returns immediately (unlimited), as does a nil ctx's sleep end.
+//
+// The sleep has to answer ctx. A downloader writes each 5 MiB chunk in one
+// WriteAt and an uploader reads a whole part in one Read, so with a low cap a
+// single call owes tens of seconds — and with four workers times the SDK's own
+// part concurrency, a Cancel used to wait out minutes of sleeps, holding the
+// transfer slot all the while.
+func (l *rateLimiter) wait(ctx context.Context, n int) error {
 	if l == nil || n <= 0 {
-		return
+		return nil
 	}
 	l.mu.Lock()
 	now := time.Now()
@@ -123,8 +149,20 @@ func (l *rateLimiter) wait(n int) {
 	sleep, tokens := throttleStep(l.rate, l.tokens, elapsed, n)
 	l.tokens = tokens
 	l.mu.Unlock()
-	if sleep > 0 {
+	if sleep <= 0 {
+		return nil
+	}
+	if ctx == nil {
 		time.Sleep(sleep)
+		return nil
+	}
+	t := time.NewTimer(sleep)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -157,13 +195,18 @@ type progressReader struct {
 	total   int64
 	update  func(written int64, total int64)
 	limiter *rateLimiter
+	// ctx is the transfer's context: a cancel interrupts the throttle's
+	// sleep, and the read reports it (see rateLimiter.wait).
+	ctx context.Context
 }
 
 func (pr *progressReader) Read(p []byte) (int, error) {
 	n, err := pr.r.Read(p)
 	pr.written += int64(n)
 	pr.update(pr.written, pr.total)
-	pr.limiter.wait(n)
+	if werr := pr.limiter.wait(pr.ctx, n); werr != nil && err == nil {
+		err = werr
+	}
 	return n, err
 }
 
@@ -173,6 +216,8 @@ type progressWriterAt struct {
 	total      int64
 	updateFunc func(written int64, total int64)
 	limiter    *rateLimiter
+	// ctx is the transfer's context; see progressReader.
+	ctx context.Context
 }
 
 func (pwa *progressWriterAt) WriteAt(p []byte, off int64) (int, error) {
@@ -181,7 +226,9 @@ func (pwa *progressWriterAt) WriteAt(p []byte, off int64) (int, error) {
 	if pwa.updateFunc != nil {
 		pwa.updateFunc(w, pwa.total)
 	}
-	pwa.limiter.wait(n)
+	if werr := pwa.limiter.wait(pwa.ctx, n); werr != nil && err == nil {
+		err = werr
+	}
 	return n, err
 }
 
@@ -407,6 +454,7 @@ func (m *Model) ListObjectsStream(ctx context.Context, key string, bucket *Objec
 	}
 
 	total := 0
+	prevNext := ""
 	paginator := s3.NewListObjectsV2Paginator(m.Client, input)
 	for paginator.HasMorePages() {
 		if err := ctx.Err(); err != nil {
@@ -416,6 +464,12 @@ func (m *Model) ListObjectsStream(ctx context.Context, key string, bucket *Objec
 		if err != nil {
 			return err
 		}
+		// Refused before the page is handed on: every caller of the recursive
+		// listing either deletes or decides what to delete from it.
+		if truncatedWithoutToken(output, prevNext) {
+			return fmt.Errorf("listing %s/%s: %w", *bucket.Key, key, ErrTruncatedListing)
+		}
+		prevNext = aws.ToString(output.NextContinuationToken)
 		total += len(output.Contents)
 		if onPage != nil && !onPage(output.Contents, total) {
 			return nil
@@ -510,6 +564,7 @@ func (m *Model) ListStream(ctx context.Context, path string, bucket *Object, onP
 	}
 
 	total := 0
+	prevNext := ""
 	paginator := s3.NewListObjectsV2Paginator(m.Client, input)
 
 	for paginator.HasMorePages() {
@@ -520,6 +575,11 @@ func (m *Model) ListStream(ctx context.Context, path string, bucket *Object, onP
 		if err != nil {
 			return err
 		}
+		// Unlike the recursive listing, this page is still worth showing —
+		// the browser marks the pane partial on ErrTruncatedListing — so the
+		// check reports after onPage below rather than before it.
+		truncated := truncatedWithoutToken(output, prevNext)
+		prevNext = aws.ToString(output.NextContinuationToken)
 		objs := make([]*Object, 0, len(output.CommonPrefixes)+len(output.Contents))
 
 		for _, p := range output.CommonPrefixes {
@@ -576,6 +636,9 @@ func (m *Model) ListStream(ctx context.Context, path string, bucket *Object, onP
 		total += len(objs)
 		if onPage != nil && !onPage(objs, total) {
 			return nil
+		}
+		if truncated {
+			return fmt.Errorf("listing %s/%s: %w", *bucket.Key, path, ErrTruncatedListing)
 		}
 	}
 	return nil
@@ -870,6 +933,23 @@ func walkFollowingRoot(localPath string, fn filepath.WalkFunc) error {
 	})
 }
 
+// followFileLink resolves a symbolic link met BELOW a walked root when it
+// points at a regular file, returning the target's info so the file is sent
+// with its real size and mtime. filepath.Walk lstats every entry, so such a
+// link used to read as "not a regular file" and vanish from uploads and sync
+// listings without a word. Anything else — a link to a directory (which may
+// loop, or lead anywhere on the filesystem), a dangling link — is returned
+// unchanged and stays unfollowed; WalkLocalTree reports those to sync.
+func followFileLink(p string, fi os.FileInfo) os.FileInfo {
+	if fi == nil || fi.Mode()&os.ModeSymlink == 0 {
+		return fi
+	}
+	if st, err := os.Stat(p); err == nil && st.Mode().IsRegular() {
+		return st
+	}
+	return fi
+}
+
 // Upload sends a local file or directory tree to s3Prefix.
 //
 // It is PrepareUpload followed by UploadTargets, so the keys it writes are by
@@ -1000,6 +1080,7 @@ func (m *Model) PrepareUpload(localPath string, currentPath string, bucket *Obje
 		if err != nil {
 			return err
 		}
+		fi = followFileLink(p, fi)
 		rel, err := filepath.Rel(base, p)
 		if err != nil {
 			return err
@@ -1157,7 +1238,7 @@ func (m *Model) DownloadTarget(
 	// case-insensitive filesystem); with a fixed name, two workers truncated
 	// and wrote into the same temp file and the result was an interleaving of
 	// both objects, reported as a success.
-	fp, err := os.CreateTemp(filepath.Dir(downloadPath), filepath.Base(downloadPath)+".*.s3duck-part")
+	fp, err := os.CreateTemp(filepath.Dir(downloadPath), tempStem(filepath.Base(downloadPath))+".*.s3duck-part")
 	if err != nil {
 		return 0, err
 	}
@@ -1174,6 +1255,7 @@ func (m *Model) DownloadTarget(
 			}
 		},
 		limiter: m.Limiter,
+		ctx:     ctx,
 	}
 
 	n, err := m.Downloader.Download(ctx, writerAt, &s3.GetObjectInput{
@@ -1199,6 +1281,26 @@ func (m *Model) DownloadTarget(
 		return n, err
 	}
 	return n, nil
+}
+
+// tempStemMax bounds the part of a download's temp name taken from the target.
+// The suffix adds about 23 bytes (".<random>.s3duck-part"), and filesystems cap
+// a name at 255: copied whole, any valid target name past ~232 bytes — about 78
+// CJK characters — failed with "file name too long" and could not be
+// downloaded at all.
+const tempStemMax = 120
+
+// tempStem is the target's base name shortened for a temp name, cut on a rune
+// boundary so the result stays valid UTF-8.
+func tempStem(base string) string {
+	if len(base) <= tempStemMax {
+		return base
+	}
+	cut := tempStemMax
+	for cut > 0 && !utf8.RuneStart(base[cut]) {
+		cut--
+	}
+	return base[:cut]
 }
 
 // PresignMaxTTL is the maximum lifetime AWS SigV4 allows for a presigned URL.

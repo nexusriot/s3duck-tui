@@ -454,20 +454,22 @@ hard logic is still untested.
 
 | Metric | Before | After |
 |---|---|---|
-| `controller.go` | 5,648 lines | 4,196 |
+| `controller.go` | 5,648 lines | 4,253 |
 | Fields on `Controller` | 44 | 30 |
 | Methods on `*Controller` | 201 | 188 |
 | Raw `Pages.*Page` calls | 226 | 2 (both inside `ui/shell`, which owns them) |
 | `QueueUpdateDraw` outside the shell | 92 | 0 |
-| Interfaces in the repo | 0 | 8 |
-| Tests | 247 | 404 |
+| Interfaces in the repo | 0 | 9 |
+| Tests | 247 | 425 |
 
-Recounted after the 2026-10 review's fixes; the version is still 0.10.2,
+Recounted after the 2026-10-21 review's fixes; the version is still 0.10.2,
 whose release read 4,020 lines, 29 fields and 184 methods in the first three
-rows. The growth is those fixes themselves — panes captured on the UI
-goroutine, the undo skip sets, `canMark`, `renderIfActive`, the clipboard
-generation — not new flows. Tests count `func Test…` across the repository,
-the tag-gated integration suite included.
+rows. The growth is the 2026-10 reviews' fixes themselves — panes captured on
+the UI goroutine, the undo skip sets, `canMark`, `renderIfActive`, the
+clipboard generation, the profile-switch guards on the copy/move and sync
+dialogs — not new flows; the ninth interface is `ops.QueueReporter`. Tests
+count `func Test…` across `internal/`, the tag-gated integration suite
+included; `e2e/` adds ten more (and its `TestMain`).
 
 The page-call row read "0" until 0.10.1, because it was only ever counted over
 `internal/controller`. Ten raw `Pages.RemovePage("modal")` calls had been left
@@ -476,10 +478,12 @@ constructors — written when overlays were addressed by magic string, and never
 converted. The shell names every overlay `layer-N`, so those handlers removed a
 page that does not exist and **Esc silently stopped closing ten dialogs**. The
 forms were still usable through their Cancel buttons, so nothing failed and
-nothing in the suite noticed. Fixed in 0.10.1: the widgets install no key
-handling at all (overlay lifetime belongs to whoever pushed the layer), the
-controller wires `escapeCloses` at each call site, and two tests now pin both
-halves of that boundary — one per package, so neither side can drift alone.
+nothing in the suite noticed. Fixed in 0.10.1: no form or dialog constructor in
+the widgets installs key handling (overlay lifetime belongs to whoever pushed
+the layer; the hotkey panel, which takes an `onClose`, is the one exception),
+the controller wires `escapeCloses` at each call site, and two tests now pin
+both halves of that boundary — one per package, so neither side can drift
+alone.
 
 Phase 4 left a similar residue, found in 0.10.2. Converting sync to
 `ops.Sync` moved its scheduler into `internal/ops`, but the controller's copy —
@@ -507,6 +511,20 @@ walk, and `ops.Upload` sends exactly its `Files`. `model.Upload` became
 empty-directory upload) also writes, by construction, the keys a preview
 would show. The rule this adds to the one above: a port takes what the user
 confirmed, never an input it re-derives that from.
+
+### Where the names differ from §3
+
+§3 sketched the target before any of it existed, and the code chose other
+names (or another shape) in a few places; §3 is left as it was written. The S3
+ports are `Fetcher`, `Pusher`, `Checker`, `FS` and `Gate` (`internal/ops/ports.go`)
+plus `Mover` (`internal/ops/copy.go`), not `Lister`/`Putter`. The operations are
+`ops.Download`, `ops.Upload`, `ops.Copy` and `ops.Sync`, not `DownloadOp` and
+friends. The shell hands back a `*shell.Layer`, not a `Handle`, and
+`shell.Toast` takes a primitive rather than (kind, header, body). A pane is
+entered with `Pane.Enter(bucket, path, restore)`, not `Navigate`, and
+`Pane.Snapshot` returns `[]*model.Object` — there is no `PaneView`. The keymap
+lives in `internal/controller/keymap.go`, not under `config/`; and `session`
+depends on `internal/model` (for the object type), not on nothing.
 
 ### What is still open
 

@@ -146,8 +146,10 @@ func dupGroupRow(g dupGroup) (primary, secondary string) {
 	if len(g.Members) > 0 {
 		face = g.Members[0].Key
 	}
+	// The key is escaped: the row is rendered with tags, and one inside a key
+	// ("x[old].bin") would hide part of the name.
 	primary = fmt.Sprintf("%d × %-10s  [gray]wastes %s[-]  %s",
-		len(g.Members), humanize.IBytes(uint64(g.Size)), humanize.IBytes(uint64(g.wasted())), face)
+		len(g.Members), humanize.IBytes(uint64(g.Size)), humanize.IBytes(uint64(g.wasted())), tview.Escape(face))
 	return primary, g.ETag
 }
 
@@ -162,7 +164,8 @@ func dupMemberRow(m dupMember, oldest bool) (primary, secondary string) {
 	if oldest {
 		tag = "[green]* [-]"
 	}
-	return fmt.Sprintf("%s%s  %s", tag, when, m.Key), m.Key
+	// Escaped in the visible text only; the secondary text is the lookup key.
+	return fmt.Sprintf("%s%s  %s", tag, when, tview.Escape(m.Key)), m.Key
 }
 
 // dropDupMember removes the member with the given key from groups[gi],
@@ -362,7 +365,7 @@ func (c *Controller) confirmDeleteDup(mdl *model.Model, bucket *model.Object, pr
 	}
 	confirm := c.view.NewConfirm()
 	confirm.SetText(fmt.Sprintf("Delete this copy?\n\n%s\n\n%d other cop%s of the same content %s. %s",
-		m.Key, others, pluralYIes(others), verb, how)).
+		tview.Escape(m.Key), others, pluralYIes(others), verb, how)).
 		SetDoneFunc(func(_ int, label string) {
 			confirmLay.Close()
 			if label != widgets.ConfirmOK {

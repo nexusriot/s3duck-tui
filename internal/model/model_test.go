@@ -5,12 +5,15 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3t "github.com/aws/aws-sdk-go-v2/service/s3/types"
 )
 
@@ -152,7 +155,7 @@ func TestNewRateLimiter(t *testing.T) {
 	}
 	// A nil limiter's wait must be a safe no-op (the unlimited path).
 	var nilL *rateLimiter
-	nilL.wait(100)
+	_ = nilL.wait(context.Background(), 100)
 }
 
 func TestRateLimiterWait(t *testing.T) {
@@ -160,23 +163,44 @@ func TestRateLimiterWait(t *testing.T) {
 
 	// Spending the burst must not block.
 	start := time.Now()
-	l.wait(1000)
+	_ = l.wait(context.Background(), 1000)
 	if d := time.Since(start); d > 100*time.Millisecond {
 		t.Fatalf("spending the initial burst blocked for %v", d)
 	}
 
 	// With the bucket drained, moving another 500 bytes must throttle ~0.5s.
 	start = time.Now()
-	l.wait(500)
+	_ = l.wait(context.Background(), 500)
 	if d := time.Since(start); d < 300*time.Millisecond {
 		t.Errorf("wait did not throttle after draining: slept %v, want >= ~0.5s", d)
 	}
 
 	// n <= 0 is always a no-op.
 	start = time.Now()
-	l.wait(0)
+	_ = l.wait(context.Background(), 0)
 	if d := time.Since(start); d > 50*time.Millisecond {
 		t.Errorf("wait(0) blocked for %v", d)
+	}
+}
+
+// A cancel must cut the throttle's sleep short: one 5 MiB chunk at a low cap
+// owes tens of seconds, and Cancel used to wait all of them out.
+func TestRateLimiterWaitAnswersCancel(t *testing.T) {
+	l := newRateLimiter(1000)
+	_ = l.wait(context.Background(), 1000) // drain the burst
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		cancel()
+	}()
+	start := time.Now()
+	err := l.wait(ctx, 60_000) // a minute's worth at 1000 B/s
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("a cancelled wait slept %v", d)
+	}
+	if err == nil {
+		t.Error("a cancelled wait must report the cancellation")
 	}
 }
 
@@ -617,4 +641,113 @@ func TestVersionFileNameStripsBackslashPaths(t *testing.T) {
 	if got := VersionFileName("..", "v"); strings.Contains(got, "..") && !strings.HasPrefix(got, "object") {
 		t.Errorf("VersionFileName(..) = %q", got)
 	}
+}
+
+// Symlinks BELOW a walked root. filepath.Walk lstats every entry, so a linked
+// file used to vanish from uploads and sync listings, and a linked directory
+// read as empty — which, under delete-extraneous, planned deleting every
+// remote copy of its files.
+func TestWalksFollowFileLinksAndReportDirectoryLinks(t *testing.T) {
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "target.txt"), []byte("12345"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(outside, "photos"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(outside, "photos", "p.jpg"), []byte("img"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	root := filepath.Join(t.TempDir(), "tree")
+	if err := os.MkdirAll(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "plain.txt"), []byte("x"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "target.txt"), filepath.Join(root, "linked.txt")); err != nil {
+		t.Skipf("cannot create symlinks here: %v", err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "photos"), filepath.Join(root, "photos")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(outside, "gone"), filepath.Join(root, "dangling")); err != nil {
+		t.Fatal(err)
+	}
+
+	entries, opaque, err := WalkLocalTree(root)
+	if err != nil {
+		t.Fatalf("WalkLocalTree: %v", err)
+	}
+	sizes := map[string]int64{}
+	for _, e := range entries {
+		sizes[e.Rel] = e.Size
+	}
+	if len(sizes) != 2 || sizes["plain.txt"] != 1 || sizes["linked.txt"] != 5 {
+		t.Errorf("entries = %v, want plain.txt (1) and linked.txt with its target's size (5)", sizes)
+	}
+	sort.Strings(opaque)
+	if strings.Join(opaque, ",") != "dangling,photos" {
+		t.Errorf("opaque = %v, want the unfollowed links [dangling photos]", opaque)
+	}
+
+	m := newTestModel(t, NewConfig("https://s3.example.com", nil, "ak", "sk", "", true, 0))
+	targets, _, err := m.PrepareUpload(root, "", &Object{Key: strPtr("b"), Ot: Bucket})
+	if err != nil {
+		t.Fatalf("PrepareUpload: %v", err)
+	}
+	keys := map[string]int64{}
+	for _, tg := range targets {
+		keys[tg.RemotePath] = tg.Size
+	}
+	if keys["tree/linked.txt"] != 5 {
+		t.Errorf("upload targets = %v, want the linked file sent as tree/linked.txt (5 bytes)", keys)
+	}
+}
+
+// The SDK paginator stops silently on a truncated page whose continuation
+// token is missing or repeats, handing back a partial listing with no error.
+func TestTruncatedWithoutToken(t *testing.T) {
+	tok := func(s string) *string { return &s }
+	cases := []struct {
+		name     string
+		out      *s3.ListObjectsV2Output
+		prevNext string
+		want     bool
+	}{
+		{"last page", &s3.ListObjectsV2Output{IsTruncated: false}, "", false},
+		{"truncated with a token", &s3.ListObjectsV2Output{IsTruncated: true, NextContinuationToken: tok("t1")}, "", false},
+		{"next token moves on", &s3.ListObjectsV2Output{IsTruncated: true, NextContinuationToken: tok("t2")}, "t1", false},
+		{"truncated, no token", &s3.ListObjectsV2Output{IsTruncated: true}, "", true},
+		{"truncated, empty token", &s3.ListObjectsV2Output{IsTruncated: true, NextContinuationToken: tok("")}, "", true},
+		{"truncated, same token again", &s3.ListObjectsV2Output{IsTruncated: true, NextContinuationToken: tok("t1")}, "t1", true},
+	}
+	for _, tc := range cases {
+		if got := truncatedWithoutToken(tc.out, tc.prevNext); got != tc.want {
+			t.Errorf("%s: truncatedWithoutToken = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// A target name near the filesystem's 255-byte limit must still get a temp
+// name that fits; copying it whole made such objects undownloadable.
+func TestTempStemFitsLongNames(t *testing.T) {
+	long := strings.Repeat("報", 84) // 252 bytes, a valid name on its own
+	stem := tempStem(long)
+	if len(stem) > tempStemMax {
+		t.Errorf("stem is %d bytes, want at most %d", len(stem), tempStemMax)
+	}
+	if !utf8.ValidString(stem) {
+		t.Error("the stem was cut inside a rune")
+	}
+	if got := tempStem("report.pdf"); got != "report.pdf" {
+		t.Errorf("a short name was changed to %q", got)
+	}
+
+	f, err := os.CreateTemp(t.TempDir(), tempStem(long)+".*.s3duck-part")
+	if err != nil {
+		t.Fatalf("temp file for a 252-byte name: %v", err)
+	}
+	f.Close()
 }

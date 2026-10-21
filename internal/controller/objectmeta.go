@@ -6,6 +6,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/dustin/go-humanize"
 	"github.com/rivo/tview"
@@ -78,11 +79,13 @@ func validateTags(tags map[string]string) error {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		if len(k) > maxTagKeyLen {
-			return fmt.Errorf("tag key %q is %d chars, over the %d limit", k, len(k), maxTagKeyLen)
+		// S3's limits are in Unicode characters, not bytes: counting bytes
+		// refused a 150-character Cyrillic value as "over 256".
+		if n := utf8.RuneCountInString(k); n > maxTagKeyLen {
+			return fmt.Errorf("tag key %q is %d chars, over the %d limit", k, n, maxTagKeyLen)
 		}
-		if v := tags[k]; len(v) > maxTagValueLen {
-			return fmt.Errorf("value of tag %q is %d chars, over the %d limit", k, len(v), maxTagValueLen)
+		if n := utf8.RuneCountInString(tags[k]); n > maxTagValueLen {
+			return fmt.Errorf("value of tag %q is %d chars, over the %d limit", k, n, maxTagValueLen)
 		}
 	}
 	return nil
@@ -341,6 +344,6 @@ func (c *Controller) runRestore(bucket *model.Object, key string, days int32, ti
 			return
 		}
 		c.logActivity("Restore requested: %s (%d day(s), %s)", key, days, tier)
-		c.success(fmt.Sprintf("Restore requested (%d day(s), %s).\nCheck the status with Ctrl+L or 'c'.", days, tier))
+		c.success(fmt.Sprintf("Restore requested (%d day(s), %s).\nCheck the status with 'm' or 'c'.", days, tier))
 	}()
 }

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	s3t "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/rivo/tview"
 
 	cfg "github.com/nexusriot/s3duck-tui/internal/config"
 	"github.com/nexusriot/s3duck-tui/internal/model"
@@ -909,4 +910,18 @@ func TestValidateEntryName(t *testing.T) {
 // the terminal.
 func newTestController() *Controller {
 	return &Controller{panes: [2]*session.Pane{session.New(), session.New()}}
+}
+
+// The confirmation must name the object it deletes. A modal renders tview
+// tags, so an unescaped "backup[old].tar" read as "backup.tar".
+func TestDeleteConfirmTextEscapesKeys(t *testing.T) {
+	for _, targets := range [][]deleteTarget{
+		{{key: "backup[old].tar", objects: 1}},
+		{{key: "backup[old].tar", objects: 1}, {key: "b.txt", objects: 1}},
+	} {
+		text := deleteConfirmText(targets)
+		if !strings.Contains(text, tview.Escape("backup[old].tar")) {
+			t.Errorf("confirm text %q does not carry the escaped key", text)
+		}
+	}
 }

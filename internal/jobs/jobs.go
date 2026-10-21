@@ -166,6 +166,9 @@ func (q *Queue) Acquire(ctx context.Context) bool {
 // Release gives back a slot taken by Acquire.
 func (q *Queue) Release() { <-q.sem }
 
+// Slots is how many byte-transfer phases may run at once.
+func (q *Queue) Slots() int { return cap(q.sem) }
+
 // Add registers a new running job.
 func (q *Queue) Add(kind, desc string, total int64, count int, cancel context.CancelFunc) *Job {
 	q.mu.Lock()

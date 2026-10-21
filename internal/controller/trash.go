@@ -8,6 +8,7 @@ import (
 
 	cfg "github.com/nexusriot/s3duck-tui/internal/config"
 	"github.com/nexusriot/s3duck-tui/internal/model"
+	"github.com/nexusriot/s3duck-tui/internal/session"
 	"github.com/nexusriot/s3duck-tui/internal/ui/shell"
 	"github.com/nexusriot/s3duck-tui/internal/ui/widgets"
 )
@@ -151,6 +152,10 @@ func (c *Controller) EmptyTrash() {
 type restoreOp struct {
 	src, dst string
 	isFolder bool
+	// name is the item's mark in the trash listing, dropped once it is
+	// restored: a mark left on a row that is gone made the next R, Delete or
+	// download in that folder resolve nothing and silently do nothing.
+	name string
 }
 
 // RestoreFromTrash moves the marked items (or the highlighted one) out of the
@@ -181,7 +186,7 @@ func (c *Controller) RestoreFromTrash() {
 		if dst == "" {
 			continue
 		}
-		ops = append(ops, restoreOp{src: src, dst: dst, isFolder: o.Ot == model.Folder})
+		ops = append(ops, restoreOp{src: src, dst: dst, isFolder: o.Ot == model.Folder, name: n})
 	}
 	if len(ops) == 0 {
 		c.error("Nothing to restore", fmt.Errorf("select items inside %s — only objects in the trash carry the key they came from", trash))
@@ -190,6 +195,7 @@ func (c *Controller) RestoreFromTrash() {
 
 	bucket := c.pane().Bucket()
 	mdl := c.model
+	pane, scope := c.pane(), c.pane().ScopeKey()
 	// A restore writes back to the key the object was deleted from, and
 	// nothing stops that key from holding a newer object by now. It goes
 	// through the same destination check as every other remote write rather
@@ -207,7 +213,7 @@ func (c *Controller) RestoreFromTrash() {
 			return keys, nil
 		},
 		func(skip map[string]bool) {
-			c.runTrashRestore(mdl, bucket, ops, skip)
+			c.runTrashRestore(mdl, bucket, ops, skip, pane, scope)
 		})
 }
 
@@ -215,7 +221,10 @@ func (c *Controller) RestoreFromTrash() {
 // Runs on the UI goroutine; skip holds the destination keys the user chose to
 // leave alone when the overwrite check found them already occupied. (Not to be
 // confused with runRestore, which is the Glacier one.)
-func (c *Controller) runTrashRestore(mdl *model.Model, bucket *model.Object, ops []restoreOp, skip map[string]bool) {
+//
+// pane and scope are where the items were marked, captured up front: the
+// marks are dropped there, wherever the user has navigated by then.
+func (c *Controller) runTrashRestore(mdl *model.Model, bucket *model.Object, ops []restoreOp, skip map[string]bool, pane *session.Pane, scope string) {
 	lay, progress, ctx, cancel := c.cancellableWait("Restoring from trash...")
 	go func() {
 		defer cancel()
@@ -243,6 +252,7 @@ func (c *Controller) runTrashRestore(mdl *model.Model, bucket *model.Object, ops
 				continue
 			}
 			res.ok()
+			pane.UnselectIn(scope, op.name)
 			c.logActivity("Restored %s -> %s", op.src, op.dst)
 		}
 		c.reportOpResult(lay, progress, res, canceled, nil)

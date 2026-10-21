@@ -24,9 +24,19 @@ func Throughput(done, total int64, elapsed time.Duration) (rate float64, eta tim
 	if rate <= 0 || total <= 0 || done >= total {
 		return rate, -1
 	}
-	eta = time.Duration(float64(total-done)/rate) * time.Second
-	return rate, eta
+	// Computed in float and capped: converting whole seconds to a Duration
+	// and then multiplying overflowed int64 at very low rates (1 B of 5 TiB
+	// after 100 s rendered as a wrapped, sometimes negative, ETA). Past the
+	// cap an estimate is noise anyway, so it reads as unknown.
+	left := float64(total-done) / rate
+	if left > maxETA.Seconds() {
+		return rate, -1
+	}
+	return rate, time.Duration(left * float64(time.Second))
 }
+
+// maxETA is the longest estimate worth showing.
+const maxETA = 1000 * time.Hour
 
 // FormatDuration renders a non-negative duration as M:SS (or H:MM:SS past an
 // hour). A negative duration — an unknown ETA — renders as "--".

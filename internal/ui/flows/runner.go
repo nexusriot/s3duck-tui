@@ -46,8 +46,8 @@ type Runner struct {
 	Done func()
 	// ExportFailures writes a failure report and returns where it landed.
 	ExportFailures func(name string, failures []ops.Failure) (string, error)
-	// CopyText puts the report on the clipboard.
-	CopyText func(string)
+	// CopyText puts the report on the clipboard, reporting whether it could.
+	CopyText func(string) error
 }
 
 // Start runs op: confirm (if it asks for one), then register a job, show
@@ -101,18 +101,41 @@ func (r *Runner) launch(op ops.Operation, d ops.Descriptor) {
 	go func() {
 		defer cancel()
 		res := op.Run(ctx, rep)
-		r.Queue.Finish(job, res.Canceled, res.Failed())
 		r.Shell.Do(func() {
+			// Finish runs here, on the UI goroutine, so it is serialised with
+			// the Background button. Called from this goroutine, a Background
+			// press landing between it and this closure got neither the
+			// summary (the modal was gone) nor the notice and bell (Finish
+			// had already seen a foreground job).
+			r.Queue.Finish(job, res.Canceled, res.Failed())
 			if job.IsBackgrounded() || !lay.IsOpen() {
 				// A Background press racing completion already took the modal
 				// down; mutating a detached one routes keys into an invisible
 				// widget.
+				r.logFailures(d, res)
 				r.finished(d)
 				return
 			}
 			r.showSummary(lay, progress, d, res)
 		})
 	}()
+}
+
+// logFailures records a backgrounded operation's failures in the activity log.
+// With no summary on screen its Retry and Export buttons never appear, so the
+// log is the only place the list survives the run.
+func (r *Runner) logFailures(d ops.Descriptor, res ops.Result) {
+	if r.Log == nil || res.Failed() == 0 {
+		return
+	}
+	const maxLogged = 200
+	for i, f := range res.Failures {
+		if i == maxLogged {
+			r.Log("%s: ...and %d more failure(s)", d.Kind, res.Failed()-maxLogged)
+			break
+		}
+		r.Log("%s failed: %s", d.Kind, f)
+	}
 }
 
 // showSummary turns the progress modal into the report. Runs on the UI
@@ -134,9 +157,16 @@ func (r *Runner) showSummary(lay *shell.Layer, modal *tview.Modal, d ops.Descrip
 	modal.SetDoneFunc(func(_ int, label string) {
 		switch {
 		case label == "Copy report":
-			if r.CopyText != nil {
-				r.CopyText(report)
+			if r.CopyText == nil {
+				return
 			}
+			// Said on the modal either way: a silent button that may or may
+			// not have done anything is the same as one that did nothing.
+			if err := r.CopyText(report); err != nil {
+				modal.SetText(report + "\nCopy failed: " + err.Error())
+				return
+			}
+			modal.SetText(report + "\nCopied to the clipboard.")
 		case strings.HasPrefix(label, "Retry failed"):
 			lay.Close()
 			// Inline, not in a goroutine: Start builds widgets and must run on
@@ -243,6 +273,24 @@ type uiReporter struct {
 
 	mu       sync.Mutex
 	lastDraw time.Time
+	// anchored records that started has been moved to the first byte-phase
+	// sample (see Progress).
+	anchored bool
+}
+
+// Queued implements ops.QueueReporter: the job shows "queued" while it waits
+// for a transfer slot, and the modal says why nothing is moving.
+func (u *uiReporter) Queued(waiting bool) {
+	if !waiting {
+		u.job.SetStatus(jobs.Running)
+		return
+	}
+	u.job.SetStatus(jobs.Queued)
+	if u.job.IsBackgrounded() {
+		return
+	}
+	text := fmt.Sprintf("%s queued\n\nWaiting for a transfer slot — at most %d run at once.\n", titleCase(string(u.desc.Kind)), u.runner.Queue.Slots())
+	u.runner.Shell.Do(func() { u.modal.SetText(text) })
 }
 
 func (u *uiReporter) Progress(p ops.Progress) {
@@ -260,6 +308,15 @@ func (u *uiReporter) Progress(p ops.Progress) {
 	}
 
 	u.mu.Lock()
+	// The rate and ETA are measured from the first byte-phase sample, not
+	// from launch: time spent answering overwrite prompts or queued behind
+	// other transfers is not transfer time, and counting it showed a fraction
+	// of the real rate and an ETA many times too long.
+	if p.Phase == "" && !u.anchored {
+		u.anchored = true
+		u.started = time.Now()
+	}
+	started := u.started
 	if time.Since(u.lastDraw) < drawEvery {
 		u.mu.Unlock()
 		return
@@ -267,7 +324,7 @@ func (u *uiReporter) Progress(p ops.Progress) {
 	u.lastDraw = time.Now()
 	u.mu.Unlock()
 
-	text := ProgressText(u.desc, p, time.Since(u.started))
+	text := ProgressText(u.desc, p, time.Since(started))
 	u.runner.Shell.Do(func() { u.modal.SetText(text) })
 }
 

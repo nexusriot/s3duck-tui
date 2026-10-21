@@ -224,6 +224,23 @@ func (w WriteOptions) applyPut(in *s3.PutObjectInput, contentTypeFor string) {
 	}
 }
 
+// applyPutForKey is applyPut for a body that is not a local file — an edited
+// object, a cross-profile stream — whose type can only come from the key's
+// name. applyPut's sniff fallback os.Opens its argument: handed a KEY, it read
+// whatever local file shared the name relative to the working directory, and a
+// key naming a FIFO or a terminal device ("dev/stdin") blocked the transfer.
+func (w WriteOptions) applyPutForKey(in *s3.PutObjectInput, key string) {
+	if in == nil {
+		return
+	}
+	if w.DetectMime && aws.ToString(in.ContentType) == "" {
+		if t := MimeForName(key); t != "" {
+			in.ContentType = aws.String(t)
+		}
+	}
+	w.applyPut(in, "")
+}
+
 // applyCreateMultipart is applyPut for the multipart-copy path, which starts a
 // bare object and so needs the same encryption and checksum decisions.
 func (w WriteOptions) applyCreateMultipart(in *s3.CreateMultipartUploadInput) {

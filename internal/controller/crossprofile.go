@@ -193,7 +193,7 @@ func (c *Controller) pickCrossDestination(items []copyMoveItem, src *model.Model
 			form.SetBorder(true)
 			form.AddButton("Copy", func() {
 				_, bucketName := form.GetFormItemByLabel("Bucket").(*tview.DropDown).GetCurrentOption()
-				prefix := model.NormalizePrefix(form.GetFormItemByLabel("Prefix").(*tview.InputField).GetText())
+				prefix := model.NormalizeTypedPrefix(form.GetFormItemByLabel("Prefix").(*tview.InputField).GetText())
 				lay.Close()
 				c.runCrossCopy(items, src, srcBucket, srcPrefix, dst, dstProfile.Name, bucketName, prefix)
 			})
@@ -253,8 +253,15 @@ func (c *Controller) runCrossCopy(items []copyMoveItem, src *model.Model, srcBuc
 			}
 			objs, err := src.ListObjects(ctx, it.srcKey, srcBucket)
 			if err != nil {
-				c.queue.Finish(job, false, 1)
 				c.shell.Do(lay.Close)
+				// A Cancel during expansion is the user's decision, not a
+				// failure: reported as one, a backgrounded job rang the bell
+				// with a ✗ notice for something nobody did wrong.
+				if ctx.Err() != nil {
+					c.queue.Finish(job, true, 0)
+					return
+				}
+				c.queue.Finish(job, false, 1)
 				c.error(fmt.Sprintf("Listing %s failed", it.srcKey), err)
 				return
 			}
@@ -287,8 +294,12 @@ func (c *Controller) runCrossCopy(items []copyMoveItem, src *model.Model, srcBuc
 		}
 		conflicts, cErr := dst.Conflicts(ctx, dstBucket, dstKeys)
 		if cErr != nil {
-			c.queue.Finish(job, false, 1)
 			c.shell.Do(lay.Close)
+			if ctx.Err() != nil { // cancelled during the probe, as above
+				c.queue.Finish(job, true, 0)
+				return
+			}
+			c.queue.Finish(job, false, 1)
 			c.error("Copy to profile", fmt.Errorf("checking the destination: %w", cErr))
 			return
 		}

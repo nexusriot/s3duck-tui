@@ -43,38 +43,65 @@ func SumAlgo(sum string) (algo, value string) {
 // counterpart to compare against. A missing root is an error; unreadable
 // entries below it abort the walk so a partial listing can never be mistaken
 // for "the destination has fewer files" and trigger deletes.
+//
+// It is WalkLocalTree without the unfollowed links; sync, which can delete,
+// must use WalkLocalTree.
 func WalkLocal(root string) ([]SyncEntry, error) {
+	entries, _, err := WalkLocalTree(root)
+	return entries, err
+}
+
+// WalkLocalTree is WalkLocal that also reports, as slash-separated paths
+// relative to root, the symbolic links below root it did not follow: links to
+// directories and links that do not resolve. A link to a regular file IS
+// followed, and listed with its target's size and mtime.
+//
+// An opaque path is not an absent one. Its contents are unknown, so the other
+// side's entries under it must be left out of the comparison: treated as
+// absent, a symlinked directory made a delete-extraneous upload sync plan
+// deleting every remote copy of its files.
+func WalkLocalTree(root string) (entries []SyncEntry, opaque []string, err error) {
 	info, err := os.Stat(root)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if !info.IsDir() {
-		return nil, fmt.Errorf("%s is not a directory", root)
+		return nil, nil, fmt.Errorf("%s is not a directory", root)
 	}
 
-	var out []SyncEntry
 	err = walkFollowingRoot(root, func(p string, fi os.FileInfo, err error) error {
 		if err != nil {
 			return err
-		}
-		if fi.IsDir() || !fi.Mode().IsRegular() {
-			return nil
 		}
 		rel, err := filepath.Rel(root, p)
 		if err != nil {
 			return err
 		}
-		out = append(out, SyncEntry{
-			Rel:  filepath.ToSlash(rel),
+		rel = filepath.ToSlash(rel)
+		if fi.Mode()&os.ModeSymlink != 0 {
+			st, serr := os.Stat(p)
+			switch {
+			case serr != nil || st.IsDir():
+				opaque = append(opaque, rel)
+				return nil
+			case st.Mode().IsRegular():
+				fi = st
+			}
+		}
+		if fi.IsDir() || !fi.Mode().IsRegular() {
+			return nil
+		}
+		entries = append(entries, SyncEntry{
+			Rel:  rel,
 			Size: fi.Size(),
 			Mod:  fi.ModTime(),
 		})
 		return nil
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return out, nil
+	return entries, opaque, nil
 }
 
 // ListRemoteEntries lists the objects under prefix as SyncEntries keyed by the
@@ -105,17 +132,33 @@ func (m *Model) ListRemoteEntries(ctx context.Context, prefix string, bucket *Ob
 	return out, nil
 }
 
-// NormalizePrefix returns key in S3 prefix form: slash-separated and, unless
-// empty (the bucket root), terminated with "/".
+// NormalizePrefix returns a browsing path in S3 prefix form: slash-separated
+// and, unless empty (the bucket root), terminated with "/".
+//
+// "/" is a real prefix here, not the root. S3 keys may begin with a slash, and
+// the listing shows them under a folder named "/" whose path is exactly "/";
+// reading that as the root sent an upload, a sync or a delete-extraneous plan
+// started inside it to the whole bucket instead. A prefix the user TYPES is
+// different — see NormalizeTypedPrefix.
 func NormalizePrefix(key string) string {
 	p := filepath.ToSlash(strings.TrimSpace(key))
-	if p == "" || p == "/" {
+	if p == "" {
 		return ""
 	}
 	if !strings.HasSuffix(p, "/") {
 		p += "/"
 	}
 	return p
+}
+
+// NormalizeTypedPrefix is NormalizePrefix for a destination prefix typed into
+// a form (copy/move, sync, cross-profile copy), where a bare "/" is the user
+// asking for the bucket root rather than for keys with a leading slash.
+func NormalizeTypedPrefix(s string) string {
+	if strings.TrimSpace(s) == "/" {
+		return ""
+	}
+	return NormalizePrefix(s)
 }
 
 // UploadFile uploads one local file to an explicit key. Model.Upload derives
@@ -148,6 +191,7 @@ func (m *Model) UploadFile(ctx context.Context, localPath, key string, bucket *O
 			}
 		},
 		limiter: m.Limiter,
+		ctx:     ctx,
 	}
 
 	in := &s3.PutObjectInput{

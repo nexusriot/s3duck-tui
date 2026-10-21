@@ -335,6 +335,12 @@ func (c *Controller) Sync() {
 		}
 
 		c.shell.Do(func() {
+			// A profile switch while the bucket list loaded: the form would
+			// scan and apply this profile's bucket names through the other
+			// profile's client (previewSync and runSync read c.model).
+			if c.model != mdl || !c.browsing {
+				return
+			}
 			c.showSyncForm(bucket, prefix, bucketNames, dstName, dstPrefix)
 		})
 	}()
@@ -355,7 +361,7 @@ func (c *Controller) showSyncForm(bucket *model.Object, prefix string, bucketNam
 		// directory, which a download sync then created.
 		localDir := expandHome(strings.TrimSpace(form.GetFormItemByLabel(widgets.FieldSyncLocalDir).(*tview.InputField).GetText()), c.params.HomeDir)
 		_, dstBucketName := form.GetFormItemByLabel(widgets.FieldSyncDstBucket).(*tview.DropDown).GetCurrentOption()
-		dstPfx := model.NormalizePrefix(form.GetFormItemByLabel(widgets.FieldSyncDstPrefix).(*tview.InputField).GetText())
+		dstPfx := model.NormalizeTypedPrefix(form.GetFormItemByLabel(widgets.FieldSyncDstPrefix).(*tview.InputField).GetText())
 		del := form.GetFormItemByLabel(widgets.FieldSyncDelete).(*tview.Checkbox).IsChecked()
 		sum := form.GetFormItemByLabel(widgets.FieldSyncChecksum).(*tview.Checkbox).IsChecked()
 		excl := parseExcludes(form.GetFormItemByLabel(widgets.FieldSyncExclude).(*tview.InputField).GetText())
@@ -435,11 +441,17 @@ func syncDirectionLabels() []string {
 // local directory is fatal for an upload (nothing to send) but normal for a
 // download's first run, where the transfer will create it.
 func (c *Controller) collectSides(ctx context.Context, mdl *model.Model, spec syncSpec) (src, dst []model.SyncEntry, err error) {
+	// opaque holds the local symbolic links the walk did not follow (links
+	// to directories, dangling links). Their contents are unknown rather than
+	// absent, so both sides' entries under them are left out below — the way
+	// an exclude pattern would leave them out.
+	var opaque []string
 	local := func() ([]model.SyncEntry, error) {
-		entries, err := model.WalkLocal(spec.localDir)
+		entries, links, err := model.WalkLocalTree(spec.localDir)
 		if err != nil && spec.dir == syncDownload && os.IsNotExist(err) {
 			return nil, nil
 		}
+		opaque = links
 		return entries, err
 	}
 
@@ -468,11 +480,20 @@ func (c *Controller) collectSides(ctx context.Context, mdl *model.Model, spec sy
 	// neither the diff nor a delete-extraneous pass can see a filtered path.
 	src = applyExcludes(src, spec.exclude)
 	dst = applyExcludes(dst, spec.exclude)
+	src = dropUnder(src, opaque)
+	dst = dropUnder(dst, opaque)
+	// The trash is invisible to sync on BOTH sides of a local↔remote run. The
+	// local side is filtered by the paths it mirrors remotely: dropping the
+	// trash from the remote side alone made a local copy of it (a download
+	// of the bucket root) an upload into the trash, or a delete-extraneous
+	// victim of a download sync.
 	switch spec.dir {
 	case syncUpload:
+		src = dropTrash(src, spec.dstPrefix, spec.trash)
 		dst = dropTrash(dst, spec.dstPrefix, spec.trash)
 	case syncDownload:
 		src = dropTrash(src, spec.srcPrefix, spec.trash)
+		dst = dropTrash(dst, spec.srcPrefix, spec.trash)
 	default:
 		src = dropTrash(src, spec.srcPrefix, spec.trash)
 		dst = dropTrash(dst, spec.dstPrefix, spec.trash)
@@ -480,6 +501,11 @@ func (c *Controller) collectSides(ctx context.Context, mdl *model.Model, spec sy
 
 	if spec.checksum {
 		c.fillSums(ctx, mdl, spec, src, dst)
+		// fillSums stops early on a cancel and keeps what it had; a plan
+		// built from half the sums is not the scan the user waited for.
+		if err := ctx.Err(); err != nil {
+			return nil, nil, err
+		}
 	}
 	return src, dst, nil
 }
@@ -515,8 +541,12 @@ func excluded(rel string, patterns []matcher) bool {
 			if m.match(seg) {
 				return true
 			}
-			// Also try the directory prefix, so "re:^build/" works.
-			if i > 0 && m.match(strings.Join(segments[:i+1], "/")+"/") {
+			// Also try each directory prefix, so "re:^build/$" works. The
+			// top-level directory counts too ("build/" itself — skipping
+			// it left a delete-extraneous plan free to remove the very tree
+			// the pattern names); the last segment is the file, not a
+			// directory, and is not tried with a slash.
+			if i < len(segments)-1 && m.match(strings.Join(segments[:i+1], "/")+"/") {
 				return true
 			}
 		}
@@ -545,6 +575,31 @@ func applyExcludes(entries []model.SyncEntry, patterns []string) []model.SyncEnt
 	return out
 }
 
+// dropUnder removes the entries at or below any of the given relative paths.
+// It is how an unfollowed local symlink keeps its remote counterpart out of
+// the diff: without it, a delete-extraneous upload sync read a symlinked
+// directory as empty and planned deleting every remote copy of its files,
+// and a download sync wrote straight through the link.
+func dropUnder(entries []model.SyncEntry, paths []string) []model.SyncEntry {
+	if len(paths) == 0 {
+		return entries
+	}
+	out := entries[:0:0]
+	for _, e := range entries {
+		hidden := false
+		for _, p := range paths {
+			if e.Rel == p || strings.HasPrefix(e.Rel, p+"/") {
+				hidden = true
+				break
+			}
+		}
+		if !hidden {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
 // withoutMtimes returns entries with their timestamps cleared, which makes
 // planSync compare by name and size alone.
 func withoutMtimes(entries []model.SyncEntry) []model.SyncEntry {
@@ -559,8 +614,14 @@ func withoutMtimes(entries []model.SyncEntry) []model.SyncEntry {
 // dropTrash removes the remote entries that live under the trash prefix.
 // prefix is the side's sync prefix: entries are relative to it, the trash
 // prefix to the bucket root.
+//
+// A side whose prefix is itself inside the trash is the user syncing the trash
+// on purpose (a stamp folder down to disk, say), so nothing is dropped: every
+// entry there starts with the trash prefix, and filtering them made that side
+// look empty — "already in sync" for a source, and, with delete-extraneous,
+// a plan deleting everything at the destination.
 func dropTrash(entries []model.SyncEntry, prefix, trash string) []model.SyncEntry {
-	if trash == "" {
+	if trash == "" || strings.HasPrefix(prefix, trash) {
 		return entries
 	}
 	out := entries[:0:0]
@@ -811,9 +872,9 @@ func (c *Controller) applySyncOp(ctx context.Context, mdl *model.Model, spec syn
 			return mdl.DeleteKey(ctx, dstKey, spec.dstBucket)
 		}
 		// A server-side copy moves no bytes through this process, so there is no
-		// progress to report — the op counter is the only thing that advances.
-		// The plan carries the source's size, so the copy needs no HEAD to
-		// decide between the single-request and multipart paths.
+		// progress within an object: the gauge advances by its size once the
+		// copy is acknowledged. The plan carries the source's size, so the copy
+		// needs no HEAD to decide between the single-request and multipart paths.
 		return mdl.CopyObjectSized(ctx, spec.srcBucket, spec.dstBucket, spec.srcPrefix+op.Rel, dstKey, op.Bytes)
 	}
 }

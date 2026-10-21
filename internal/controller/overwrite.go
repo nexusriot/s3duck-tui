@@ -28,7 +28,9 @@ func overwriteText(title string, conflicts []string, candidates int) string {
 			fmt.Fprintf(&b, "  ...and %d more\n", len(conflicts)-overwriteRows)
 			break
 		}
-		b.WriteString("  - " + k + "\n")
+		// Escaped: the modal renders tags, and the list must name exactly
+		// the objects that would be replaced.
+		b.WriteString("  - " + tview.Escape(k) + "\n")
 	}
 	return b.String()
 }
