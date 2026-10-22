@@ -45,6 +45,11 @@ type Config struct {
 	// MaxBytesPerSec caps transfer throughput (upload + download) for this
 	// profile. 0 (the default) means unlimited.
 	MaxBytesPerSec int64 `json:"max_bytes_per_sec,omitempty"`
+	// TransferWorkers is how many objects one download or one sync moves at
+	// a time. 0 (the default) means the built-in width of 4. It does not
+	// change how many jobs run at once, and the bandwidth cap above still
+	// bounds them all together.
+	TransferWorkers int `json:"transfer_workers,omitempty"`
 	// Bookmarks are saved bucket+prefix locations for this profile.
 	Bookmarks []Bookmark `json:"bookmarks,omitempty"`
 

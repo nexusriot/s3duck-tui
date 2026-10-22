@@ -548,3 +548,39 @@ func TestDownloadCancelDuringVerifyIsNotAFailure(t *testing.T) {
 		t.Errorf("canceled %v / done %d / unverified %d; want true / 1 / 1", res.Canceled, res.Done, res.Unverified)
 	}
 }
+
+// The configured width is the width: with every slot parked and dispatch then
+// cancelled, exactly Workers objects were in flight — both narrower and wider
+// than the default.
+func TestDownloadHonoursTheConfiguredWidth(t *testing.T) {
+	for _, width := range []int{2, DownloadWorkers + 2} {
+		ctx, cancel := context.WithCancel(context.Background())
+		f := &fakeFetcher{gate: make(chan struct{}), started: make(chan string, width)}
+		var tg []model.DownloadTarget
+		for i := range width * 5 {
+			tg = append(tg, model.DownloadTarget{Key: fmt.Sprintf("k%02d", i), Size: 1})
+		}
+		d := newDownload(t, newMemFS(), f, tg)
+		d.Workers = width
+
+		done := make(chan Result, 1)
+		go func() { done <- d.Run(ctx, &recorder{}) }()
+		for range width {
+			select {
+			case <-f.started:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("width %d: workers never reached the fetcher", width)
+			}
+		}
+		cancel()
+		close(f.gate)
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("width %d: Run did not return after the cancel", width)
+		}
+		if got := len(f.keys()); got != width {
+			t.Errorf("width %d: %d objects were in flight", width, got)
+		}
+	}
+}

@@ -925,3 +925,22 @@ func TestDeleteConfirmTextEscapesKeys(t *testing.T) {
 		}
 	}
 }
+
+// The properties modal renders colour tags, and both the name and the link it
+// shows are built from an S3 key — which may contain one. Unescaped, "a[red]b"
+// was drawn as "ab" and recoloured everything after it, so the panel named a
+// different object than the one it was opened on.
+func TestFilePropertiesTextEscapesKeys(t *testing.T) {
+	when := time.Date(2026, 10, 22, 12, 0, 0, 0, time.UTC)
+	text := filePropertiesText("a[red]b.txt", "10 B", &when, "etag", "https://h/bucket/a[red]b.txt")
+
+	tv := tview.NewTextView().SetDynamicColors(true)
+	tv.SetText(text)
+	shown := tv.GetText(true)
+	if !strings.Contains(shown, "a[red]b.txt") {
+		t.Errorf("the key was eaten as markup:\n%s", shown)
+	}
+	if !strings.Contains(shown, "https://h/bucket/a[red]b.txt") {
+		t.Errorf("the link was eaten as markup:\n%s", shown)
+	}
+}

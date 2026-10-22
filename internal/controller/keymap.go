@@ -73,6 +73,12 @@ const (
 	actBucketConfig   actionID = "bucket-config"
 	actAbortUploads   actionID = "abort-uploads"
 	actQuit           actionID = "quit"
+	actMarkPattern    actionID = "mark-pattern"
+	actUnmarkPattern  actionID = "unmark-pattern"
+	actInvertMarks    actionID = "invert-marks"
+	actDiffLocal      actionID = "diff-local"
+	actArchive        actionID = "download-archive"
+	actRestores       actionID = "restores"
 )
 
 // defaultBinding pairs an action with its out-of-the-box chord and the
@@ -93,6 +99,9 @@ func defaultBindings() []defaultBinding {
 		{actToggleSelect, "Space", false, "mark / unmark"},
 		{actSelectAll, "Ctrl+S", false, "mark everything visible"},
 		{actClearSelection, "Ctrl+X", false, "clear the marks"},
+		{actMarkPattern, "+", false, "mark by pattern (text, *.glob, re:regex)"},
+		{actUnmarkPattern, "-", false, "unmark by pattern"},
+		{actInvertMarks, "*", false, "invert the marks"},
 		{actFilter, "/", false, "filter the listing (text, *.glob, re:regex)"},
 		{actCancelListing, "Esc", false, "stop a running listing"},
 		{actRefresh, "r", false, "re-list from the server"},
@@ -150,6 +159,9 @@ func defaultBindings() []defaultBinding {
 		{actAbortUploads, "m", true, "abort incomplete multipart uploads"},
 		{actUsage, "u", true, "usage browser"},
 		{actVerify, "v", true, "verify the local copy"},
+		{actDiffLocal, "d", true, "diff against the local copy"},
+		{actArchive, "z", true, "download as one .tar.gz / .zip"},
+		{actRestores, "r", true, "Glacier restores (tracked)"},
 	}
 }
 

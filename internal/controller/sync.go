@@ -809,7 +809,9 @@ func (c *Controller) runSync(spec syncSpec, plan []syncOp) {
 		TotalBytes: st.Bytes,
 		// A remote→local sync changes nothing the browser is showing.
 		WritesRemote: spec.dir != syncDownload,
-		Gate:         c.queue,
+		// The profile's width; 0 keeps the built-in default.
+		Workers: c.transferWorkers(),
+		Gate:    c.queue,
 		Apply: func(ctx context.Context, i int, onProgress func(written int64)) error {
 			return c.applySyncOp(ctx, mdl, spec, plan[i], onProgress)
 		},

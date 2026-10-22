@@ -187,7 +187,7 @@ func (c *Controller) pickCrossDestination(items []copyMoveItem, src *model.Model
 
 			var lay *shell.Layer
 			form := tview.NewForm()
-			form.SetTitle(fmt.Sprintf(" Destination on %s ", dstProfile.Name))
+			form.SetTitle(fmt.Sprintf(" Destination on %s ", tview.Escape(dstProfile.Name)))
 			form.AddDropDown("Bucket", bucketNames, 0, nil)
 			form.AddInputField("Prefix", "", 50, nil, nil)
 			form.SetBorder(true)

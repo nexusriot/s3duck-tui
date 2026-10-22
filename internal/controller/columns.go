@@ -165,10 +165,30 @@ func rowClass(o *model.Object) string {
 	return *o.StorageClass
 }
 
+// restoreCell is what the class column shows for an object the restore
+// tracker is watching: where the restore stands replaces the class, which an
+// archived object's row would otherwise show without saying whether it can be
+// read yet. Empty for every other state, so the class shows as usual.
+func restoreCell(st restoreState) string {
+	switch st {
+	case restorePending:
+		return "[blue]restoring[-]"
+	case restoreReady:
+		return "[green]restored[-]"
+	}
+	return ""
+}
+
 // listRow renders one listing line: icon, padded name, then whichever of
 // size / date / storage class fit. Size is right-aligned so magnitudes line up
 // down the column.
 func listRow(o *model.Object, selected bool, cols listColumns) string {
+	return listRowRestore(o, selected, cols, "")
+}
+
+// listRowRestore is listRow with the restore tracker's state for the object,
+// shown in the class column (see restoreCell).
+func listRowRestore(o *model.Object, selected bool, cols listColumns, restore restoreState) string {
 	if o == nil || o.Key == nil {
 		return ""
 	}
@@ -211,6 +231,9 @@ func listRow(o *model.Object, selected bool, cols listColumns) string {
 		class := truncateDisplay(rowClass(o), colClassWidth)
 		if class != "" {
 			class = "[yellow]" + class + "[-]"
+		}
+		if cell := restoreCell(restore); cell != "" {
+			class = cell
 		}
 		b.WriteString(class)
 	}

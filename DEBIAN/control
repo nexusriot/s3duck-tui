@@ -3,5 +3,5 @@ Version: _version_
 Architecture: amd64
 Maintainer: Vladislav Ananev <nexus.riot@gmail.com>
 Description: Simple TUI client for S3
-Installed-Size: 15330
+Installed-Size: _installed_size_
 Recommends: xclip | xsel | wl-clipboard

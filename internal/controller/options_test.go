@@ -20,6 +20,7 @@ func TestOptionsRoundTrip(t *testing.T) {
 		KMSKey:      "key-1",
 		Checksum:    "CRC32C",
 		Verify:      true,
+		Workers:     "8",
 	}
 	applyOptionsToConfig(p, want)
 	if got := optionsFromConfig(p); got != want {
@@ -33,6 +34,30 @@ func TestOptionsRoundTrip(t *testing.T) {
 	}
 	if got := optionsFromConfig(&cfg.Config{}); !got.DetectMime {
 		t.Error("a profile predating this field must default to detecting")
+	}
+	if p.TransferWorkers != 8 {
+		t.Errorf("TransferWorkers = %d, want 8", p.TransferWorkers)
+	}
+	// The default is shown as a blank, not as a number nobody chose.
+	if got := optionsFromConfig(&cfg.Config{}); got.Workers != "" {
+		t.Errorf("default width renders as %q, want blank", got.Workers)
+	}
+}
+
+func TestParseWorkers(t *testing.T) {
+	for in, want := range map[string]int{"": 0, " ": 0, "1": 1, "16": 16, " 6 ": 6} {
+		if got, err := parseWorkers(in); err != nil || got != want {
+			t.Errorf("parseWorkers(%q) = %d, %v; want %d", in, got, err, want)
+		}
+	}
+	for _, bad := range []string{"0", "17", "-2", "four"} {
+		if _, err := parseWorkers(bad); err == nil {
+			t.Errorf("parseWorkers(%q) should be refused", bad)
+		}
+	}
+	o := widgets.ProfileOptions{DetectMime: true, Workers: "99"}
+	if err := validateProfileOptions(o); err == nil {
+		t.Error("an out-of-range width must fail validation, before it is saved")
 	}
 }
 

@@ -2,12 +2,14 @@ package controller
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/rivo/tview"
 
 	cfg "github.com/nexusriot/s3duck-tui/internal/config"
 	"github.com/nexusriot/s3duck-tui/internal/model"
+	"github.com/nexusriot/s3duck-tui/internal/ops"
 	"github.com/nexusriot/s3duck-tui/internal/ui/shell"
 	"github.com/nexusriot/s3duck-tui/internal/ui/widgets"
 )
@@ -84,7 +86,46 @@ func optionsFromConfig(p *cfg.Config) widgets.ProfileOptions {
 		KMSKey:     p.SSEKMSKeyID,
 		Checksum:   p.ChecksumAlgo,
 		Verify:     p.VerifyDownloads,
+		Workers:    workersText(p.TransferWorkers),
 	}
+}
+
+// maxTransferWorkers caps the per-job width. Past a few dozen parallel GETs
+// one client gains nothing but throttling responses, and each worker in a
+// download holds a 5 MiB buffer.
+const maxTransferWorkers = 16
+
+// workersText renders the stored width for the form: blank for the default,
+// so the field shows that nothing was chosen rather than a number that looks
+// like a choice.
+func workersText(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	return strconv.Itoa(n)
+}
+
+// parseWorkers reads the form's width: blank is the default (0), anything else
+// must be a whole number from 1 to maxTransferWorkers.
+func parseWorkers(s string) (int, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil || n < 1 || n > maxTransferWorkers {
+		return 0, fmt.Errorf("parallel transfers must be a number from 1 to %d (blank for the default of %d)", maxTransferWorkers, ops.DownloadWorkers)
+	}
+	return n, nil
+}
+
+// transferWorkers is the open profile's per-job transfer width; 0 lets each
+// operation use its built-in default.
+func (c *Controller) transferWorkers() int {
+	if c.activeConfig == nil {
+		return 0
+	}
+	return c.activeConfig.TransferWorkers
 }
 
 // readProfileOptions reads the form back by label and validates it.
@@ -122,6 +163,7 @@ func readProfileOptions(form *tview.Form, sseChoices, checksumChoices []string) 
 		KMSKey:      text(widgets.FieldOptKMSKey),
 		Checksum:    choice(widgets.FieldOptChecksum, checksumChoices),
 		Verify:      checked(widgets.FieldOptVerify),
+		Workers:     text(widgets.FieldOptWorkers),
 	}
 	return opts, validateProfileOptions(opts)
 }
@@ -137,6 +179,9 @@ func validateProfileOptions(o widgets.ProfileOptions) error {
 	}
 	if o.Trash && strings.HasPrefix(strings.TrimSpace(o.TrashPrefix), "/") {
 		return fmt.Errorf("a trash prefix is a key prefix, so it cannot start with /")
+	}
+	if _, err := parseWorkers(o.Workers); err != nil {
+		return err
 	}
 	if o.Verify && o.Checksum == "" {
 		// Not an error: an ETag comparison still verifies single-part
@@ -159,6 +204,9 @@ func applyOptionsToConfig(p *cfg.Config, o widgets.ProfileOptions) {
 	p.SSEKMSKeyID = o.KMSKey
 	p.ChecksumAlgo = o.Checksum
 	p.VerifyDownloads = o.Verify
+	// Validated before this is reached; a value that still fails to parse
+	// falls back to the default rather than storing nonsense.
+	p.TransferWorkers, _ = parseWorkers(o.Workers)
 }
 
 // optionsSummary is the one-line description used in the details pane and the
@@ -182,6 +230,9 @@ func optionsSummary(p *cfg.Config) string {
 	}
 	if p.VerifyDownloads {
 		parts = append(parts, "verify downloads")
+	}
+	if p.TransferWorkers > 0 {
+		parts = append(parts, fmt.Sprintf("%d parallel transfers", p.TransferWorkers))
 	}
 	return strings.Join(parts, ", ")
 }

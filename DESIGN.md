@@ -45,9 +45,9 @@ Three suites, split by what they can actually establish.
 
 **Unit tests** cover the pure functions — planners, formatters, parsers, comparators (`planSync`, `deleteConfirmText`, `filterSortObjects`, `ParseRestoreStatus`, `ParseAWSProfiles`) — and, since the `ops` refactor, the *orchestration* as well.
 
-That second half is new and is the point of `internal/ops`. An operation depends only on narrow interfaces declared by the consumer — `Fetcher`, `Pusher` (whose one method is `UploadTargets`), `Checker`, `FS` and `Gate` in `internal/ops/ports.go`, `Mover` beside its only user in `internal/ops/copy.go` — and `*model.Model` satisfies them directly. A fake therefore implements a handful of methods rather than sixty: the shared doubles — fetcher, checker, in-memory filesystem, gate and scripted reporter — are one ~240-line file (`internal/ops/fake_test.go`), with the mover and pusher fakes beside the tests that use them, and the decisions that matter run against it in milliseconds: a download's two-phase resolve, its overwrite answers, the four-worker pool, cancellation draining, verification accounting and the retry set; a copy's item-versus-object accounting, that a skipped file is neither done nor recorded as moved, and the skip set it hands the undo; an upload sending exactly its target list; that a cancel mid-run is reported as a cancel rather than as failures; and — the one with the sharpest failure mode — sync's writes-then-deletes barrier, including that a failed write cancels the delete phase and says why. Those are the branches that used to be reachable only by driving the real TUI against a live endpoint, which is to say the ones most likely to be wrong were the least tested.
+That second half is new and is the point of `internal/ops`. An operation depends only on narrow interfaces declared by the consumer — `Fetcher`, `Pusher` (whose one method is `UploadTargets`), `Checker`, `FS` and `Gate` in `internal/ops/ports.go`, `Mover` beside its only user in `internal/ops/copy.go` — and `*model.Model` satisfies them directly. A fake therefore implements a handful of methods rather than sixty: the shared doubles — fetcher, checker, in-memory filesystem, gate and scripted reporter — are one ~240-line file (`internal/ops/fake_test.go`), with the mover and pusher fakes beside the tests that use them, and the decisions that matter run against it in milliseconds: a download's two-phase resolve, its overwrite answers, the worker pool (including that a configured width is the width actually used), cancellation draining, verification accounting and the retry set; a copy's item-versus-object accounting, that a skipped file is neither done nor recorded as moved, and the skip set it hands the undo; an upload sending exactly its target list; that a cancel mid-run is reported as a cancel rather than as failures; and — the one with the sharpest failure mode — sync's writes-then-deletes barrier, including that a failed write cancels the delete phase and says why. Those are the branches that used to be reachable only by driving the real TUI against a live endpoint, which is to say the ones most likely to be wrong were the least tested.
 
-**Integration tests** (build tag `integration`) run against a live S3-compatible endpoint, in four files: `internal/model/integration_test.go`, `internal/model/integration_new_test.go` and `internal/model/integration_browse_test.go` for the calls the model makes, and `internal/controller/integration_test.go` for the flows the controller composes from them (sync in both directions, the exclude guard, safe delete's trash round trip). They exist because the most important properties of this code are unobservable without a server:
+**Integration tests** (build tag `integration`) run against a live S3-compatible endpoint, in seven files. For the calls the model makes: `internal/model/integration_test.go`, `integration_new_test.go`, `integration_browse_test.go`, `integration_archive_test.go` (the archive operation and the `OpenObject` port it streams through) and `integration_corner_test.go` (the key shapes and mid-run changes a fake store cannot produce). For the flows the controller composes from them: `internal/controller/integration_test.go` (sync in both directions, the exclude guard, safe delete's trash round trip) and `integration_corner_test.go` (the preview formatter, the restore tracker and the bucket dashboard against what a server really sends). They exist because the most important properties of this code are unobservable without a server:
 
 - a version restore *adds* a version rather than rewinding the history
 - a `DeleteVersion` leaves no delete marker, while an ordinary delete does
@@ -62,6 +62,10 @@ That second half is new and is the point of `internal/ops`. An operation depends
 - `UploadTargets` writes exactly the target list it is given — one file and one empty-folder marker, and nothing else from the directory they sit in
 - a ranged read returns exactly the requested window, and asking for more than the object holds returns the object rather than an error
 - `GetVersionContent` reaches a specific old version, which is what the diff needs
+- a HEAD of a missing key is recognised as *not found* — it carries no body, so the error arrives untyped and its code differs by backend, and the restore tracker would otherwise re-check a deleted object every minute forever
+- a real lifecycle rule keeps its scope through the summary, including the rule-level `Prefix` the SDK marks deprecated but a server still returns
+- an object deleted between the listing and its turn in an archive is left out and reported, while one that fails mid-body abandons the archive rather than leaving a corrupt file
+- the head of a gzip or a minified JSON document larger than the preview window still renders: the decoder meets the cut mid-stream and the re-indenter needs no closing brackets
 - `ListObjectsStream` reports a cancelled context instead of running to the end. The same test also asserts paging and the early stop, but with 12 keys in one 1000-key page it cannot fail on either; only the cancellation half really checks anything
 
 They skip entirely without `S3DUCK_TEST_ENDPOINT`, so a tagged run on a machine with no server is a no-op rather than a failure. `make test-integration` brings up a throwaway MinIO in Docker — the same pinned `alpine/minio` image, on a tmpfs `/data`, that CI uses — and tears it down again. Individual tests skip themselves when the endpoint lacks the feature (SSE-S3 needs a KMS MinIO does not configure by default, versioning may be unsupported) rather than failing against a legitimate backend.
@@ -71,6 +75,15 @@ They skip entirely without `S3DUCK_TEST_ENDPOINT`, so a tagged run on a machine 
 **The end-to-end suite** (`e2e/`, build tag `e2e`) drives exactly that. `TestMain` builds the binary from the working tree; each test starts it in its own tmux server with its own HOME (config, downloads, `XDG_STATE_HOME`) and its own bucket, types at it with `send-keys`, reads the screen with `capture-pane`, and asserts on what MinIO and the disk hold — never on what the app reported. tmux is the terminal because it is one: capture-pane returns the rendered grid as text, so a test waits for a dialog's own wording rather than for a sleep, and `settle` (two identical captures 60 ms apart) keeps the next key from racing the redraw. A failing test logs its last screen, which is usually the whole story; `remain-on-exit` keeps a crashed binary's panic on that screen. The cursor is located through the details panel's `FullPath` line (single pane) or by narrowing the listing with the filter (dual pane, which has no details panel).
 
 The scenarios are chosen by where a dialog's answer decides what happens to data — the seams the 2026-10 review found its worst bugs in: undo after *Skip existing* (file and folder), the local pane's upload of a highlighted or marked file, a config that fails to parse, a folder delete beside a same-stem sibling, and a delete-extraneous sync on a safe-delete profile with an exclude. Each data scenario was run against a binary built from the commit before its fix (`S3DUCK_E2E_BINARY`) and fails there with a statement about the bucket ("`src/a.txt` holds DST-A, want SRC-A"), not a timeout.
+
+`e2e/features_test.go` and `e2e/corner_test.go` extend the same method to the
+2026-10-22 round: each new feature through its real keys, then the inputs that
+make a dialog say something rather than do something — a pattern matching
+nothing, a regex that does not compile, a file name that is really a path, a
+zero-byte object, and a key or profile name that looks like a colour tag. That
+last pair is what found the escaping bug below, and it found it through the
+harness itself: the cursor is located through the details panel's `FullPath`
+line, so a key the panel was swallowing could not be reached at all.
 
 `make e2e` runs it hermetically (`e2e/run.sh`): MinIO on a tmpfs and a runner image (Go pinned by digest, tmux, the module cache) on a private compose network with no published ports, the tree mounted read-only; containers, network and volumes are removed afterwards pass or fail, and the runner image is kept as a build cache. Run from the host against an endpoint you already have, it needs Go and tmux; without `S3DUCK_TEST_ENDPOINT` it skips.
 
@@ -176,7 +189,7 @@ An Overwrite decision only sets a flag on the item — **nothing is deleted at p
 **Phase 2 — `transfer`: parallel download (semaphore pool)**
 
 ```
-sem = make(chan struct{}, DownloadWorkers)   // 4 concurrent workers
+sem = make(chan struct{}, d.workers())   // transfer_workers, default DownloadWorkers (4)
 
 for each r in todo:
     if ctx.Err() != nil: led.cancel(); break   // checked BEFORE the select
@@ -271,7 +284,7 @@ Addressing rather than mirroring is what retired the navigation race — but onl
 
 ## Bandwidth throttle
 
-`model.Config.MaxBytesPerSec` (from the profile) builds a `*rateLimiter` on the `Model`, shared by `progressReader`/`progressWriterAt`, so uploads, sync transfers and the 4-worker download pool of one profile honor one cap between them. It is one limiter per `*model.Model`, not one for the process: each profile open builds a fresh model (and limiter), and a cross-profile copy builds a second model for the destination, whose limiter is separate — the copy is throttled by the source's, on the read side. The pure `throttleStep` is a token bucket (tokens may go negative — the debt is paid by the next refill, which is what prevents over-crediting sleep time); `newRateLimiter(0)` returns nil (unlimited), making the hot path free when throttling is off. The sleep answers the transfer's context (each `progressReader`/`progressWriterAt` carries it), and the read or write then returns the cancellation: a downloader writes a 5 MiB chunk in one `WriteAt` and an uploader reads a whole part in one `Read`, so at a low cap one call owes tens of seconds, and a Cancel used to wait out every worker's sleep.
+`model.Config.MaxBytesPerSec` (from the profile) builds a `*rateLimiter` on the `Model`, shared by `progressReader`/`progressWriterAt`, so uploads, sync transfers and the download pool of one profile honor one cap between them, however wide `transfer_workers` makes the pools. It is one limiter per `*model.Model`, not one for the process: each profile open builds a fresh model (and limiter), and a cross-profile copy builds a second model for the destination, whose limiter is separate — the copy is throttled by the source's, on the read side. The pure `throttleStep` is a token bucket (tokens may go negative — the debt is paid by the next refill, which is what prevents over-crediting sleep time); `newRateLimiter(0)` returns nil (unlimited), making the hot path free when throttling is off. The sleep answers the transfer's context (each `progressReader`/`progressWriterAt` carries it), and the read or write then returns the cancellation: a downloader writes a 5 MiB chunk in one `WriteAt` and an uploader reads a whole part in one `Read`, so at a low cap one call owes tens of seconds, and a Cancel used to wait out every worker's sleep.
 
 ## Bookmarks, history, palette, batch rename
 
@@ -500,7 +513,7 @@ carries a `-<partcount>` suffix that a single `CopyObject` could never produce.
 - **Spec.** A run is described by one `syncSpec` (direction + local dir + source and destination bucket/prefix). Introducing it replaced a growing parameter list: the local↔remote flows only ever needed one bucket, but a remote↔remote run needs two, and threading both through every function is where mistakes would have lived. `collectSides` is the single place that knows which side comes from where.
 - **Collect.** `model.WalkLocal` walks the local root into `SyncEntry{Rel, Size, Mod}` (regular files only — a directory has no counterpart to compare against); `model.ListRemoteEntries` does the same from a paginated `ListObjects`, skipping folder-marker keys. Both sides key on a slash-separated path relative to their root, so they compare directly. `collectSides` then applies the run's **exclude patterns** (`applyExcludes`, matcher syntax) *before* anything else looks at the entries — an excluded path is invisible to the planner, so a delete-extraneous run cannot decide it is extraneous. That protection is why every pattern is compiled when the form is read and one that does not compile stops the run: an invalid `re:` used to match nothing, which put the very path it was meant to protect into the delete plan. The profile's trash prefix is dropped from the remote side(s) the same way (`dropTrash`): it is the app's own bookkeeping, and a delete-extraneous sync of the bucket root used to plan — and run, as real deletes — the removal of everything in the trash. Finally, when asked, `collectSides` fills each side's `Sum` for the paths present on both (`fillSums`).
 - **Plan.** `planSync(src, dst, del)` is pure. When both sides carry a checksum with the same algorithm, that decides it: equal sums mean no transfer whatever the timestamps say, different sums mean a transfer whatever the sizes say. Otherwise a file transfers when it is missing at the destination, when the sizes differ, or when the sizes match but the source is newer by more than `syncModTolerance` (2s, absorbing clock skew and coarse filesystem/S3 timestamp granularity). A zero timestamp on either side degrades to a size-only comparison rather than forcing a transfer. Deletes are emitted **only** when the flag is set. Output is ordered creates → updates → deletes, each group by path, so the plan is deterministic and reviewable.
-- **Apply.** The plan is handed to `ops.Sync`, which runs through the shared `flows.Runner` like every other transfer — so a sync is cancellable and backgroundable and honours the bandwidth limiter without `runSync` knowing how any of that works. `ops.Sync` sees only `SyncUnit{Label, Bytes, Delete}` plus an `Apply(ctx, i, onProgress)` closure: it has no idea there are three directions, which is what keeps the barrier and the pool testable without a bucket or a filesystem. Operations run through a **4-worker pool** (`ops.SyncWorkerCount`, never more workers than work), in two phases from the pure `ops.SplitSyncPhases`: every write completes before any delete starts, so a run cancelled partway leaves the destination having *gained* the new files but not yet *lost* the old ones — the safer intermediate state. Within a phase the operations are independent by construction (a path is either present at the source or not), so they interleave freely. Per-unit byte counts live in an `inFlight` map keyed by plan index so the displayed total stays correct with several transfers in progress. The controller keeps exactly the part that needs to know all three directions: `applySyncOp`, which maps plan entry *i* onto `model.UploadFile` (upload to an explicit key — `Model.Upload` derives keys from a local path of its own), `model.DownloadTarget`, `model.CopyObjectSized`, `model.DeleteKey`, or `os.Remove`. Failures are collected, not fatal: one unreadable file doesn't strand the rest, and the retry plan re-runs exactly those units (its `Apply` remaps the new indices back onto the original plan). A *cancel* is not a failure, though: the units in flight when it lands are not ledgered as failed, and the run reports itself cancelled. Ledgering them used to offer a "Retry failed" covering only those few, silently dropping every unit never dispatched and every delete.
+- **Apply.** The plan is handed to `ops.Sync`, which runs through the shared `flows.Runner` like every other transfer — so a sync is cancellable and backgroundable and honours the bandwidth limiter without `runSync` knowing how any of that works. `ops.Sync` sees only `SyncUnit{Label, Bytes, Delete}` plus an `Apply(ctx, i, onProgress)` closure: it has no idea there are three directions, which is what keeps the barrier and the pool testable without a bucket or a filesystem. Operations run through a **worker pool** (4 wide via `ops.SyncWorkerCount`, never more workers than work, or the profile's `transfer_workers`), in two phases from the pure `ops.SplitSyncPhases`: every write completes before any delete starts, so a run cancelled partway leaves the destination having *gained* the new files but not yet *lost* the old ones — the safer intermediate state. Within a phase the operations are independent by construction (a path is either present at the source or not), so they interleave freely. Per-unit byte counts live in an `inFlight` map keyed by plan index so the displayed total stays correct with several transfers in progress. The controller keeps exactly the part that needs to know all three directions: `applySyncOp`, which maps plan entry *i* onto `model.UploadFile` (upload to an explicit key — `Model.Upload` derives keys from a local path of its own), `model.DownloadTarget`, `model.CopyObjectSized`, `model.DeleteKey`, or `os.Remove`. Failures are collected, not fatal: one unreadable file doesn't strand the rest, and the retry plan re-runs exactly those units (its `Apply` remaps the new indices back onto the original plan). A *cancel* is not a failure, though: the units in flight when it lands are not ledgered as failed, and the run reports itself cancelled. Ledgering them used to offer a "Retry failed" covering only those few, silently dropping every unit never dispatched and every delete.
 - **Remote → remote.** The planner never knew which side was local — it diffs two `[]SyncEntry` — so the third direction needed only a second `ListRemoteEntries` call and one branch in `applySyncOp`, which issues a server-side copy instead of an upload — `CopyObjectSized`, with the size the plan already carries, so no object costs a `HeadObject` to choose between the single-request and multipart paths. Two consequences worth knowing: a server-side copy moves no bytes through this process, so there is **no progress within an object** — the byte gauge advances by each object's size as its copy is acknowledged; and it inherits the same-endpoint constraint documented below, since both sides go through one client.
 - **Safety.** Deletes are skipped entirely when any write failed — a partly-written destination is not the mirror the reviewed plan assumed, so removals are no longer covered by the user's approval. A remote→remote run between overlapping prefixes of the same bucket is rejected up front (`prefixesOverlap`): the source listing would include the destination, so src-inside-dst with delete-extraneous would delete the physical source objects, and dst-inside-src re-nests one level per run (`mirror/mirror/…`). `DeleteKey` refuses any key ending in `/`, so a sync delete can never degrade into `Delete`'s recursive prefix removal. Every download op passes `overwrite=true` — the reviewed plan has already decided what may be replaced — and `DownloadTarget` swaps the file atomically (temp + rename) once the body is fully on disk — it used to pre-remove the stale copy, which destroyed the local file even when the transfer then failed. Nor does the download op create directories itself any more: `DownloadTarget` makes the parents only after `SafeLocalPath` has checked the key stays inside the local directory, where an `os.MkdirAll` up front created directories outside it for a hostile `../` key before the write was refused. Two download-direction gaps remain (see *Known limitations*): a non-canonical key such as `a//b.txt` plans as a create of `a//b.txt` *and* a delete of the local `a/b.txt` — the same file, so delete-extraneous removes what the run just downloaded. Symbolic links *below* the local root are resolved by `WalkLocalTree`: a link to a file is listed with its target's size and mtime, while a link to a directory, or one that does not resolve, is reported as opaque, and both sides' entries under it are left out of the comparison (`dropUnder`) the way an exclude would leave them out — `filepath.Walk` lstats every entry, so such a directory used to read as empty, and a delete-extraneous upload planned deleting every remote copy of its files (a download wrote through the link). The trash is filtered from both sides of a local↔remote run, the local side by the paths it mirrors, except when a side's prefix is itself inside the trash: that is the trash being synced on purpose, and filtering it emptied the side. `WalkLocal` follows a symlinked root (`walkFollowingRoot`): `filepath.Walk` lstats its root, so a symlinked directory used to produce an *empty listing with a nil error* — precisely the partial-listing-taken-as-truth case the doc comment promises can't happen, and with delete-extraneous set it planned deleting the entire destination.
 
@@ -542,7 +555,15 @@ Saving is guarded against the **lost update**: the ETag captured at download tim
 
 ## Bucket config & multipart
 
-`model.BucketConfig` gathers versioning/encryption/object-lock/region, treating endpoints that don't support a feature (MinIO/Ceph return an error) as its default rather than failing. `ListMultipartUploads`/`AbortMultipartUpload` surface and clean orphaned upload parts (one page — the first 1 000 uploads — which is usually ample for cleanup; note that "abort all" cannot tell an orphan from an upload this app is still running). Both act on the current bucket, from the leader key (`, b` and `, m`) or the palette.
+`model.BucketConfig` (`internal/model/bucketconfig.go`) reads every section the dashboard shows — region, versioning, default encryption, object lock, public access block, tags, policy, lifecycle, CORS, website, replication, event notifications, access logging — as thirteen independent requests run at once, so the dashboard opens in one round trip's time rather than thirteen; it takes a context, and the dashboard reads it behind a cancellable wait.
+
+Each section is a `ConfigItem` with a `ConfigState`, because "none", "this server does not do that" and "you may not look" are different answers. `classifyConfigErr` sorts a failure by the call's own *unset* codes (`NoSuchBucketPolicy`, `NoSuchCORSConfiguration`, `ServerSideEncryptionConfigurationNotFoundError`, …), then not-implemented (`NotImplemented`, HTTP 501/405 — what MinIO and Ceph answer for website, logging and public access block), then denied (`AccessDenied`, 403); anything else is shown as an error with its text. The old reader turned *every* failure into the section's default, which is how an AccessDenied read as "Versioning: off" — stated as a fact about a bucket nobody had looked at.
+
+The summaries are pure functions over the SDK types (`summarizeLifecycle`, `summarizeReplication`, …), tested without an endpoint. The policy is shown whole, indented: who may do what *is* the content, and a count of statements alone cannot be audited.
+
+The tag editor (`t` on the dashboard) is the one write. `PutBucketTagging` replaces the whole set and S3 refuses keys with the `aws:` prefix, so a bucket that carries system tags (CloudFormation stamps `aws:cloudformation:*`) cannot have its set rewritten without losing them; the editor refuses to open there rather than drop them. An empty set is a `DeleteBucketTagging`, since S3 refuses an empty `PutBucketTagging`. Limits: 50 tags per bucket (an object allows 10), 128/256-character keys/values.
+
+`ListMultipartUploads`/`AbortMultipartUpload` surface and clean orphaned upload parts (one page — the first 1 000 uploads — which is usually ample for cleanup; note that "abort all" cannot tell an orphan from an upload this app is still running). Both act on the current bucket, from the leader key (`, b` and `, m`) or the palette.
 
 ## Selection scoping
 
@@ -592,6 +613,7 @@ Profiles are stored in `~/.config/s3duck-tui/config.json` (mode `0600`), created
   "sse_kms_key_id":   "",
   "checksum_algo":    "CRC32C",
   "verify_downloads": true,
+  "transfer_workers": 0,
   "trash":            false,
   "trash_prefix":     "",
   "last_bucket":      "reports",
@@ -629,6 +651,7 @@ Two more files sit beside it, both optional:
 |---|---|---|
 | `~/.config/s3duck-tui/keys.json` | the user | Rebinds any action; see *Keymap*. Never written by the app. |
 | `$XDG_STATE_HOME/s3duck-tui/activity.log` (`~/.local/state/…` when unset) | the app | Append-only operation log, mode 0600, rotated once at 2 MiB; see *Persistent activity log*. |
+| `$XDG_STATE_HOME/s3duck-tui/restores.json` | the app | The Glacier restores being waited on, per profile; see *Glacier restore tracker*. Rewritten whole (temp file + rename) on every change; an unreadable one starts the list empty. |
 
 ---
 
@@ -851,12 +874,12 @@ metadata and storage-class rewrites, the version actions, the editor) pass
 
 What deliberately still runs on `context.TODO()` is the set of bucket-level
 calls — `CreateBucket`, `CreateFolder`, `DeleteBucket`, `MakeBucketPublic`,
-`GetBucketLocation`, `BucketConfig`, `PresignGetURL`, `ListMultipartUploads`,
-`AbortMultipartUpload`. None of them paginates, and each request is bounded by
+`GetBucketLocation`, `PresignGetURL`, `ListMultipartUploads`,
+`AbortMultipartUpload`. (`BucketConfig` left the list when it grew to thirteen
+requests: it now takes a context, and the dashboard's wait can cancel it.) None of them paginates, and each request is bounded by
 the transport's per-phase timeouts, so threading a context through them would
 add signature churn for no behaviour a user could observe. They are not all
-one round trip, though: `BucketConfig` makes four (location, versioning,
-encryption, object lock), a public `CreateBucket` two (the bucket, then its
+one round trip, though: a public `CreateBucket` makes two (the bucket, then its
 policy), and `PresignGetURL` none — it signs locally. `GetConfig`'s
 `LoadDefaultConfig` is the same case.
 
@@ -1008,9 +1031,10 @@ now folds its overflow into one disclosed row instead of truncating.
 
 Inspecting an object's contents meant downloading it or opening `$EDITOR`,
 which refuses anything binary or over 1 MiB. The missing piece was the ranged
-GET: `GetObjectHead` reads a fixed 64 KiB window, so previewing a 40 GiB log
-costs one small request, and the read is capped independently of the range
-because some S3-compatible backends ignore `Range` entirely.
+GET: `GetObjectHead` reads a bounded window — 64 KiB, or 256 KiB when the name
+says the object is compressed (see *Formatted preview*) — so previewing a
+40 GiB log costs one small request, and the read is capped independently of
+the range because some S3-compatible backends ignore `Range` entirely.
 
 Binary content is rendered as a hexdump rather than refused — the question a
 preview answers about a blob is usually "what *is* this?", and magic numbers
@@ -1037,6 +1061,62 @@ a side, and the table for it is ~5 GiB of `int`. `maxDiffCells` (4 Mi cells,
 with a message naming both line counts and suggests downloading the versions.
 That covers every config file a version diff is for, and declining beats
 taking the process down.
+
+### Formatted preview (`internal/controller/previewfmt.go`)
+
+`renderPreview` decides what the head *is* from three hints, strongest first:
+the magic bytes (gzip `1f 8b`, zstd `28 b5 2f fd`, tar's `ustar` at 257), the
+key's extension, and the Content-Type — which is often the generic
+`application/octet-stream` and so only breaks ties. Magic beats name in both
+directions: an extensionless gzip is decoded, and a `.gz` that is really text
+is shown as text rather than reported undecodable.
+
+A head is a truncated stream by construction, so every parser here is one
+that degrades instead of failing at the cut:
+
+- **Decompression** keeps what decoded before the decoder's unexpected-EOF. A
+  name that says compressed gets a 256 KiB window instead of 64 KiB, because
+  the unit a compressor emits is a block (zstd's run to 128 KiB) and a window
+  holding no whole block decodes to nothing. Output is capped at 256 KiB.
+  zstd comes from `github.com/klauspost/compress` (pinned to the last release
+  that builds with the `go` line in go.mod), bounded to one goroutine and a
+  64 MiB window. bzip2 and xz are not decoded: a bzip2 block can be 900 KiB,
+  far past any window a preview should fetch.
+- **JSON** goes through `json.Indent` when the document is complete, and
+  through `reindentJSON` — a token-level re-indenter that needs no closing
+  brackets — when it is not; the label says which. Sniffing an extensionless
+  `{`/`[` head as JSON requires a quoted key after `{` and an object, array or
+  string after `[`, because `[2024-01-01 12:00]` and `[INFO]` start log lines.
+  JSON Lines are left as they are: one record per line is already the
+  readable form.
+- **CSV/TSV** are read with `LazyQuotes` and ragged rows allowed; the record
+  that ran into the end of a truncated read is dropped (it is a fragment)
+  unless the data ends on a line break. Cells are capped at 32 cells wide and
+  an embedded newline is shown as `↵`, so no cell can break its row; one
+  column is not a table and falls back to text.
+- **tar** lists entries like `tar tv` until the first header or body the read
+  did not reach, and says the listing stopped there.
+
+Formatting hides something every time (a CSV's real quoting, a JSON file's own
+layout), so whenever it changed anything the raw text of the same decoded
+bytes is kept and `r` swaps between them.
+
+### Diff against a local file (`internal/controller/difflocal.go`)
+
+The version diff's `unifiedDiff`, aimed at the object and a local file. The
+local side is looked for where the user is — the local pane's directory, by
+base name, since the pane shows one directory — and otherwise where a
+download would have put it (`SafeLocalPath`, so a key cannot reach outside the
+download directory); when neither exists the path is asked for, prefilled
+with the guess. Both bodies are capped at 1 MiB like the editor's.
+
+`compareLocal` answers before diffing where a diff would mislead: identical
+bytes are "identical"; binary bodies get a size comparison, not a hexdump
+diff; and two texts that differ only in CRLF or the final newline — which
+`splitLines` normalises away — are said to differ in exactly that, because a
+user diffing a Windows-edited file is asking precisely that question.
+`diffChangeRows` lists the first row of each run of changes, so `n` / `N` can
+jump between them in a full-context diff.
 
 ## Trash (`internal/controller/trash.go`)
 
@@ -1185,6 +1265,98 @@ since an empty result would read as "no matches". And a sync exclude that does
 not compile stops the run, because an exclude matching nothing puts the path it
 was meant to protect into the delete plan.
 
+## Download as one archive (`internal/ops/archive.go`)
+
+`ops.Archive` streams the resolved objects — the same expansion a download
+uses, `resolveTargets` — into one `.tar.gz` or `.zip`, through the `Opener`
+port (`model.OpenObject`: a GET whose body is read through the profile's
+bandwidth cap). Nothing is staged on disk, so archiving a folder needs only
+the archive's own space. It runs through the shared `Runner` like any
+transfer: confirmation, gate, background, cancel, failure list.
+
+An archive is one stream, so objects go in one at a time and there is no
+worker pool. Failures split by *when* they happen. An object that cannot be
+opened (denied, an archived Glacier object, deleted since the listing) has
+nothing written yet, so it is left out and reported and the archive stays
+whole. One that fails mid-body cannot be left out — its entry header already
+declared the full size — so the run is abandoned rather than leave a file that
+looks finished and is not. The archive is built in a hidden temp file beside
+the destination, synced and renamed into place only when every entry is in; a
+cancelled or abandoned run leaves nothing, and an existing archive of that
+name (replaced only after the overwrite question) survives until then. Done is
+counted only after the rename, and a run where nothing could be opened writes
+no file at all.
+
+Entry names are relative to the browsed prefix (`ArchiveEntryName`): empty
+segments collapse, and a `..` segment is refused — the zip-slip a download
+refuses, moved to where an extracting tool would meet it. Two keys that land
+on one name (`a//b`, `a/b`) are refused rather than both written, since
+extraction would keep only the last. A zip stores already-compressed formats
+(images, video, archives, Parquet) instead of deflating them again and
+declares each entry's size up front, so the writer can choose zip64 for one
+over 4 GiB before it starts. Times are truncated to whole seconds: tar would
+otherwise switch to PAX headers for nothing, and zip's DOS time cannot hold
+them anyway.
+
+## Transfer width (`transfer_workers`)
+
+`ops.Download` and `ops.Sync` each run a bounded pool; `transfer_workers` sets
+its width per profile (1–16, default `DownloadWorkers` / `SyncWorkers` = 4).
+It widens one job, not the queue — the `jobs.Queue` gate still lets two jobs
+move bytes at once — and `max_bytes_per_sec` still caps everything together.
+The cap of 16 is where a single client stops gaining throughput and starts
+collecting SlowDown answers, and each download worker holds a 5 MiB buffer.
+The form shows the default as a blank rather than a 4, so a number on it is
+always a choice someone made.
+
+## Mark by pattern (`internal/controller/marks.go`)
+
+Midnight Commander's `+` / `-` / `*`. The pattern is the filter's own query
+(`match.go`), matched against the displayed name, and the scope is what the
+filter lets through — the same scope as Ctrl+S, so a mark never lands on a row
+the user cannot see. Folders are left out unless *Include folders* is ticked:
+a folder mark is a recursive one, and `*` then Delete should not take a tree
+with it. The last pattern and checkbox are offered again.
+
+## Glacier restore tracker (`internal/controller/restores.go`)
+
+A restore is asynchronous — minutes for Expedited, hours for Standard, up to
+two days for Bulk — and the app used to say only "check the status with m or
+c". The tracker remembers every restore requested with `c`, and any already
+in progress that `c` sees, in `restores.json` beside the activity log (state,
+not configuration; the wait outlives a session).
+
+`nextRestoreState` is the whole judgement, a pure function of the previous
+state and one HEAD: `ongoing-request="true"` is pending; `false` is ready
+(with its expiry) and, if the previous state was not ready, the moment worth
+the bell; no restore header on an archived object is *expired* after ready and
+*not restoring* otherwise; a non-archive class is *not archived*; 404 is
+*gone*; any other failure is *check failed*, kept and retried. Expired, not
+restoring, not archived and gone are final and never checked again.
+
+`runRestorePoller` ticks every minute for the app's lifetime, but the tick
+only schedules a round on the UI goroutine, where the open profile and its
+client are read without a race; the HEADs run off it, at most 100 per round,
+serialised by `restoreCheckMu` against a manual `r`. Ready restores are
+re-checked every 30 minutes, only to notice their expiry. Opening a profile
+checks at once. A ready transition logs, sets the header notice and rings the
+bell; the class column shows `restoring` / `restored` for tracked objects
+(`restoreCell`) in place of the class.
+
+## Profile export (`internal/controller/export.go`)
+
+`x` on the profiles screen renders the highlighted profile for the AWS CLI
+(`~/.aws/config` + `credentials`, with `endpoint_url` and path-style
+addressing for a custom endpoint, since that is how this app addresses one),
+`mc alias set`, or an rclone remote. The secret key and session token are
+never written — placeholders stand in — so the snippet is safe to paste into a
+ticket; the access key ID is kept as the identifier of which secret to fill
+in. A delegating profile exports its delegation instead (the endpoint lines
+for its own `~/.aws` profile; rclone's `env_auth` + `profile`), and mc, which
+cannot read `~/.aws`, says so. `exportProfile` is pure and tested; the viewer
+copies (`c`) or writes the snippet to a 0600 file in the profile's download
+directory (`w`), the latter for the SSH sessions where no clipboard exists.
+
 ## Known limitations
 
 | Area | Description |
@@ -1201,14 +1373,17 @@ was meant to protect into the delete plan.
 | **No download resume** | Interrupted downloads restart from byte 0. Transfers write to a temp file beside the target, `<name>.<random>.s3duck-part` (unique per transfer), that is removed on cancel/failure; the target file is only ever replaced by a completed download. |
 | ~~Sync compares size + mtime, not content~~ | **Fixed (optional).** The sync form's *Compare content by checksum* fills `SyncEntry.Sum` from the object's stored whole-object checksum (or its plain-MD5 ETag) and a locally computed one, and `planSync` compares those when both sides agree on the algorithm. It costs one request per remote object and a full read per local one, so it is a choice rather than the default; paths where either side cannot produce a comparable sum fall back to size+mtime. |
 | **An upload sync straight after a download sync re-uploads** | A downloaded file's local mtime is its download time, which is newer than the object's `LastModified`. Reversing the direction therefore sees "source is newer" for every file and re-sends them once (sizes are equal, so nothing is corrupted, and the second reversal is a no-op). This matches `aws s3 sync` semantics; the dry-run plan shows it before anything moves — and *Compare content by checksum* avoids it entirely. |
-| ~~Sync applies one operation at a time~~ | **Fixed.** `ops.Sync` uses a 4-worker pool with a writes-then-deletes barrier (see *Sync* above). |
+| ~~Sync applies one operation at a time~~ | **Fixed.** `ops.Sync` uses a worker pool (4 wide, or the profile's `transfer_workers`) with a writes-then-deletes barrier (see *Sync* above). |
 | **Sync direction is one-way** | Each run treats one side as the source of truth. There is no bidirectional merge and no conflict resolution — the newer-wins rule only ever applies in the chosen direction. |
 | **Download sync and unusual keys** | A non-canonical key such as `a//b.txt` is planned as a create of `a//b.txt` *and* a delete of the local `a/b.txt` — the same file — so delete-extraneous removes what the run just downloaded. (Symlinked local subdirectories are no longer written through: sync leaves them out on both sides, see *Sync*.) |
 | **Static session tokens expire, silently** | A *stored* temporary credential is used as-is: when it expires, calls start failing with an auth error and s3duck neither refreshes it nor warns beforehand. The fix is not to store one — set the profile's `aws_profile` instead and the SDK re-resolves (and re-runs SSO / assume-role) on expiry. |
 | **Versioned buckets can't be emptied from the TUI** | `model.Delete` sends no `VersionId`, so folder deletes write delete markers only; `EmptyBucket` clears current objects but old versions survive, and `DeleteBucket` then fails with BucketNotEmpty. A version-aware purge is on the roadmap. |
 | **Whitespace keys** | Every secondary-text reader trims the key, so `"dir/report "` resolves to `"dir/report"` in lookups (wrong object if both exist, silent no-op if only the padded one does). |
 | **Versioning needs a versioned bucket** | On an unversioned bucket S3 reports a single `null` version; the browser shows exactly that rather than hiding the feature. Enabling versioning is a bucket-level operation s3duck does not perform. |
-| **Restore is asynchronous** | `RestoreObject` only *requests* a restore; completion takes minutes to hours and s3duck does not poll. Re-open the storage-class form (`c`) or the metadata editor (`m`) to see the current state. |
+| **Restores are checked only while their profile is open** | The tracker polls the open profile's restores (a HEAD per object per minute); another profile's wait out until it is opened, which then checks at once. The HEAD goes through the open client, which is pinned to the region of the last bucket entered, so on AWS a restore in a bucket of another region reads *check failed* until a bucket in that region is entered. |
+| **Archives are written one object at a time** | A tar or zip is a single stream, so `, z` cannot parallelise the way a download does, and an object that fails mid-transfer abandons the whole archive (one that cannot be opened is only left out). |
+| **The preview decodes gzip and zstd only** | bzip2 and xz heads are shown as a hexdump: a bzip2 block can be 900 KiB, past any window a preview should read. A zip cannot be listed from its head at all — its directory is at the end. |
+| **Profile export leaves the secrets to fill in** | By design: the secret key and any session token are placeholders. mc takes no session token on `alias set` and cannot read `~/.aws`, which the export says rather than working around. |
 | **Metadata edits rewrite the object** | A metadata save is a server-side copy onto the same key. On a versioned bucket that creates a new version; the ETag may also change for multipart objects (and always does when the object is large enough to take the multipart-copy path, which re-chunks it). |
 | **Undo and sync do not prompt before overwriting** | Copy, move, rename, paste, upload and trash restore confirm first (see *Overwrite confirmation*). Sync is exempt because its dry-run plan already lists the updates; undo because it has its own confirmation and restores objects to where they just were — leaving alone whatever the original move skipped. An undo belongs to the profile its move ran in; anywhere else `u` says "Nothing to undo in this profile". In-place rewrites (metadata, storage class, version restore, editor save) do not prompt either. |
 | **A folder undo also moves pre-existing objects** | Undoing a folder move reverses the whole destination folder, so objects that were already in it — ones the move did not conflict with — are moved back into the source folder too. Nothing is lost (their keys did not exist at the source), but they end up where they never were. A per-object undo would need `MoveKeys` to report the exact keys it wrote. |
@@ -1228,6 +1403,38 @@ was meant to protect into the delete plan.
 | **The version diff is bounded by line count** | `unifiedDiff`'s LCS table is quadratic in lines, so `maxDiffCells` (4 Mi cells, two ~2 000-line files) bounds it rather than the 1 MiB body cap, which would permit a multi-gigabyte table. A larger pair is declined with both line counts named; download the two versions and diff them locally. |
 
 ---
+
+## Fixed in the 2026-10-22 corner-case round
+
+Found by driving the new features against a live endpoint with awkward input,
+which is the only way this class shows up: every unit test feeds these
+functions names that contain no brackets.
+
+**Colour tags in text the app did not write.** tview renders `[red]` as
+markup wherever dynamic colours are on, which is every list row, every modal
+and **every widget title**. `listRow` and `deleteConfirmText` had always
+escaped their keys; nothing else did. So an object named `logs/[red]alert.log`
+was shown as `logs/alert.log` in the details panel, in the preview's title bar,
+in the properties modal and in the metadata, storage-class and version
+dialogs — the one piece of chrome that says *which* object you are acting on
+named a different one. A profile named `[red]prod` did the same on the
+profiles screen, and a bucket or prefix containing a bracket pair recoloured
+the browser's own title.
+
+The rule is now applied wherever untrusted text reaches a rendered string:
+object keys, bucket names, prefixes, profile names, local paths and the search
+query are escaped at the point of formatting (`tview.Escape`). Two details
+worth keeping in mind when adding to this:
+
+- A title mixes markup the app *does* mean (`[yellow]listing… 400`) with data
+  it does not, so the escape goes around the data, never the whole string.
+- `fillConfigData` escapes a row's **primary** text and leaves its secondary
+  text raw: the secondary is that row's lookup key (`ConfigEntryByName`) and is
+  never drawn, so escaping it would break the lookup instead of the display.
+
+`filePropertiesText` was split out of `ShowFileProperties` for the same reason
+`deleteConfirmText` exists: the escaping is then a pure function with a test,
+rather than a line inside a widget call that no test can see.
 
 ## Fixed in the 2026-10-21 review
 

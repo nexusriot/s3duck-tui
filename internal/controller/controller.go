@@ -113,6 +113,11 @@ type Controller struct {
 	// goroutine only, like every other input-handler field.
 	leaderArmed bool
 
+	// lastMarkPattern / markFolders are what the last mark-by-pattern used,
+	// offered again by the next one. UI goroutine only.
+	lastMarkPattern string
+	markFolders     bool
+
 	// listing tracks the in-flight navigation listing so Esc can cancel it.
 	listing listingState
 
@@ -153,6 +158,12 @@ type Controller struct {
 	// refreshMu serializes updateList so overlapping refreshes can't stack
 	// network calls or race on the object map.
 	refreshMu sync.Mutex
+
+	// restores is the Glacier restore tracker (restores.go); it locks itself.
+	// restoreCheckMu keeps the poller and a manual "check now" from running
+	// two rounds of HEADs at once.
+	restores       *restoreTracker
+	restoreCheckMu sync.Mutex
 }
 
 // activityEntry is one line in the in-session operation log.
@@ -189,6 +200,7 @@ func NewController() *Controller {
 	c.transfers = screens.NewTransfers(c.shell, c.queue, c.pushModal)
 	c.keys = loadKeymap(KeysPath(params.HomeDir))
 	c.auditPath = AuditPath(params.HomeDir)
+	c.restores = loadRestoreTracker(RestoresPath(params.HomeDir))
 	c.wireFilter(v.PaneFilter(0))
 	c.wireFilter(v.PaneFilter(1))
 	return c
@@ -650,20 +662,7 @@ func (c *Controller) Download() {
 	srcPath := c.pane().Path()
 	mdl := c.model
 
-	names := c.selectedNames()
-	if len(names) == 0 {
-		// current item only
-		cur := c.getSelectedObjectName()
-		names = []string{cur}
-	}
-	var sel []*model.Object
-	for _, name := range names {
-		val, ok := c.pane().Lookup(name)
-		if !ok || (val.Ot != model.File && val.Ot != model.Folder) {
-			continue
-		}
-		sel = append(sel, val)
-	}
+	sel := c.downloadSelection()
 	if len(sel) == 0 {
 		return
 	}
@@ -675,27 +674,14 @@ func (c *Controller) Download() {
 
 	go func() {
 		defer resolveCancel()
-		var allObjects []model.DownloadTarget
-		var totalSize int64
-		for _, val := range sel {
-			key := *val.FullPath
-			objs, size, err := mdl.ResolveDownloadObjects(
-				resolveCtx,
-				key,
-				val.Ot == model.Folder,
-				val.Size,
-				srcBucket,
-			)
-			if err != nil {
-				c.shell.Do(resolveWait.Close)
-				// A cancel is the user's own decision, not an error to report.
-				if resolveCtx.Err() == nil {
-					c.error("Download: resolving objects failed", err)
-				}
-				return
+		allObjects, totalSize, err := resolveTargets(resolveCtx, mdl, srcBucket, sel)
+		if err != nil {
+			c.shell.Do(resolveWait.Close)
+			// A cancel is the user's own decision, not an error to report.
+			if resolveCtx.Err() == nil {
+				c.error("Download: resolving objects failed", err)
 			}
-			allObjects = append(allObjects, objs...)
-			totalSize += size
+			return
 		}
 
 		c.shell.Do(func() {
@@ -704,7 +690,7 @@ func (c *Controller) Download() {
 				return
 			}
 			proceed := func(cwd string) {
-				c.runDownload(mdl, srcBucket, srcPath, len(names), allObjects, totalSize, cwd)
+				c.runDownload(mdl, srcBucket, srcPath, len(sel), allObjects, totalSize, cwd)
 			}
 			switch {
 			case c.otherPaneLocalDir() != "":
@@ -718,6 +704,41 @@ func (c *Controller) Download() {
 			}
 		})
 	}()
+}
+
+// resolveTargets expands the chosen files and folders into the objects they
+// stand for — a folder is paged through in full — with their combined size.
+// Network I/O: called off the UI goroutine, behind a cancellable wait.
+func resolveTargets(ctx context.Context, mdl *model.Model, bucket *model.Object, sel []*model.Object) ([]model.DownloadTarget, int64, error) {
+	var all []model.DownloadTarget
+	var total int64
+	for _, val := range sel {
+		objs, size, err := mdl.ResolveDownloadObjects(ctx, *val.FullPath, val.Ot == model.Folder, val.Size, bucket)
+		if err != nil {
+			return nil, 0, err
+		}
+		all = append(all, objs...)
+		total += size
+	}
+	return all, total, nil
+}
+
+// downloadSelection is what Download and the archive act on: the marked files
+// and folders, or the highlighted one when nothing is marked.
+func (c *Controller) downloadSelection() []*model.Object {
+	names := c.selectedNames()
+	if len(names) == 0 {
+		names = []string{c.getSelectedObjectName()}
+	}
+	var sel []*model.Object
+	for _, name := range names {
+		val, ok := c.pane().Lookup(name)
+		if !ok || (val.Ot != model.File && val.Ot != model.Folder) {
+			continue
+		}
+		sel = append(sel, val)
+	}
+	return sel
 }
 
 // runDownload confirms and executes the byte phase for already-resolved
@@ -739,6 +760,7 @@ func (c *Controller) runDownload(mdl *model.Model, srcBucket *model.Object, srcP
 		// switch mid-download must not change the rules a running transfer is
 		// playing by.
 		Verify:  c.verifyDownloads(),
+		Workers: c.transferWorkers(),
 		Fetcher: mdl,
 		Checker: mdl,
 		FS:      ops.OSFS{},
@@ -757,7 +779,7 @@ func (c *Controller) labelForList(o *model.Object) (primary string, secondary st
 		selected = c.pane().IsSelected(key)
 	}
 
-	return listRow(o, selected, c.cols), key
+	return listRowRestore(o, selected, c.cols, c.listRestoreState(o)), key
 }
 
 // canMark reports whether the active pane holds markable entries: a prefix
@@ -980,7 +1002,9 @@ func (c *Controller) listTitleBase() string {
 	if loc.Bucket == nil || loc.Bucket.Key == nil {
 		return "(buckets)"
 	}
-	return fmt.Sprintf("(%s)/%s", *loc.Bucket.Key, loc.Path)
+	// Escaped: this is the browser's own title, and a bucket or prefix may
+	// contain what tview reads as a colour tag.
+	return fmt.Sprintf("(%s)/%s", tview.Escape(*loc.Bucket.Key), tview.Escape(loc.Path))
 }
 
 // listChrome builds the list title and the frame help line for the current
@@ -2549,6 +2573,12 @@ func (c *Controller) actionTable() map[actionID]func() {
 		actToggleSelect:   c.ToggleSelectCurrent,
 		actSelectAll:      c.SelectAllVisible,
 		actClearSelection: c.ClearSelection,
+		actMarkPattern:    func() { c.MarkByPattern(true) },
+		actUnmarkPattern:  func() { c.MarkByPattern(false) },
+		actInvertMarks:    c.InvertMarks,
+		actDiffLocal:      c.DiffLocal,
+		actArchive:        c.DownloadArchive,
+		actRestores:       c.ShowRestores,
 		actFilter:         c.focusFilter,
 		actRefresh:        c.Refresh,
 		actRefreshAlt:     c.Refresh,
@@ -2798,7 +2828,11 @@ func (c *Controller) fillDetails(key string) {
 			fmt.Fprintf(c.view.Details, "[green] Etag: [white] %s\n\n", *val.Etag)
 		}
 		if val.Ot != model.Bucket {
-			fmt.Fprintf(c.view.Details, "[green] FullPath: [white] %s\n\n", *val.FullPath)
+			// Escaped for the same reason listRow escapes the name: an S3 key
+			// may itself be a valid tview tag ("logs/[red]alert.log"), and an
+			// unescaped one is swallowed as markup — so the panel named a
+			// different object than the cursor was on.
+			fmt.Fprintf(c.view.Details, "[green] FullPath: [white] %s\n\n", tview.Escape(*val.FullPath))
 		}
 		if val.StorageClass != nil {
 			fmt.Fprintf(c.view.Details, "[green] Storage class: [white] %s\n", *val.StorageClass)
@@ -2810,6 +2844,7 @@ func (c *Controller) Run() error {
 	c.shell.Start()
 	c.Profiles()
 	c.runStatusTicker()
+	c.runRestorePoller()
 	c.logActivity("session started")
 	// A keys.json the app could not honour is reported once here rather than
 	// leaving the user to guess why a rebinding did nothing.
@@ -2914,7 +2949,7 @@ func (c *Controller) chooseDir(startPath string, onChosen func(dir string)) {
 	renderList = func(curPath string) {
 		currentPath = curPath
 		localList.Clear()
-		localList.SetTitle(fmt.Sprintf("Choose download dir: %s", curPath)).SetBorder(true)
+		localList.SetTitle(fmt.Sprintf("Choose download dir: %s", tview.Escape(curPath))).SetBorder(true)
 
 		entries, err := os.ReadDir(curPath)
 		if err != nil {
@@ -3028,7 +3063,7 @@ func (c *Controller) ShowLocalFSModal(startPath string) {
 	renderList = func(curPath string) {
 		currentPath = curPath
 		localList.Clear()
-		localList.SetTitle(fmt.Sprintf("Local FS: %s", curPath)).SetBorder(true)
+		localList.SetTitle(fmt.Sprintf("Local FS: %s", tview.Escape(curPath))).SetBorder(true)
 
 		entries, err := os.ReadDir(curPath)
 		if err != nil {
@@ -3223,6 +3258,20 @@ func (c *Controller) uploadEmptyDir(localPath, dstPath string, dstBucket *model.
 	}()
 }
 
+// filePropertiesText renders the properties modal's body. Pure, so the
+// escaping is testable: a modal renders colour tags, and both the object name
+// and the link are built from an S3 key, which may contain one.
+func filePropertiesText(name, size string, modified *time.Time, etag, url string) string {
+	return fmt.Sprintf(
+		"[black]Name: [white]%s\n[black]Size: [white]%s\n[black]Modified: [white]%v\n[black]Etag: [white]%s\n[black]Link: [white]%s",
+		tview.Escape(name),
+		size,
+		modified,
+		tview.Escape(etag),
+		tview.Escape(url),
+	)
+}
+
 func (c *Controller) ShowFileProperties(key string) {
 	// lay is assigned below; every handler here runs after that.
 	var lay *shell.Layer
@@ -3261,14 +3310,7 @@ func (c *Controller) ShowFileProperties(key string) {
 		etag = *obj.Etag
 	}
 
-	text := fmt.Sprintf(
-		"[black]Name: [white]%s\n[black]Size: [white]%s\n[black]Modified: [white]%v\n[black]Etag: [white]%s\n[black]Link: [white]%s",
-		*obj.Key,
-		size,
-		obj.LastModified,
-		etag,
-		url,
-	)
+	text := filePropertiesText(*obj.Key, size, obj.LastModified, etag, url)
 
 	modal := tview.NewModal().
 		SetText(text).
@@ -3636,7 +3678,7 @@ func (c *Controller) presentSearchResults(query string, hits []searchHit, trunca
 	if truncated {
 		countLabel = fmt.Sprintf("first %d match(es)", len(hits))
 	}
-	results.SetTitle(fmt.Sprintf(" Search %q — %s (Enter: reveal, Esc: close) ", query, countLabel))
+	results.SetTitle(fmt.Sprintf(" Search %q — %s (Enter: reveal, Esc: close) ", tview.Escape(query), countLabel))
 
 	for _, h := range hits {
 		h := h
@@ -3925,6 +3967,7 @@ func filterActions(actions []paletteAction, query string) []paletteAction {
 func (c *Controller) paletteActions() []paletteAction {
 	return []paletteAction{
 		{"Download", func() { c.Download() }},
+		{"Download as one archive (.tar.gz / .zip)", c.DownloadArchive},
 		{"Upload (local browser)", func() { c.ShowLocalFSModal(c.params.HomeDir) }},
 		{"New bucket/folder", c.Create},
 		{"Delete", func() { c.Delete() }},
@@ -3944,6 +3987,7 @@ func (c *Controller) paletteActions() []paletteAction {
 		{"Preview (read-only)", c.Preview},
 		{"Usage browser (du)", c.ShowUsage},
 		{"Verify local copy against object", c.VerifyObject},
+		{"Diff against the local copy", c.DiffLocal},
 		{c.localPaneLabel(), c.ToggleLocalPane},
 		{"Upload from the local pane", c.uploadFromLocalPane},
 		{"Restore from trash", c.RestoreFromTrash},
@@ -3962,8 +4006,12 @@ func (c *Controller) paletteActions() []paletteAction {
 		{"Versions (history / restore)", c.ShowVersions},
 		{"Metadata & tags", c.EditObjectMeta},
 		{"Storage class / Glacier restore", c.ChangeStorageClass},
+		{"Glacier restores (tracked)", c.ShowRestores},
 		{"Presign link", func() { c.PresignLink(c.getSelectedObjectName()) }},
 		{"Select all visible", c.SelectAllVisible},
+		{"Mark by pattern", func() { c.MarkByPattern(true) }},
+		{"Unmark by pattern", func() { c.MarkByPattern(false) }},
+		{"Invert marks", c.InvertMarks},
 		{"Clear selection", c.ClearSelection},
 		{"Abort incomplete uploads", c.AbortMultipartUploads},
 		{"Bucket config", c.BucketDashboard},
@@ -4213,41 +4261,4 @@ func (c *Controller) presentMultipartUploads(bucket *model.Object, ups []model.M
 
 	lay = c.pushModal(list, 90, 24)
 	c.view.App.SetFocus(list)
-}
-
-// BucketDashboard shows the current bucket's configuration (read-only).
-func (c *Controller) BucketDashboard() {
-	// lay is assigned below; every handler here runs after that.
-	var lay *shell.Layer
-	if c.remoteOnly("The bucket dashboard") {
-		return
-	}
-	if c.pane().Bucket() == nil {
-		return
-	}
-	bucket := c.pane().Bucket()
-	go func() {
-		info, err := c.model.BucketConfig(bucket)
-		if err != nil {
-			c.error("Bucket config", err)
-			return
-		}
-		c.shell.Do(func() {
-			tv := tview.NewTextView().SetDynamicColors(true).SetWrap(true)
-			tv.SetBorder(true).SetTitle(" Bucket config — Esc to close ")
-			tv.SetText(fmt.Sprintf(
-				"[green]Bucket:[white] %s\n\n[green]Region:[white] %s\n[green]Versioning:[white] %s\n[green]Default encryption:[white] %s\n[green]Object lock:[white] %s",
-				*bucket.Key, info.Region, info.Versioning, info.Encryption, info.ObjectLock))
-			tv.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
-				if ev.Key() == tcell.KeyEsc {
-					lay.Close()
-					c.view.App.SetFocus(c.view.List)
-					return nil
-				}
-				return ev
-			})
-			lay = c.pushModal(tv, 70, 12)
-			c.view.App.SetFocus(tv)
-		})
-	}()
 }

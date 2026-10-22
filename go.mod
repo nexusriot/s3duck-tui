@@ -12,6 +12,7 @@ require (
 	github.com/aws/smithy-go v1.22.2
 	github.com/dustin/go-humanize v1.0.1
 	github.com/gdamore/tcell/v2 v2.8.1
+	github.com/klauspost/compress v1.18.4
 	github.com/mattn/go-runewidth v0.0.16
 	github.com/rivo/tview v0.0.0-20250501113434-0c592cd31026
 )

@@ -23,13 +23,16 @@
 # The version is hard-coded in three places — VERSION here, versionText in
 # internal/ui/widgets/view.go and version= in build-deb.sh — so a release bumps
 # all three; TestVersionMatchesPackaging fails the build if one is missed.
+# DEBIAN/control carries placeholders rather than values: both packaging paths
+# substitute the version, the architecture and the installed size (measured
+# from the staged tree, so it cannot drift the way a literal did).
 # `make debs VERSION=x.y.z` relabels the package and file names ONLY: the
 # binary inside still reports the compiled-in versionText.
 
 APP        := s3duck-tui
 PKG        := ./cmd/s3duck-tui
 GO         ?= go
-VERSION    ?= 0.10.2
+VERSION    ?= 0.11.0
 LDFLAGS    ?= -s -w
 BUILD_DIR  := build
 DIST_DIR   := dist
@@ -54,6 +57,7 @@ define build_deb
 	@chmod 0755 "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)/usr/bin/$(APP)"
 	@sed -i "s/_version_/$(VERSION)/g" "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)/DEBIAN/control"
 	@sed -i "s/^Architecture: .*/Architecture: $(1)/" "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)/DEBIAN/control"
+	@sed -i "s/_installed_size_/$$(du -k -s "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)/usr" | cut -f1)/" "$(BUILD_DIR)/$(APP)_$(VERSION)_$(1)/DEBIAN/control"
 	cd $(BUILD_DIR) && dpkg-deb --build -Z gzip --root-owner-group "$(APP)_$(VERSION)_$(1)"
 	@echo ">> $(BUILD_DIR)/$(APP)_$(VERSION)_$(1).deb"
 endef

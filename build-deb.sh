@@ -7,7 +7,7 @@
 # the script still exited 0.
 set -euo pipefail
 
-version=0.10.2
+version=0.11.0
 arch="${1:-amd64}"
 
 # Every path below is relative to the repository, wherever this is run from.
@@ -44,5 +44,8 @@ fi
 
 sed -i "s/_version_/$version/g" "$folder_name/DEBIAN/control"
 sed -i "s/Architecture: .*/Architecture: $arch/" "$folder_name/DEBIAN/control"
+# Measured from what is actually staged, in KiB, as dpkg expects: the number
+# used to be a hard-coded guess that drifted with every dependency added.
+sed -i "s/_installed_size_/$(du -k -s "$folder_name/usr" | cut -f1)/" "$folder_name/DEBIAN/control"
 
 cd build/ && dpkg-deb --build -Z gzip --root-owner-group "$project"

@@ -264,6 +264,7 @@ func (c *Controller) ChangeStorageClass() {
 	}
 	bucket := c.pane().Bucket()
 	key := *obj.FullPath
+	profile := c.profileName()
 
 	wait := c.wait("Reading storage class...")
 
@@ -274,6 +275,13 @@ func (c *Controller) ChangeStorageClass() {
 			c.shell.Do(wait.Close)
 			c.error("Failed to read storage class", err)
 			return
+		}
+		// A restore already running — requested from the console, another
+		// tool, or before the tracker existed — is worth the same watch as
+		// one requested here.
+		if ongoing, _, ok := model.ParseRestoreStatus(meta.Restore); ok && ongoing &&
+			c.restores != nil && !c.restores.tracked(profile, *bucket.Key, key) {
+			c.trackRestore(profile, *bucket.Key, key, 0, "", restorePending)
 		}
 
 		c.shell.Do(func() {
@@ -334,16 +342,20 @@ func (c *Controller) runStorageClassChange(bucket *model.Object, key, class stri
 }
 
 // runRestore requests a Glacier restore. The request is asynchronous on S3's
-// side — completion can take minutes to hours — so this only reports that the
-// request was accepted; progress shows up in the object's restore status.
+// side — completion can take minutes to hours — so this reports that the
+// request was accepted and hands the wait to the restore tracker, which rings
+// the bell when the object becomes readable.
 func (c *Controller) runRestore(bucket *model.Object, key string, days int32, tier string) {
 	mdl := c.model
+	profile := c.profileName()
 	go func() {
 		if err := mdl.RestoreObject(context.Background(), bucket, key, days, tier); err != nil {
 			c.error("Restore failed", err)
 			return
 		}
+		c.trackRestore(profile, *bucket.Key, key, days, tier, restorePending)
 		c.logActivity("Restore requested: %s (%d day(s), %s)", key, days, tier)
-		c.success(fmt.Sprintf("Restore requested (%d day(s), %s).\nCheck the status with 'm' or 'c'.", days, tier))
+		c.success(fmt.Sprintf("Restore requested (%d day(s), %s).\n\nIt is tracked: the bell rings when the object is readable,\nand the restore list (leader r) shows where it stands.", days, tier))
+		go c.renderList()
 	}()
 }

@@ -208,7 +208,7 @@ func usageTitle(bucket string, n *usageNode) string {
 	if n.fullPath != "" {
 		scope = bucket + "/" + strings.TrimSuffix(n.fullPath, "/")
 	}
-	return fmt.Sprintf(" Usage: %s — %s in %d object(s) ", scope, widgets.HumanizeBytes(n.bytes), n.objects)
+	return fmt.Sprintf(" Usage: %s — %s in %d object(s) ", tview.Escape(scope), widgets.HumanizeBytes(n.bytes), n.objects)
 }
 
 // ShowUsage scans the current prefix recursively and opens the usage browser.

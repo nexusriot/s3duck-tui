@@ -60,3 +60,13 @@ func TestDebianControlKeepsTheVersionPlaceholder(t *testing.T) {
 		t.Errorf("DEBIAN/control does not carry the _version_ placeholder that the Makefile and build-deb.sh substitute:\n%s", control)
 	}
 }
+
+// Installed-Size is substituted from the staged tree by both packaging paths.
+// It used to be a literal, which every added dependency made more wrong — it
+// read 15330 KiB against a binary of about 12800.
+func TestDebianControlKeepsTheInstalledSizePlaceholder(t *testing.T) {
+	control := readRepoFile(t, "DEBIAN/control")
+	if !regexp.MustCompile(`(?m)^Installed-Size: _installed_size_\s*$`).MatchString(control) {
+		t.Errorf("DEBIAN/control does not carry the _installed_size_ placeholder that the Makefile and build-deb.sh substitute:\n%s", control)
+	}
+}

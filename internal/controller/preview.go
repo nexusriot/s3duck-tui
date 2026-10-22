@@ -107,7 +107,10 @@ func previewBody(data []byte) (body, label string) {
 	return escapeForTextView(sanitizeText(data)), fmt.Sprintf("text — first %s", humanize.IBytes(uint64(len(data))))
 }
 
-// previewTitle names the object and how much of it is shown.
+// previewTitle names the object and how much of it is shown. The key is
+// escaped: a title is drawn with tview's colour tags active, so a key like
+// "logs/[red]alert.log" was shown — in the title bar naming what you are
+// looking at — as "logs/alert.log".
 func previewTitle(key string, shown int64, size *int64, label string) string {
 	total := "unknown size"
 	if size != nil {
@@ -117,7 +120,7 @@ func previewTitle(key string, shown int64, size *int64, label string) string {
 	if size != nil && shown < *size {
 		truncated = " · truncated"
 	}
-	return fmt.Sprintf(" %s — %s of %s (%s%s) ", key, humanize.IBytes(uint64(shown)), total, label, truncated)
+	return fmt.Sprintf(" %s — %s of %s (%s%s) ", tview.Escape(key), humanize.IBytes(uint64(shown)), total, label, truncated)
 }
 
 // Preview shows the head of the highlighted object read-only. Unlike the
@@ -140,10 +143,17 @@ func (c *Controller) Preview() {
 	bucket := c.pane().Bucket()
 	mdl := c.model
 
+	// A compressed object gets a bigger window: its first decodable block can
+	// be larger than the plain-text window (see previewCompressedBytes).
+	window := int64(previewBytes)
+	if codec, _ := compressionByName(key); codec != "" {
+		window = previewCompressedBytes
+	}
+
 	wait, _, ctx, cancel := c.cancellableWait(fmt.Sprintf("Reading %s ...", key))
 	go func() {
 		defer cancel()
-		data, ctype, err := mdl.GetObjectHead(ctx, bucket, key, previewBytes)
+		data, ctype, err := mdl.GetObjectHead(ctx, bucket, key, window)
 		c.shell.Do(wait.Close)
 		if err != nil {
 			if ctx.Err() == nil {
@@ -151,17 +161,45 @@ func (c *Controller) Preview() {
 			}
 			return
 		}
-		body, label := previewBody(data)
+		whole := size != nil && int64(len(data)) >= *size
+		out := renderPreview(previewInput{key: key, data: data, ctype: ctype, whole: whole})
+		suffix := ""
 		if ctype != "" {
-			label += " · " + ctype
+			suffix = " · " + ctype
 		}
-		title := previewTitle(key, int64(len(data)), size, label)
-		c.showTextOverlay(title, body,
-			"[gray]↑↓/PgUp/PgDn[white] scroll · [gray]e[white] edit · [gray]Esc/q[white] close",
-			func(ev *tcell.EventKey, lay *shell.Layer) bool {
-				if ev.Key() == tcell.KeyRune && ev.Rune() == 'e' {
+		title := previewTitle(key, int64(len(data)), size, out.label+suffix)
+
+		footer := "[gray]↑↓←→/PgUp/PgDn[white] scroll · [gray]e[white] edit · [gray]Esc/q[white] close"
+		if out.raw != "" {
+			footer = "[gray]↑↓←→/PgUp/PgDn[white] scroll · [gray]r[white] raw/formatted · [gray]e[white] edit · [gray]Esc/q[white] close"
+		}
+		showingRaw := false
+		c.showTextOverlay(title, out.body, footer,
+			func(ev *tcell.EventKey, lay *shell.Layer, tv *tview.TextView) bool {
+				if ev.Key() != tcell.KeyRune {
+					return false
+				}
+				switch ev.Rune() {
+				case 'e':
 					lay.Close()
 					c.EditObject()
+					return true
+				case 'r':
+					if out.raw == "" {
+						return false
+					}
+					// Formatting is a reading aid, and every aid hides
+					// something (a CSV cell's real quoting, a JSON file's
+					// own layout); the bytes are one key away.
+					showingRaw = !showingRaw
+					if showingRaw {
+						tv.SetText(out.raw)
+						tv.SetTitle(previewTitle(key, int64(len(data)), size, "raw"+suffix))
+					} else {
+						tv.SetText(out.body)
+						tv.SetTitle(title)
+					}
+					tv.ScrollToBeginning()
 					return true
 				}
 				return false
@@ -171,13 +209,14 @@ func (c *Controller) Preview() {
 
 // showTextOverlay is the shared read-only text viewer: a scrollable TextView
 // with a one-line footer, closed with Esc or q. extra lets a caller add its
-// own keys (the preview's "e" to open the editor).
+// own keys (the preview's "e" to open the editor, "r" to swap the text), and
+// is handed the TextView so a key can change what it shows.
 //
 // Scrolling is the reason this is not a tview.Modal: a Modal's text cannot be
 // scrolled, and a preview that shows only what fits is not a preview. Sized
 // through ModalClamped so it can never ask for more rows than the terminal
 // has — the mistake that made the hotkey panel's tail unreachable.
-func (c *Controller) showTextOverlay(title, body, footer string, extra func(*tcell.EventKey, *shell.Layer) bool) {
+func (c *Controller) showTextOverlay(title, body, footer string, extra func(*tcell.EventKey, *shell.Layer, *tview.TextView) bool) {
 	c.shell.Do(func() {
 		// lay is assigned below; every closure here runs after that.
 		var lay *shell.Layer
@@ -200,7 +239,7 @@ func (c *Controller) showTextOverlay(title, body, footer string, extra func(*tce
 			}
 		})
 		tv.SetInputCapture(func(ev *tcell.EventKey) *tcell.EventKey {
-			if extra != nil && extra(ev, lay) {
+			if extra != nil && extra(ev, lay, tv) {
 				return nil
 			}
 			if ev.Key() == tcell.KeyRune && (ev.Rune() == 'q' || ev.Rune() == 'Q') {
@@ -349,7 +388,7 @@ func (c *Controller) diffVersions(bucket *model.Object, key string, v model.Obje
 			return
 		}
 		c.showTextOverlay(
-			fmt.Sprintf(" %s — version %s vs current ", key, short),
+			fmt.Sprintf(" %s — version %s vs current ", tview.Escape(key), short),
 			body,
 			"[gray]↑↓/PgUp/PgDn[white] scroll · [gray]Esc/q[white] close",
 			nil)

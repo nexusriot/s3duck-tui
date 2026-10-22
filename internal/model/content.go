@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
@@ -207,6 +208,49 @@ func (m *Model) GetObjectHead(ctx context.Context, bucket *Object, key string, n
 		return nil, "", err
 	}
 	return data, aws.ToString(out.ContentType), nil
+}
+
+// ObjectStat is what a GET reports about the body it is about to stream.
+type ObjectStat struct {
+	Size         int64
+	LastModified *time.Time
+}
+
+// throttledBody is a GET body read through the profile's bandwidth cap, still
+// closable by the caller.
+type throttledBody struct {
+	io.Reader
+	io.Closer
+}
+
+// OpenObject starts a GET of one object and hands back its body for the
+// caller to stream and close. The read goes through the profile's bandwidth
+// cap like every other transfer. It exists for consumers that write the bytes
+// somewhere other than a file of their own (an archive entry), which is why it
+// returns a reader rather than taking a destination.
+func (m *Model) OpenObject(ctx context.Context, bucket *Object, key string) (io.ReadCloser, ObjectStat, error) {
+	if bucket == nil || bucket.Key == nil {
+		return nil, ObjectStat{}, fmt.Errorf("bucket is nil")
+	}
+	if key == "" {
+		return nil, ObjectStat{}, fmt.Errorf("key is empty")
+	}
+	out, err := m.Client.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(*bucket.Key),
+		Key:    aws.String(key),
+	})
+	if err != nil {
+		return nil, ObjectStat{}, err
+	}
+	body := &progressReader{
+		r:       out.Body,
+		total:   out.ContentLength,
+		update:  func(int64, int64) {},
+		limiter: m.Limiter,
+		ctx:     ctx,
+	}
+	return throttledBody{Reader: body, Closer: out.Body},
+		ObjectStat{Size: out.ContentLength, LastModified: out.LastModified}, nil
 }
 
 // isInvalidRange reports whether err is S3 refusing a byte range as

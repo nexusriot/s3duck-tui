@@ -247,7 +247,7 @@ func (c *Controller) presentDupGroups(mdl *model.Model, bucket *model.Object, pr
 	var lay *shell.Layer
 
 	list := tview.NewList().ShowSecondaryText(false)
-	list.SetBorder(true).SetTitle(fmt.Sprintf(" Duplicates under %s/%s — %s ", *bucket.Key, prefix, dupSummary(groups)))
+	list.SetBorder(true).SetTitle(fmt.Sprintf(" Duplicates under %s — %s ", tview.Escape(*bucket.Key+"/"+prefix), dupSummary(groups)))
 	list.SetSelectedBackgroundColor(tcell.ColorBlue)
 	list.SetSelectedTextColor(tcell.ColorWhite)
 

@@ -5,8 +5,31 @@ Known constraints live in [DESIGN.md](DESIGN.md); user-facing docs in [README.md
 
 ## Delivered in this round
 
-Three tiers of work landed together; the design notes for each are in
-DESIGN.md, and the new limitations they carry are in its table.
+**Reading, packaging and watching** — 0.11.0, 2026-10-22; design notes in
+DESIGN.md, limitations in its table
+
+- **Formatted preview** — gzip / zstd decoded on the fly, JSON pretty-printed
+  (re-indented when the head is truncated), CSV/TSV as aligned columns, tar
+  listed; `r` toggles the raw text.
+- **Diff against the local copy** (`, d`) — the version diff aimed at the
+  local pane's file or the download path; says when two texts differ only in
+  line endings.
+- **Download as one archive** (`, z`) — streamed `.tar.gz` / `.zip`, temp file
+  renamed into place only when whole.
+- **Mark by pattern / invert** (`+`, `-`, `*`) with the filter's query syntax.
+- **Parallel transfers per profile** (`transfer_workers`, 1–16).
+- **Glacier restore tracker** (`, r`) — persisted, polled while the profile is
+  open, bell on ready, `restoring` / `restored` in the class column.
+- **Bucket dashboard** (`, b`) — public access block, tags (editable), policy,
+  lifecycle, replication, CORS, website, notifications and logging join the
+  four old sections, each saying whether it is unset, unsupported or denied.
+  This closes the old *bucket policy viewer* and *lifecycle rules viewer*
+  items, and the hardening item about AccessDenied reading as "off".
+- **Profile export** (`x` on the profiles screen) — AWS CLI, mc or rclone,
+  secrets left out.
+
+**The previous round:** three tiers of work landed together; the design notes
+for each are in DESIGN.md, and the new limitations they carry are in its table.
 
 **Gaps in shipped features**
 
@@ -115,16 +138,19 @@ DESIGN.md, and the new limitations they carry are in its table.
   `re:`) is in place; this is the predicate half.
 - **Saved sync jobs** `[S]` — persist local dir + direction + destination + the
   exclude list per profile (the `Bookmarks` pattern), re-run from the palette.
+- **Preview a zip's directory** `[S]` — a zip's directory is at its end, so
+  the head-only preview cannot list one; a second ranged GET of the last 64 KiB
+  (the end-of-central-directory record, then the directory) can.
+- **Restore tracker: per-bucket region** `[S]` — the tracker's HEADs go
+  through the open client, pinned to the last bucket's region, so a restore in
+  another AWS region reads "check failed" until a bucket there is entered. A
+  client per region (the cross-profile substrate) would fix it.
 - **Local pane: sort by the pane's own key** `[S]` — the local pane honours the
   shared sort key, which is right for name and size but means a local and a
   remote pane cannot be ordered differently.
 
 ## Later
 
-- **Bucket policy viewer** `[S–M]` — `MakeBucketPublic` writes a policy nothing can read
-  back; a read-only viewer alone is worthwhile.
-- **Lifecycle rules viewer** `[M]` — explains why objects change class or vanish, and
-  would pair with the usage browser's storage-class breakdown.
 - **Object Lock retention / legal hold** `[M]` — per-object, complementing the dashboard.
 - **OS keyring for secrets** `[M]` — `secret_key` / `session_token` are plaintext (0600).
   Less pressing now that `aws_profile` stores no key material at all, but it is still
@@ -298,9 +324,6 @@ Found in the 2026-10-21 review (the ones it fixed are in DESIGN.md's history):
 - **Rewrites reset object ACLs** `[S]` — metadata saves, storage-class changes,
   version restores, editor saves and moves are copies or PUTs that send no ACL, so on
   a legacy ACL-enabled AWS bucket a public-read object comes back private.
-- **`BucketConfig` reads any error as "off"** `[S]` — AccessDenied shows
-  "Versioning: off" and "Encryption: none" as facts; only not-implemented and
-  `NoSuch…Configuration` answers should mean the default.
 - **`~/.aws` import differs from the SDK** `[S]` — a `[profile x]` section in the
   credentials file and a prefix-less section in the config file are taken where the
   SDK ignores them, `[default]` vs `[profile default]` is resolved in map order,

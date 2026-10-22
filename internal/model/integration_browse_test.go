@@ -343,9 +343,10 @@ func TestIntegrationIncompleteUploads(t *testing.T) {
 }
 
 // TestIntegrationBucketConfigDegradesGracefully pins the contract that makes
-// the properties panel usable on S3-compatible servers: a feature the endpoint
-// does not implement is reported as its default, not raised as an error that
-// blanks the whole panel.
+// the dashboard usable on S3-compatible servers: a section the endpoint does
+// not implement is reported as unsupported (and one the bucket lacks as unset,
+// with its display default), not raised as an error that blanks the whole
+// dashboard — and never as a value it does not have.
 //
 // The two halves use separate buckets on purpose. Enabling versioning is a
 // permanent, bucket-level change that freshBucket cannot undo — asserting the
@@ -356,21 +357,37 @@ func TestIntegrationBucketConfigDegradesGracefully(t *testing.T) {
 	ctx := context.Background()
 	bucket := freshBucket(t, m, "s3duck-it-bucketcfg")
 
-	info, err := m.BucketConfig(bucket)
+	info, err := m.BucketConfig(ctx, bucket)
 	if err != nil {
 		t.Fatalf("BucketConfig: %v", err)
 	}
 	if info.Region == "" {
-		t.Error("Region is empty; the panel shows it verbatim")
+		t.Error("Region is empty; the dashboard shows it verbatim")
 	}
-	// Every field is a display string with a defined fallback. An empty one
-	// means an unsupported feature leaked through as a blank rather than its
-	// default, which is what this call exists to prevent.
-	if info.Encryption == "" || info.ObjectLock == "" || info.Versioning == "" {
-		t.Errorf("unsupported features reported as empty rather than a default: %+v", info)
+	sections := map[string]model.ConfigItem{
+		"versioning": info.Versioning, "encryption": info.Encryption, "object lock": info.ObjectLock,
+		"public access block": info.PublicAccessBlock, "tags": info.Tags, "policy": info.Policy,
+		"lifecycle": info.Lifecycle, "cors": info.CORS, "website": info.Website,
+		"replication": info.Replication, "notifications": info.Notifications, "logging": info.Logging,
 	}
-	if info.ObjectLock != "on" && info.ObjectLock != "off" {
-		t.Errorf("ObjectLock = %q, want \"on\" or \"off\"", info.ObjectLock)
+	for name, item := range sections {
+		switch item.State {
+		case model.ConfigError:
+			// A fresh bucket has nothing configured; an error here is a
+			// classification gap, not a server answer worth showing as one.
+			t.Errorf("%s: unclassified error on a fresh bucket: %v", name, item.Err)
+		case model.ConfigUnset, model.ConfigSet:
+			if item.Value == "" {
+				t.Errorf("%s: state %d with no value to show", name, item.State)
+			}
+		}
+	}
+	// A fresh bucket's versioning and tags are known to be absent.
+	if info.Versioning.State == model.ConfigSet {
+		t.Errorf("versioning on a fresh bucket: %+v", info.Versioning)
+	}
+	if info.Tags.State == model.ConfigUnset && info.TagSet == nil {
+		t.Error("an untagged bucket must hand the editor an empty set, not nil")
 	}
 
 	t.Run("versioning is reported once enabled", func(t *testing.T) {
@@ -383,12 +400,33 @@ func TestIntegrationBucketConfigDegradesGracefully(t *testing.T) {
 		}); err != nil {
 			t.Skipf("endpoint does not support bucket versioning: %v", err)
 		}
-		info, err := m.BucketConfig(versioned)
+		info, err := m.BucketConfig(ctx, versioned)
 		if err != nil {
 			t.Fatalf("BucketConfig: %v", err)
 		}
-		if info.Versioning != "Enabled" {
-			t.Errorf("Versioning = %q after enabling it, want %q", info.Versioning, "Enabled")
+		if info.Versioning.State != model.ConfigSet || info.Versioning.Value != "Enabled" {
+			t.Errorf("Versioning = %+v after enabling it, want Enabled", info.Versioning)
+		}
+	})
+
+	t.Run("tags round-trip through the editor's calls", func(t *testing.T) {
+		tagged := freshBucket(t, m, "s3duck-it-bucketcfg-tags")
+		if err := m.PutBucketTags(ctx, tagged, map[string]string{"env": "test", "team": "duck"}); err != nil {
+			t.Skipf("endpoint does not support bucket tagging: %v", err)
+		}
+		info, err := m.BucketConfig(ctx, tagged)
+		if err != nil {
+			t.Fatalf("BucketConfig: %v", err)
+		}
+		if info.TagSet["env"] != "test" || info.TagSet["team"] != "duck" || info.Tags.Value != "2 tag(s)" {
+			t.Errorf("tags = %v / %+v", info.TagSet, info.Tags)
+		}
+		if err := m.PutBucketTags(ctx, tagged, nil); err != nil {
+			t.Fatalf("removing every tag: %v", err)
+		}
+		info, _ = m.BucketConfig(ctx, tagged)
+		if len(info.TagSet) != 0 || info.Tags.State != model.ConfigUnset {
+			t.Errorf("after removing them: %v / %+v", info.TagSet, info.Tags)
 		}
 	})
 }

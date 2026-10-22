@@ -21,6 +21,7 @@ func formConstructors(v *View) map[string]tview.Primitive {
 		"NewObjectMetaForm":     v.NewObjectMetaForm("k", "summary", false),
 		"NewStorageClassForm":   v.NewStorageClassForm("k", "s", []string{"STANDARD"}, "STANDARD", []string{"Standard"}, false),
 		"NewCreateForm":         v.NewCreateForm("h", false),
+		"NewArchiveForm":        v.NewArchiveForm("h", []string{"tar.gz", "zip"}, "x.tar.gz", "/tmp"),
 	}
 }
 

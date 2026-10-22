@@ -213,6 +213,9 @@ func TestRoadmapDoesNotPromiseWhatShipped(t *testing.T) {
 		"Post-transfer verify":        "VerifyLocalFile",
 		"Text preview via ranged GET": "GetObjectHead",
 		"Anonymous profiles":          "", // still open
+		"Bucket policy viewer":        "summarizePolicy",
+		"Lifecycle rules viewer":      "summarizeLifecycle",
+		"reads any error as":          "classifyConfigErr",
 	}
 	for phrase, symbol := range shipped {
 		if symbol == "" {

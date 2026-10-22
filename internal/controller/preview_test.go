@@ -164,3 +164,26 @@ func TestUnifiedDiffRefusesAnOversizedTable(t *testing.T) {
 		t.Errorf("a small diff was refused: %v", err)
 	}
 }
+
+// A title is drawn with colour tags active, so every title built from an S3
+// key, a bucket name or a local path has to escape it. Unescaped, the one
+// piece of chrome that says *which* object you are looking at named a
+// different one — "logs/[red]alert.log" was drawn as "logs/alert.log".
+func TestTitlesEscapeTheirData(t *testing.T) {
+	size := int64(10)
+	titles := map[string]string{
+		"preview": previewTitle("logs/[red]alert.log", 10, &size, "text"),
+		"usage":   usageTitle("buck[et]", newUsageNode("x", "p/[red]/", true)),
+	}
+	for name, title := range titles {
+		tv := tview.NewTextView().SetDynamicColors(true)
+		tv.SetText(title)
+		shown := tv.GetText(true)
+		if name == "preview" && !strings.Contains(shown, "logs/[red]alert.log") {
+			t.Errorf("%s title lost its key: %q", name, shown)
+		}
+		if name == "usage" && !strings.Contains(shown, "buck[et]") {
+			t.Errorf("%s title lost its bucket: %q", name, shown)
+		}
+	}
+}

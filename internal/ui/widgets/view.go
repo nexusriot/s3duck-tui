@@ -10,7 +10,7 @@ import (
 	"github.com/rivo/tview"
 )
 
-const versionText = "S3Duck 🦆 TUI v.0.10.2"
+const versionText = "S3Duck 🦆 TUI v.0.11.0"
 
 // View ...
 type View struct {
@@ -341,6 +341,7 @@ const (
 	FieldOptKMSKey     = "SSE-KMS key id"
 	FieldOptChecksum   = "Checksum on write"
 	FieldOptVerify     = "Verify downloads against the checksum"
+	FieldOptWorkers    = "Parallel transfers per job (1-16)"
 )
 
 // ProfileOptions is the value the options form edits, kept as a plain struct
@@ -355,6 +356,9 @@ type ProfileOptions struct {
 	KMSKey      string
 	Checksum    string
 	Verify      bool
+	// Workers is the per-job transfer width as typed; empty means the
+	// built-in default.
+	Workers string
 }
 
 // NewProfileOptionsForm builds the per-profile behaviour form. Rows are read
@@ -371,7 +375,7 @@ func (v *View) NewProfileOptionsForm(name string, opts ProfileOptions, sseChoice
 	}
 
 	form := tview.NewForm()
-	form.SetTitle(fmt.Sprintf(" Options: %s ", name))
+	form.SetTitle(fmt.Sprintf(" Options: %s ", tview.Escape(name)))
 	form.AddInputField(FieldOptAWSProfile, opts.AWSProfile, 40, nil, nil)
 	form.AddCheckbox(FieldOptReadOnly, opts.ReadOnly, nil)
 	form.AddCheckbox(FieldOptTrash, opts.Trash, nil)
@@ -381,6 +385,7 @@ func (v *View) NewProfileOptionsForm(name string, opts ProfileOptions, sseChoice
 	form.AddInputField(FieldOptKMSKey, opts.KMSKey, 40, nil, nil)
 	form.AddDropDown(FieldOptChecksum, sseLabels(checksumChoices), indexOf(checksumChoices, opts.Checksum), nil)
 	form.AddCheckbox(FieldOptVerify, opts.Verify, nil)
+	form.AddInputField(FieldOptWorkers, opts.Workers, 4, tview.InputFieldInteger, nil)
 	form.SetBorder(true)
 	return form
 }
@@ -401,7 +406,7 @@ func sseLabels(choices []string) []string {
 
 // ProfileOptionsHeight sizes the options dialog: one row per field plus the
 // buttons and the border.
-const ProfileOptionsHeight = 17
+const ProfileOptionsHeight = 18
 
 // NewSearchForm builds the recursive-search form: a query input (item 0) and an
 // "All buckets" checkbox (item 1). The caller owns the overlay, so the caller installs Esc.
@@ -478,7 +483,7 @@ func (v *View) NewSyncForm(current, localDir string, directions, buckets []strin
 	}
 
 	form := tview.NewForm()
-	form.SetTitle(fmt.Sprintf(" Sync — this pane: %s ", current))
+	form.SetTitle(fmt.Sprintf(" Sync — this pane: %s ", tview.Escape(current)))
 	form.AddDropDown(FieldSyncDirection, directions, 0, nil)
 	form.AddInputField(FieldSyncLocalDir, localDir, 56, nil, nil)
 	form.AddDropDown(FieldSyncDstBucket, buckets, initialBucket, nil)
@@ -486,6 +491,30 @@ func (v *View) NewSyncForm(current, localDir string, directions, buckets []strin
 	form.AddCheckbox(FieldSyncDelete, false, nil)
 	form.AddCheckbox(FieldSyncChecksum, false, nil)
 	form.AddInputField(FieldSyncExclude, "", 56, nil, nil)
+	form.SetBorder(true)
+	return form
+}
+
+// Field labels for the download-as-archive form.
+const (
+	FieldArchiveFormat = "Format"
+	FieldArchiveName   = "File name"
+	FieldArchiveDir    = "Directory"
+)
+
+// NewArchiveForm builds the download-as-archive dialog: the container format,
+// the archive's file name and the directory it lands in. Read it back with
+// GetFormItemByLabel. The caller owns the overlay, so the caller installs Esc.
+//
+// The two text fields take the dialog's whole width (field width 0): a
+// generated name ends in a timestamp and the extension, and a fixed width cut
+// exactly those off the end, where they cannot be seen without editing.
+func (v *View) NewArchiveForm(header string, formats []string, name, dir string) *tview.Form {
+	form := tview.NewForm()
+	form.SetTitle(header)
+	form.AddDropDown(FieldArchiveFormat, formats, 0, nil)
+	form.AddInputField(FieldArchiveName, name, 0, nil, nil)
+	form.AddInputField(FieldArchiveDir, dir, 0, nil, nil)
 	form.SetBorder(true)
 	return form
 }
@@ -512,7 +541,7 @@ const (
 // means "not supported" rather than "no tags". The caller owns the overlay, so the caller installs Esc.
 func (v *View) NewObjectMetaForm(key, summary string, tagsUnavailable bool) *tview.Form {
 	form := tview.NewForm()
-	form.SetTitle(fmt.Sprintf(" Metadata & tags — %s ", key))
+	form.SetTitle(fmt.Sprintf(" Metadata & tags — %s ", tview.Escape(key)))
 
 	form.AddTextView("", summary, 0, 2, true, false)
 	form.AddInputField(FieldContentType, "", 56, nil, nil)
@@ -541,7 +570,7 @@ func (v *View) NewStorageClassForm(key, summary string, classes []string, curren
 	}
 
 	form := tview.NewForm()
-	form.SetTitle(fmt.Sprintf(" Storage class — %s ", key))
+	form.SetTitle(fmt.Sprintf(" Storage class — %s ", tview.Escape(key)))
 	form.AddTextView("", summary, 0, 2, true, false)
 	form.AddDropDown(FieldStorageClass, classes, initial, nil)
 	if archived {
@@ -603,6 +632,7 @@ const helpProfiles = `
     Ctrl+I        Import profile from ~/.aws (incl. session token)
     Ctrl+Y        Copy profile
     o             Per-profile options (read-only, trash, SSE, checksums)
+    x             Export for the AWS CLI / mc / rclone (no secrets)
     Ctrl+E        Edit profile
     Ctrl+V        Verify profile (test connection)
     Del           Delete profile

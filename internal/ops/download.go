@@ -45,6 +45,9 @@ type Download struct {
 	// as a failure: a silently corrupt file is the worst of the three outcomes.
 	Verify bool
 
+	// Workers is how many objects transfer at once. 0 means DownloadWorkers.
+	Workers int
+
 	Fetcher Fetcher
 	Checker Checker
 	FS      FS
@@ -174,7 +177,15 @@ func (d *Download) plan(ctx context.Context, rep Reporter, led *ledger) ([]resol
 	return todo, true
 }
 
-// transfer is phase 2: move the bytes, DownloadWorkers at a time.
+// workers is the pool width in force: the configured one, else the default.
+func (d *Download) workers() int {
+	if d.Workers > 0 {
+		return d.Workers
+	}
+	return DownloadWorkers
+}
+
+// transfer is phase 2: move the bytes, d.workers() at a time.
 func (d *Download) transfer(ctx context.Context, rep Reporter, led *ledger, todo []resolved, totalBytes int64) {
 	// live tracks the bytes moved so far by transfers that have not finished,
 	// keyed by object, so the gauge stays honest while several run at once.
@@ -202,7 +213,7 @@ func (d *Download) transfer(ctx context.Context, rep Reporter, led *ledger, todo
 		rep.Progress(p)
 	}
 
-	sem := make(chan struct{}, DownloadWorkers)
+	sem := make(chan struct{}, d.workers())
 	var wg sync.WaitGroup
 
 	for _, r := range todo {

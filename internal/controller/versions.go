@@ -52,7 +52,7 @@ func versionsTitle(key string, vs []model.ObjectVersion) string {
 			markers++
 		}
 	}
-	base := fmt.Sprintf(" Versions of %s — %d total", key, len(vs))
+	base := fmt.Sprintf(" Versions of %s — %d total", tview.Escape(key), len(vs))
 	if markers > 0 {
 		base += fmt.Sprintf(", %d delete marker(s)", markers)
 	}

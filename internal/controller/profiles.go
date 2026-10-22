@@ -452,8 +452,12 @@ func (c *Controller) setConfigInput() {
 			c.CheckProfile()
 			return nil
 		case tcell.KeyRune:
-			if event.Rune() == 'o' {
+			switch event.Rune() {
+			case 'o':
 				c.EditProfileOptions()
+				return nil
+			case 'x':
+				c.ExportProfile()
 				return nil
 			}
 		case tcell.KeyCtrlA:
@@ -484,10 +488,14 @@ func (c *Controller) fillConfigDetails(cur string) {
 	item := c.ConfigEntryByName(cur)
 
 	if item != nil {
-		fmt.Fprintf(c.view.Details, "[green] Config: [white]%s\n", item.Name)
-		fmt.Fprintf(c.view.Details, "[blue] Url: [gray] %s\n", item.BaseUrl)
+		// Every value a user typed is escaped: this panel renders colour
+		// tags, so a profile named "[red]prod" — or a base URL or trash
+		// prefix holding a bracket pair — would be swallowed as markup and
+		// recolour everything below it.
+		fmt.Fprintf(c.view.Details, "[green] Config: [white]%s\n", tview.Escape(item.Name))
+		fmt.Fprintf(c.view.Details, "[blue] Url: [gray] %s\n", tview.Escape(item.BaseUrl))
 		if item.Region != nil {
-			fmt.Fprintf(c.view.Details, "[blue] Region: [white] %s\n", *item.Region)
+			fmt.Fprintf(c.view.Details, "[blue] Region: [white] %s\n", tview.Escape(*item.Region))
 		}
 		fmt.Fprintf(c.view.Details, "[blue] Ssl: [white] %v\n", !item.IgnoreSsl)
 		// The options are what decide whether this profile can be written to
@@ -498,14 +506,17 @@ func (c *Controller) fillConfigDetails(cur string) {
 		if item.ReadOnly {
 			fmt.Fprintf(c.view.Details, "[red] READ-ONLY[white] — every write is refused\n")
 		}
-		fmt.Fprintf(c.view.Details, "[blue] Safe delete: [white] %s\n", trashSummaryLine(item))
+		fmt.Fprintf(c.view.Details, "[blue] Safe delete: [white] %s\n", tview.Escape(trashSummaryLine(item)))
 		fmt.Fprintf(c.view.Details, "[blue] Writes: [white] %s\n",
 			modelConfigFor(item).Write.WriteSummary())
 		if item.VerifyDownloads {
 			fmt.Fprintf(c.view.Details, "[blue] Downloads: [white] verified against the object checksum\n")
 		}
+		if item.TransferWorkers > 0 {
+			fmt.Fprintf(c.view.Details, "[blue] Transfers: [white] %d objects at a time per job\n", item.TransferWorkers)
+		}
 		if item.LastBucket != "" {
-			fmt.Fprintf(c.view.Details, "[blue] Reopens at: [white] %s/%s\n", item.LastBucket, item.LastPrefix)
+			fmt.Fprintf(c.view.Details, "[blue] Reopens at: [white] %s/%s\n", tview.Escape(item.LastBucket), tview.Escape(item.LastPrefix))
 		}
 	}
 }
@@ -522,7 +533,11 @@ func (c *Controller) fillConfigData() {
 	})
 
 	for _, cf := range c.params.Config {
-		c.view.List.AddItem(cf.Name, cf.Name, 0, func() {
+		// The shown name is escaped, the secondary one is not: the secondary
+		// is this row's lookup key (ConfigEntryByName) and is never drawn,
+		// while the primary is, and a profile named "[red]prod" would
+		// otherwise be drawn as "prod".
+		c.view.List.AddItem(tview.Escape(cf.Name), cf.Name, 0, func() {
 			conf := c.configAt(c.view.List.GetCurrentItem())
 			if conf == nil {
 				return
@@ -531,7 +546,7 @@ func (c *Controller) fillConfigData() {
 			c.Duck()
 		})
 	}
-	c.view.SetFrameText("[::b][↓,↑][::-]Down/Up [::b][Enter[][::-]Use [::b][Ctrl+N[][::-]New [::b][Ctrl+I[][::-]Import AWS [::b][Ctrl+Y[][::-]Yank(Copy) [::b][Ctrl+E[][::-]Edit [::b][o[][::-]Options [::b][Ctrl+V[][::-]Verify [::b][Del[][::-]Delete [::b][Ctrl+H[][::-]Hotkeys [::b][Ctrl+Q][::-]Quit")
+	c.view.SetFrameText("[::b][↓,↑][::-]Down/Up [::b][Enter[][::-]Use [::b][Ctrl+N[][::-]New [::b][Ctrl+I[][::-]Import AWS [::b][Ctrl+Y[][::-]Yank(Copy) [::b][Ctrl+E[][::-]Edit [::b][o[][::-]Options [::b][x[][::-]Export [::b][Ctrl+V[][::-]Verify [::b][Del[][::-]Delete [::b][Ctrl+H[][::-]Hotkeys [::b][Ctrl+Q][::-]Quit")
 }
 
 // Duck opens the profile in c.activeConfig for browsing. Every connection
@@ -567,6 +582,9 @@ func (c *Controller) Duck() {
 	c.setInput()
 	c.logActivity("opened profile %s (%s)", c.activeConfig.Name,
 		modelConfigFor(c.activeConfig).CredentialSource())
+	// Restores this profile is waiting on may have finished while it was
+	// closed; check now rather than a poll interval from now.
+	c.scheduleRestoreCheck()
 	// Land where this profile was last browsing, if it remembers.
 	if c.restoreLocation() {
 		return

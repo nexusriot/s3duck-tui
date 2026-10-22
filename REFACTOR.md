@@ -517,9 +517,9 @@ confirmed, never an input it re-derives that from.
 §3 sketched the target before any of it existed, and the code chose other
 names (or another shape) in a few places; §3 is left as it was written. The S3
 ports are `Fetcher`, `Pusher`, `Checker`, `FS` and `Gate` (`internal/ops/ports.go`)
-plus `Mover` (`internal/ops/copy.go`), not `Lister`/`Putter`. The operations are
-`ops.Download`, `ops.Upload`, `ops.Copy` and `ops.Sync`, not `DownloadOp` and
-friends. The shell hands back a `*shell.Layer`, not a `Handle`, and
+plus `Mover` (`internal/ops/copy.go`) and `Opener` (`internal/ops/archive.go`),
+not `Lister`/`Putter`. The operations are `ops.Download`, `ops.Upload`,
+`ops.Copy`, `ops.Sync` and `ops.Archive`, not `DownloadOp` and friends. The shell hands back a `*shell.Layer`, not a `Handle`, and
 `shell.Toast` takes a primitive rather than (kind, header, body). A pane is
 entered with `Pane.Enter(bucket, path, restore)`, not `Navigate`, and
 `Pane.Snapshot` returns `[]*model.Object` — there is no `PaneView`. The keymap
@@ -528,8 +528,11 @@ depends on `internal/model` (for the object type), not on nothing.
 
 ### What is still open
 
-- **Four flows are converted; five still open-code the pipeline.**
-  `Download`, `Upload`, `Copy`/`Move` and `Sync` are `ops.Operation`s. Still
+- **Five flows are converted; five still open-code the pipeline.**
+  `Download`, `Upload`, `Copy`/`Move`, `Sync` and `Archive` are
+  `ops.Operation`s — `Archive` was written as one from the start, which is the
+  shape working as intended: it got the confirmation, the queue, Background,
+  Cancel and the failure ledger without adding a line of UI code. Still
   open-coding what the Runner owns: `runCrossCopy` (221 lines),
   `runBatchRename` (84), `runDelete` (77), `runUndo` (67) and
   `runTrashRestore` (34). The pattern is established — each is a

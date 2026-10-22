@@ -816,49 +816,6 @@ func (m *Model) ListMultipartUploads(bucket *Object) ([]MultipartUpload, error) 
 	return ups, nil
 }
 
-// BucketConfigInfo is a read-only snapshot of a bucket's configuration.
-type BucketConfigInfo struct {
-	Region     string
-	Versioning string // "Enabled" / "Suspended" / "off"
-	Encryption string // e.g. "AES256" / "aws:kms" / "none"
-	ObjectLock string // "on" / "off"
-}
-
-// BucketConfig gathers a bucket's versioning, default encryption, object-lock,
-// and region. Optional features that the endpoint doesn't support (common on
-// MinIO/Ceph) error out and are reported as their "off"/"none" default rather
-// than failing the whole call.
-func (m *Model) BucketConfig(bucket *Object) (BucketConfigInfo, error) {
-	if bucket == nil || bucket.Key == nil {
-		return BucketConfigInfo{}, fmt.Errorf("bucket is nil")
-	}
-	name := aws.String(*bucket.Key)
-	ctx := context.TODO()
-	info := BucketConfigInfo{Region: "us-east-1", Versioning: "off", Encryption: "none", ObjectLock: "off"}
-
-	if loc, err := m.GetBucketLocation(bucket.Key); err == nil && loc != nil && *loc != "" {
-		info.Region = *loc
-	}
-	if v, err := m.Client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: name}); err == nil {
-		if s := string(v.Status); s != "" {
-			info.Versioning = s
-		}
-	}
-	if e, err := m.Client.GetBucketEncryption(ctx, &s3.GetBucketEncryptionInput{Bucket: name}); err == nil {
-		if e.ServerSideEncryptionConfiguration != nil && len(e.ServerSideEncryptionConfiguration.Rules) > 0 {
-			if d := e.ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault; d != nil {
-				info.Encryption = string(d.SSEAlgorithm)
-			}
-		}
-	}
-	if l, err := m.Client.GetObjectLockConfiguration(ctx, &s3.GetObjectLockConfigurationInput{Bucket: name}); err == nil {
-		if l.ObjectLockConfiguration != nil && string(l.ObjectLockConfiguration.ObjectLockEnabled) == "Enabled" {
-			info.ObjectLock = "on"
-		}
-	}
-	return info, nil
-}
-
 // AbortMultipartUpload discards one incomplete multipart upload and its parts.
 func (m *Model) AbortMultipartUpload(bucket *Object, key, uploadID string) error {
 	if bucket == nil || bucket.Key == nil {

@@ -1,6 +1,21 @@
+# Editors
 .idea/
+.vscode/
+
+# Build output. These are what `make clean` removes: the cross-build tree, the
+# .deb staging area, and a binary from a plain `go build` in the repository
+# root. The leading slash anchors the binary names to the root, so a directory
+# or package named after the app elsewhere in the tree is still tracked.
 build/
 dist/
 /s3duck-tui
+/s3duck-tui.exe
 
+# Go tooling leftovers: `go test -c` writes <package>.test, and a coverage run
+# writes its profile wherever it is pointed.
+*.test
+coverage.out
 
+# macOS writes these into any directory it browses, and this project ships
+# darwin builds.
+.DS_Store

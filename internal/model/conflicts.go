@@ -245,6 +245,10 @@ func (m *Model) conflictsByListing(ctx context.Context, bucket *Object, keys []s
 	return found, nil
 }
 
+// IsNotFound is isNotFound for callers outside the package: the restore
+// tracker tells "the object is gone" from "the check failed" with it.
+func IsNotFound(err error) bool { return isNotFound(err) }
+
 // isNotFound reports whether an error is S3's "this key does not exist".
 //
 // It has to be generous. A HEAD response carries no body, so there is nothing

@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/dustin/go-humanize"
+	"github.com/rivo/tview"
 
 	"github.com/nexusriot/s3duck-tui/internal/model"
 )
@@ -123,7 +124,7 @@ func (c *Controller) localTitle() string {
 	// bracket has to be escaped ("[local[]") for a literal one, which is
 	// exactly the trap listRow already documents for object names.
 	return fmt.Sprintf("[local[] %s  [gray]%d file(s), %s",
-		model.DisplayDir(c.pane().LocalDir(), c.params.HomeDir), files, humanize.IBytes(uint64(bytes)))
+		tview.Escape(model.DisplayDir(c.pane().LocalDir(), c.params.HomeDir)), files, humanize.IBytes(uint64(bytes)))
 }
 
 // localDown enters a directory (or does nothing on a file — a local pane has
