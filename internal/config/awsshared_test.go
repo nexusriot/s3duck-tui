@@ -199,3 +199,35 @@ func TestLoadAWSProfiles(t *testing.T) {
 		}
 	})
 }
+
+// A header with a trailing comment must still open its own section: treating
+// it as unrecognised merged prod's keys into "default".
+func TestParseAWSProfilesHeaderComment(t *testing.T) {
+	creds := "[default]\naws_access_key_id = DEFAULTKEY\naws_secret_access_key = ds\n" +
+		"[prod] # careful\naws_access_key_id = PRODKEY ; rotated monthly\naws_secret_access_key = ps\n"
+	got := map[string]AWSProfile{}
+	for _, p := range ParseAWSProfiles(creds, "") {
+		got[p.Name] = p
+	}
+	if got["default"].AccessKey != "DEFAULTKEY" {
+		t.Errorf("default key = %q, want DEFAULTKEY", got["default"].AccessKey)
+	}
+	if got["prod"].AccessKey != "PRODKEY" {
+		t.Errorf("prod key = %q, want PRODKEY (inline comment stripped)", got["prod"].AccessKey)
+	}
+}
+
+func TestStripInlineComment(t *testing.T) {
+	cases := map[string]string{
+		"eu-west-1 # comment": "eu-west-1",
+		"AKEY\t; inline":      "AKEY",
+		"abc#def":             "abc#def",
+		"a;b":                 "a;b",
+		"plain":               "plain",
+	}
+	for in, want := range cases {
+		if got := stripInlineComment(in); got != want {
+			t.Errorf("stripInlineComment(%q) = %q, want %q", in, got, want)
+		}
+	}
+}

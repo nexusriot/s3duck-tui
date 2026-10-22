@@ -1,0 +1,7 @@
+# The runner image needs only the module files: the tree itself is mounted at
+# run time. Everything else stays out of the build context, so a source edit
+# never rebuilds the image and a large build/ or dist/ never ships to the
+# daemon.
+*
+!go.mod
+!go.sum

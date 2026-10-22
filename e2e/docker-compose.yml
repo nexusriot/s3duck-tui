@@ -1,0 +1,51 @@
+# Hermetic end-to-end run: a throwaway MinIO and a runner that drives the real
+# s3duck-tui binary against it, in a terminal, on a private network. Nothing
+# outside this directory is required and nothing outlives `down -v`: MinIO's
+# data is a tmpfs and no port is published to the host.
+#
+#   make e2e                                         from the repository root
+#   docker compose -f e2e/docker-compose.yml run --rm runner
+
+name: s3duck-tui-e2e
+
+services:
+  minio:
+    # The image CI pins (see .github/workflows/ci.yml for why this rebuild of
+    # MinIO's final community release, and not quay.io/minio/minio). Override
+    # with S3DUCK_E2E_MINIO_IMAGE to point at a MinIO you host yourself.
+    image: ${S3DUCK_E2E_MINIO_IMAGE:-alpine/minio:RELEASE.2025-10-15T17-29-55Z}
+    command: server /data --address :9000
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+      MINIO_BROWSER: "off"
+    # tmpfs, not a volume: a run that depended on what a previous one left
+    # behind would not be hermetic. It also settles ownership — the server
+    # runs as uid 100, and a /data in the image layer is root-owned, which
+    # MinIO reports as "file access denied".
+    tmpfs:
+      - /data:uid=100,gid=101,mode=0750
+    healthcheck:
+      # The image has no curl and no mc; wget is what it carries.
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:9000/minio/health/live"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 3s
+
+  runner:
+    build:
+      context: ..
+      dockerfile: e2e/Dockerfile
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      S3DUCK_TEST_ENDPOINT: http://minio:9000
+      S3DUCK_TEST_ACCESS_KEY: minioadmin
+      S3DUCK_TEST_SECRET_KEY: minioadmin
+      S3DUCK_TEST_REGION: us-east-1
+    volumes:
+      # Read-only: the suite must not be able to edit the tree it tests. It
+      # builds the binary into /tmp and gives every test its own HOME there.
+      - ..:/src:ro

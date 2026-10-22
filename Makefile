@@ -15,16 +15,21 @@
 #   darwin            darwin/amd64 + arm64   (bonus, README-documented)
 #   windows           windows/amd64          (bonus, README-documented)
 #
-# Debian packages (.deb via dpkg-deb, mirrors build-deb.sh):
+# Debian packages (.deb via dpkg-deb; same DEBIAN/ template and package layout
+# as build-deb.sh, but every binary here is built CGO-off with -trimpath -s -w,
+# where build-deb.sh links a native-arch build statically through cgo):
 #   deb-amd64  deb-arm64  deb-armhf  deb-riscv64   ->  build/<pkg>.deb
 #
-# Override version:   make debs VERSION=0.0.40
-# The version is also hard-coded in pkg/view/view.go and build-deb.sh; bump all three.
+# The version is hard-coded in three places — VERSION here, versionText in
+# internal/ui/widgets/view.go and version= in build-deb.sh — so a release bumps
+# all three; TestVersionMatchesPackaging fails the build if one is missed.
+# `make debs VERSION=x.y.z` relabels the package and file names ONLY: the
+# binary inside still reports the compiled-in versionText.
 
 APP        := s3duck-tui
 PKG        := ./cmd/s3duck-tui
 GO         ?= go
-VERSION    ?= 0.10.0
+VERSION    ?= 0.10.2
 LDFLAGS    ?= -s -w
 BUILD_DIR  := build
 DIST_DIR   := dist
@@ -70,6 +75,7 @@ help:
 	@echo "  make debs               - deb-amd64 + deb-arm64 + deb-armhf + deb-riscv64"
 	@echo "  make test | test-race | check | staticcheck | vet | fmt | tidy | clean"
 	@echo "  make test-integration   - tagged suite against a throwaway MinIO in Docker"
+	@echo "  make e2e                - the real binary, in tmux, against MinIO, all in Docker"
 
 .PHONY: tidy
 tidy:
@@ -94,22 +100,36 @@ test-race:
 # Integration tests need a live S3 endpoint. This target brings MinIO up in
 # Docker, runs the tagged suite against it, and tears it down again. To use an
 # endpoint you already have, set S3DUCK_TEST_ENDPOINT and run test-integration-run.
-MINIO_IMAGE     ?= quay.io/minio/minio
+#
+# The image is the one CI pins (see .github/workflows/ci.yml for why it is this
+# rebuild of MinIO's final community release rather than quay.io/minio/minio).
+MINIO_IMAGE     ?= alpine/minio:RELEASE.2025-10-15T17-29-55Z
 MINIO_CONTAINER ?= s3duck-test-minio
 MINIO_PORT      ?= 19000
 
+# The tmpfs is needed, not an optimisation: the image runs as a non-root user
+# (uid 100, gid 101), and a /data in the container's own layer is root-owned,
+# so the server would die with "file access denied". The S3DUCK_TEST_* keys
+# match the container's root user, overriding any set for another endpoint.
 .PHONY: test-integration
 test-integration:
 	@docker rm -f $(MINIO_CONTAINER) >/dev/null 2>&1 || true
 	docker run -d --name $(MINIO_CONTAINER) -p $(MINIO_PORT):9000 \
+		--tmpfs /data:uid=100,gid=101,mode=0750 \
 		-e MINIO_ROOT_USER=minioadmin -e MINIO_ROOT_PASSWORD=minioadmin \
-		$(MINIO_IMAGE) server /data
+		$(MINIO_IMAGE) server /data --address :9000
 	@echo "waiting for MinIO on :$(MINIO_PORT)..."
 	@for i in $$(seq 1 60); do \
-		curl -sf http://localhost:$(MINIO_PORT)/minio/health/live >/dev/null && break; \
+		curl -sf http://localhost:$(MINIO_PORT)/minio/health/live >/dev/null && exit 0; \
 		sleep 1; \
-	done
+	done; \
+	echo "MinIO did not become ready in time" >&2; \
+	docker logs $(MINIO_CONTAINER) || true; \
+	docker rm -f $(MINIO_CONTAINER) >/dev/null 2>&1 || true; \
+	exit 1
 	@S3DUCK_TEST_ENDPOINT=http://localhost:$(MINIO_PORT) \
+		S3DUCK_TEST_ACCESS_KEY=minioadmin S3DUCK_TEST_SECRET_KEY=minioadmin \
+		S3DUCK_TEST_REGION=us-east-1 \
 		$(GO) test -tags integration -count=1 -v ./... ; \
 		status=$$? ; \
 		docker rm -f $(MINIO_CONTAINER) >/dev/null 2>&1 || true ; \
@@ -120,16 +140,28 @@ test-integration:
 test-integration-run:
 	$(GO) test -tags integration -count=1 -v ./...
 
+# The end-to-end suite: the real binary, driven through tmux, against a real
+# MinIO — both in containers on a private network, torn down afterwards (see
+# e2e/run.sh). Narrow it with E2E_RUN, a go test -run pattern:
+#   make e2e E2E_RUN=Undo
+E2E_RUN ?=
+
+.PHONY: e2e
+e2e:
+	./e2e/run.sh $(if $(E2E_RUN),-run '$(E2E_RUN)')
+
 .PHONY: staticcheck
 staticcheck:
 	staticcheck ./...
 
-# Everything CI enforces, in one target.
+# CI's lint-and-test job in one target, minus staticcheck (see the staticcheck
+# target; CI pins its version). The integration suite is test-integration.
 .PHONY: check
 check:
 	@test -z "$$(gofmt -l .)" || { echo "not gofmt-clean:"; gofmt -l .; exit 1; }
 	$(GO) vet ./...
 	$(GO) vet -tags integration ./...
+	$(GO) vet -tags e2e ./...
 	$(GO) build ./...
 	$(GO) test -race -count=1 ./...
 

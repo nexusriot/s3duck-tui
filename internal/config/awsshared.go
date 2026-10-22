@@ -70,9 +70,20 @@ func parseINI(data string) map[string]map[string]string {
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 			continue
 		}
-		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
-			section = strings.TrimSpace(line[1 : len(line)-1])
-			if _, ok := out[section]; !ok {
+		if strings.HasPrefix(line, "[") {
+			// The header ends at the first "]", so "[prod] # careful" is
+			// still prod. Requiring "]" to be the last character made such a
+			// header unrecognised and merged prod's keys into the PREVIOUS
+			// section — importing "default" then authenticated as prod. A
+			// header with no "]" at all starts no section, so the lines under
+			// it attach to nothing rather than to the one above.
+			end := strings.Index(line, "]")
+			if end < 0 {
+				section = ""
+				continue
+			}
+			section = strings.TrimSpace(line[1:end])
+			if _, ok := out[section]; !ok && section != "" {
 				out[section] = map[string]string{}
 			}
 			continue
@@ -84,9 +95,21 @@ func parseINI(data string) map[string]map[string]string {
 		if !found {
 			continue
 		}
-		out[section][strings.ToLower(strings.TrimSpace(k))] = strings.TrimSpace(v)
+		out[section][strings.ToLower(strings.TrimSpace(k))] = stripInlineComment(strings.TrimSpace(v))
 	}
 	return out
+}
+
+// stripInlineComment drops a trailing "# ..." or "; ..." comment from a value,
+// as the SDK does. Only a marker preceded by whitespace starts one: key
+// material never contains spaces, but it may contain the characters.
+func stripInlineComment(v string) string {
+	for i := 1; i < len(v); i++ {
+		if (v[i] == '#' || v[i] == ';') && (v[i-1] == ' ' || v[i-1] == '\t') {
+			return strings.TrimSpace(v[:i])
+		}
+	}
+	return v
 }
 
 // normalizeProfileSection maps a section name to its profile name. The config

@@ -1,4 +1,4 @@
-#!/bin/env bash
+#!/usr/bin/env bash
 # Build s3duck-tui for the LicheeRV Nano (W) — linux/riscv64.
 #
 #   ./build-licheerv.sh           -> bare static binary into dist/
@@ -6,6 +6,8 @@
 set -e
 
 dir="$(cd "$(dirname "$0")" && pwd)"
+# dist/ and ./cmd/... are repository paths, wherever this is run from.
+cd "$dir"
 
 if [ "${1:-}" = "deb" ]; then
   exec "$dir/build-deb.sh" riscv64

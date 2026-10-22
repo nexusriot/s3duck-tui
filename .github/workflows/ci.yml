@@ -55,6 +55,10 @@ jobs:
       - name: type-check integration tests
         run: go vet -tags integration ./...
 
+      # Same for the end-to-end suite, which only the e2e job below runs.
+      - name: type-check e2e tests
+        run: go vet -tags e2e ./...
+
   integration:
     name: Integration (MinIO)
     runs-on: ubuntu-latest
@@ -66,15 +70,36 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      # Started here rather than as a `services:` container: the official MinIO
-      # image needs the `server /data` argument, which the services block cannot
+      # Started here rather than as a `services:` container: the MinIO image
+      # needs the `server /data` argument, which the services block cannot
       # supply.
+      #
+      # MinIO archived its open-source server in 2025. quay.io/minio/minio
+      # stopped granting anonymous pulls — the pull now fails with
+      # "unauthorized", which is what broke this job — the Docker Hub
+      # repository is gone, and dl.min.io answers 410 for the community
+      # binaries. This is the Alpine project's rebuild of the FINAL community
+      # release, pinned to that exact upstream tag.
+      #
+      # Staying on MinIO matters more than staying current: several of this
+      # project's documented limitations are statements about how MinIO
+      # behaves, and a different server would answer differently and quietly
+      # stop checking them.
+      #
+      # The tmpfs is not an optimisation. This image runs as a non-root user,
+      # so a /data created in the container's own layer is root-owned and the
+      # server dies with "Unable to initialize backend: file access denied".
+      # Mounting it with that user's ids settles the ownership, and a run that
+      # starts from nothing is what makes the suite's fixtures trustworthy.
       - name: start MinIO
+        env:
+          MINIO_IMAGE: alpine/minio:RELEASE.2025-10-15T17-29-55Z
         run: |
           docker run -d --name minio -p 9000:9000 \
+            --tmpfs /data:uid=100,gid=101,mode=0750 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio server /data
+            "$MINIO_IMAGE" server /data --address :9000
           for _ in $(seq 1 60); do
             if curl -sf http://localhost:9000/minio/health/live >/dev/null; then
               echo "MinIO is up"
@@ -94,9 +119,26 @@ jobs:
           S3DUCK_TEST_REGION: us-east-1
         run: go test -tags integration -count=1 -v ./...
 
+      # `|| true`: when the failure IS that the container never started — an
+      # unauthorized pull, say — `docker logs` exits 1 and adds a second,
+      # louder error that buries the real one.
       - name: MinIO logs on failure
         if: failure()
-        run: docker logs minio
+        run: docker logs minio || true
+
+  # The real binary, in a real terminal (tmux), against a real MinIO — the one
+  # place a keypress is followed all the way to what the server holds. Fully
+  # in containers (e2e/docker-compose.yml): the runner image carries Go and
+  # tmux, MinIO runs on a tmpfs, and the network is private, so the job needs
+  # nothing from the host but Docker.
+  e2e:
+    name: End-to-end (binary in tmux, MinIO)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: make e2e
+        run: make e2e
 
   cross-build:
     name: Cross-build ${{ matrix.goos }}/${{ matrix.goarch }}
