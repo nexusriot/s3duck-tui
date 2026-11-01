@@ -5,8 +5,52 @@ Known constraints live in [DESIGN.md](DESIGN.md); user-facing docs in [README.md
 
 ## Delivered in this round
 
-**Reading, packaging and watching** — 0.11.0, 2026-10-22; design notes in
-DESIGN.md, limitations in its table
+**Two accounts, resume, export** — 0.14.0, 2026-11-01; design notes in
+DESIGN.md (*Panes on different profiles*, *Resume*, *Export a listing*)
+
+- **Dual panes on different profiles** (`, o`) — a client per pane; Tab
+  switches account, guards and header; Ctrl+Y / Ctrl+T stream between
+  accounts (a move deletes each source after its copy lands); `=` compares
+  each side through its own; cross-account paste refused.
+- **Download resume** — from 8 MiB, a cancelled, failed or quit download
+  keeps its prefix and the next one fetches the rest, pinned to the version
+  with `If-Match`.
+- **Export a listing** (`, e`; `x` in search results and the usage browser)
+  — CSV or JSON, formula-safe CSV.
+
+**The previous round: versioned buckets** — 0.13.0, 2026-10-31; design notes in DESIGN.md
+(*Purge, deleted objects and bulk edits*), limitations in its table
+
+- **Purge** (`, X`, or `v` with several marked) — every version, or old
+  versions only, by version ID, with the totals confirmed first; deleting a
+  bucket purges it, so a versioned bucket can be removed.
+- **Deleted objects** (`, D`) — keys whose latest entry is a delete marker,
+  with undelete (marked or highlighted) and the version history.
+- **Bulk `m` / `c`** over the marked set or a folder: merged metadata and tag
+  edits, one storage class for all, restore of the archived ones.
+- **Buckets by name** when the credentials may not list buckets.
+
+**The previous round: quick wins** — 0.12.0, 2026-10-27; design notes in DESIGN.md (*Command
+line, go-to and `s3://` URIs*, *Anonymous profiles and presigned uploads*,
+*Desktop notifications*), limitations in its table
+
+- **Command line** — `--profile`, `--config`, `--notify`, `--version`,
+  `--help`, and an `s3://bucket/prefix` (or object) argument that opens there.
+  Mistakes are reported on stderr, status 2, before the TUI starts.
+- **Go to** (`g`) — an `s3://` URI, `/key` from the bucket root, or a path
+  relative to here with `..`; an ambiguous key is probed (folder or object).
+- **Copy `s3://` URI** (`, c`) — marked items one per line, the highlighted
+  one, or the folder being shown.
+- **Presigned upload link** (`, p`) — PUT URL for one key, 15m–7d, says when it
+  would replace an object; never logged.
+- **Anonymous profiles** — unsigned requests for public buckets, with a
+  bucket list of their own, region from `HEAD`, plain URLs from `Ctrl+W`, and
+  exports for the AWS CLI / mc / rclone.
+- **Enable / suspend versioning** from the bucket dashboard (`v`).
+- **Desktop notifications** — `notify-send` / `osascript`, or OSC 9 / 777
+  through the terminal, for finished background jobs and ready restores.
+
+**The previous round: reading, packaging and watching** — 0.11.0, 2026-10-22
 
 - **Formatted preview** — gzip / zstd decoded on the fly, JSON pretty-printed
   (re-indented when the head is truncated), CSV/TSV as aligned columns, tar
@@ -79,25 +123,6 @@ for each are in DESIGN.md, and the new limitations they carry are in its table.
 
 ## Next
 
-- **Bulk operations for metadata / storage class / versions** `[M]` — `m`, `c` and `v`
-  act on the highlighted object only, while download / copy / move / rename / delete
-  all honour the marked set. Tagging forty objects `env=staging` or archiving a whole
-  folder to GLACIER should be one action. The per-object machinery exists; this is the
-  marked-set loop plus a progress modal, same shape as `runDelete`.
-- **Version-aware delete / purge** `[M]` — `model.Delete` sends no `VersionId`, so on a
-  versioned bucket a folder delete only writes delete markers and a bucket can never be
-  fully emptied from the TUI (`EmptyBucket` clears current objects; versions survive).
-  Wants: "delete all versions of this object", and a version-aware recursive purge so
-  versioned buckets can actually be removed. (Safe delete does not help here: a
-  trashed object leaves a delete marker at its old key.)
-- **Enable bucket versioning from the dashboard** `[S]` — the bucket dashboard reports
-  versioning read-only and the version browser requires it; the app should be able to
-  turn it on (`PutBucketVersioning`).
-- **Show deleted objects** `[M]` — undelete itself exists: `d` on a delete marker in the
-  version browser removes it, and the version underneath becomes current again. What is
-  missing is reaching a deleted key: `ListObjectsV2` hides it, and the version browser
-  opens only on a listed object. A "show deleted" listing toggle (keys whose latest
-  version is a marker) closes the loop the version browser opened.
 - **Deep duplicate scan** `[M]` — the finder groups by (size, ETag), which cannot see
   two identical files uploaded with different part sizes. `ObjectChecksum` alone does
   not close that blind spot: a multipart object's stored checksum is a
@@ -117,22 +142,14 @@ for each are in DESIGN.md, and the new limitations they carry are in its table.
   common real case.
 - **Export the duplicate report** `[S]` — the failure ledger's export
   (`writeFailureReport`) is the shape to copy.
-- **Presigned PUT** `[S]` — `PresignGetURL` exists; the upload counterpart is ~15 lines
-  and enables "send me a file" workflows.
-- **Copy `s3://` URI** `[S]` — `CopyToClipboard` reports its errors now, so this is
-  only the button.
-- **Go-to-path jump** `[S]` — `jumpTo()` exists; needs only an input modal.
-- **CLI flags** `[S]` — `--profile` / `--config` / `--version`; nothing parses args today.
 - **Mouse support** `[S]` — `EnableMouse(true)` plus click-to-select. Now that the
   keymap is data, this is the other half of "input is configurable".
-- **Export listing to CSV/JSON** `[S]` — makes recursive search and the usage browser
-  usable outside the TUI.
 - **Watch mode** `[S]` — a toggle that re-lists the current prefix every few
   seconds and highlights new/changed rows; for watching a pipeline drop files
   into a bucket. The transfers panel's ticker pattern already exists.
-- **Anonymous profiles** `[S]` — a "public bucket (no credentials)" checkbox
-  using `aws.AnonymousCredentials`, for browsing public datasets. Today a
-  profile always signs requests, so public-only access is impossible.
+- **Presigned POST** `[M]` — a browser-form upload policy (size range,
+  key prefix, content type) for "drop files here" pages, which a PUT link
+  cannot constrain.
 - **Search filters** `[M]` — extend recursive search beyond the name query with
   size/date predicates (`>100M`, `<2025-01-01`). The query syntax (text / glob /
   `re:`) is in place; this is the predicate half.
@@ -155,11 +172,6 @@ for each are in DESIGN.md, and the new limitations they carry are in its table.
 - **OS keyring for secrets** `[M]` — `secret_key` / `session_token` are plaintext (0600).
   Less pressing now that `aws_profile` stores no key material at all, but it is still
   the answer for a static MinIO key.
-- **Download resume** `[L]`.
-- **Dual panes on different profiles** `[L]` — the cross-profile copy (`>`,
-  v0.7.0) built the two-client substrate, and the local pane showed that a pane
-  can hold something other than "the one model": the remaining work is a
-  per-pane client.
 - **Trash retention** `[S–M]` — an age-based "empty anything older than N days",
   so safe delete does not need a manual sweep.
 
@@ -263,16 +275,47 @@ Found in the 2026-10 review:
   or to a different profile of that name.
 - **Usage browser paths for empty segments** `[S]` — a node's `fullPath` is wrong for
   keys like `/etc/x` or `a//b`.
-- **config.json edge cases** `[S]` — `WriteConfig` does not fsync before its rename,
-  writes through a fixed `config.json.tmp` that two instances share, and replaces a
-  symlinked `config.json` (dotfile managers) with a regular file. An explicit save
+- **config.json edge cases** `[S]` — a save replaces a symlinked `config.json`
+  (dotfile managers) with a regular file. (The fixed, shared `config.json.tmp` and
+  the missing fsync were fixed in the 0.12.0 review.) An explicit save
   also writes the in-memory list, so it drops what another running instance saved
   since this one started, and fields this build does not know (only the automatic
   location save patches the file in place). With `$HOME` unset every path becomes
   relative to the working directory.
-- **No conditional reads on large transfers** `[M]` — a multipart copy sends no
-  `CopySourceIfMatch` and the downloader no `IfMatch`, so an object replaced
-  mid-transfer can produce a mix of two versions.
+- **No conditional reads on small downloads** `[S]` — downloads under 8 MiB send no
+  `IfMatch`, so an object replaced mid-download by one *of the same size* could mix
+  two versions (a different size is refused). Larger downloads are pinned since
+  0.14.0, multipart copies since 0.12.0.
+- **Partials nobody resumes** `[S]` — a kept partial stays (hidden) until the same
+  object is downloaded to the same place; an age-based sweep, and a lock against
+  two instances sharing one, are not done.
+- **Undo for a move between profiles** `[M]` — a Ctrl+T across accounts is not
+  recorded for `u`.
+- **Trash prefix inside the folder being deleted** `[S]` — with a custom
+  `trash_prefix` such as `data/.trash/`, deleting `data/` plans a move into its own
+  subtree, which `planFolderCopy` refuses: nothing is lost, but the folder cannot
+  be deleted while safe delete is on (and Retry repeats the refusal).
+- **Delete inside the trash reads like a trash move** `[S]` — `d` on the trash
+  folder or something already in it is a real delete, but the confirmation uses
+  the recoverable wording; the duplicate finder already tells the two apart.
+- **Large copies drop unreadable tags** `[S]` — a copy above 5 GiB re-applies the
+  source's tags, and when `GetObjectTagging` fails (a role without
+  `s3:GetObjectTagging`) it goes ahead with none, so a move or a metadata save of a
+  tagged object that large loses them. Wants: degrade only on "not implemented",
+  report anything else.
+- **Upload memory for very large files** `[S]` — an upload's body is not seekable,
+  so the SDK buffers each part, five at a time, and parts grow to fit 10 000: about
+  525 MiB per upload for a 1 TiB file, times the transfer width.
+- **Archive name collisions between a file and a folder** `[S]` — keys `a` and `a/b`
+  become entries `a` and `a/b`, which no extractor can create both of; the archive
+  reports success.
+- **Skipped counts in upload and copy summaries** `[S]` — an upload never counts the
+  files a "Skip" left out (5 files, 2 skipped reads "Done: 3 of 5"), and a copy
+  counts skipped *objects*, so a retry of one item can say "Skipped: 5".
+- **Case-insensitive filesystems and download sync** `[M]` — on macOS a remote
+  `README.md` and a local `readme.md` plan as "create" plus "delete" of the same
+  file, which the delete then removes (the remote copy survives); the same shape as
+  the `a//b.txt` item below.
 - **Incomplete-upload cleanup** `[S]` — `ListMultipartUploads` returns only the first
   1 000, and "abort all" also aborts uploads this app is still running.
 - **Sync retry drops the skipped deletes** `[S]` — a retry after failed writes does not

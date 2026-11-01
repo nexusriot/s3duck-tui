@@ -86,3 +86,19 @@ func TestTempSuffix(t *testing.T) {
 		}
 	}
 }
+
+// The lost-update guard fails closed: a copy read without an ETag cannot be
+// confirmed unchanged, so it is not saved over whatever the key holds now.
+func TestEditGuardRefusal(t *testing.T) {
+	if r := editGuardRefusal("abc", "abc"); r != "" {
+		t.Errorf("unchanged object refused: %q", r)
+	}
+	if r := editGuardRefusal("abc", "def"); !strings.Contains(r, "changed on the server") {
+		t.Errorf("changed object: %q", r)
+	}
+	for _, cur := range []string{"", "def"} {
+		if r := editGuardRefusal("", cur); !strings.Contains(r, "cannot be confirmed") {
+			t.Errorf("read without an ETag, current %q: allowed (%q)", cur, r)
+		}
+	}
+}

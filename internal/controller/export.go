@@ -111,6 +111,18 @@ func exportAWSProfile(p *cfg.Config) string {
 		}
 	}
 
+	if p.Anonymous {
+		// No credentials section: the AWS CLI sends unsigned requests with
+		// --no-sign-request, and needs nothing in ~/.aws/credentials for it.
+		b.WriteString("# ~/.aws/config (anonymous: no credentials)\n")
+		fmt.Fprintf(&b, "[profile %s]\n", name)
+		writeEndpoint()
+		if p.IgnoreSsl {
+			b.WriteString("\n# This profile skips TLS verification: add --no-verify-ssl to aws commands.\n")
+		}
+		fmt.Fprintf(&b, "\n# Then: aws s3 ls s3://%s/ --no-sign-request --profile %s\n", anonymousExampleBucket(p), name)
+		return b.String()
+	}
 	if p.AWSProfile != "" {
 		fmt.Fprintf(&b, "# This profile delegates its credentials to the ~/.aws profile %q.\n", p.AWSProfile)
 		fmt.Fprintf(&b, "# Add these lines to that profile's section in ~/.aws/config:\n")
@@ -135,6 +147,17 @@ func exportAWSProfile(p *cfg.Config) string {
 	return b.String()
 }
 
+// anonymousExampleBucket names a bucket for an anonymous profile's "Then:"
+// line, which has to name one: there is no anonymous bucket listing.
+func anonymousExampleBucket(p *cfg.Config) string {
+	for _, b := range p.PublicBuckets {
+		if b = strings.TrimSpace(b); b != "" {
+			return b
+		}
+	}
+	return "BUCKET"
+}
+
 // awsCLIProfileName is the profile the exported AWS block is reached by.
 func awsCLIProfileName(p *cfg.Config) string {
 	if p.AWSProfile != "" {
@@ -156,6 +179,15 @@ func exportMCAlias(p *cfg.Config) string {
 	if p.SessionToken != "" {
 		b.WriteString("# The profile uses temporary credentials (a session token), which\n")
 		b.WriteString("# `mc alias set` cannot take: export them through MC_HOST_<alias> instead.\n")
+	}
+	if p.Anonymous {
+		// mc treats an alias with empty keys as anonymous.
+		fmt.Fprintf(&b, "mc alias set %s %s '' '' --api S3v4\n", shellQuote(exportName(p.Name)), shellQuote(url))
+		if p.IgnoreSsl {
+			b.WriteString("# This profile skips TLS verification: add --insecure to mc commands.\n")
+		}
+		fmt.Fprintf(&b, "# Then: mc ls %s\n", shellQuote(exportName(p.Name)+"/"+anonymousExampleBucket(p)))
+		return b.String()
 	}
 	access := p.AccessKey
 	if access == "" {
@@ -186,7 +218,10 @@ func exportRcloneRemote(p *cfg.Config) string {
 	} else {
 		b.WriteString("provider = Other\n")
 	}
-	if p.AWSProfile != "" {
+	if p.Anonymous {
+		// Blank keys with env_auth off is rclone's anonymous access.
+		b.WriteString("env_auth = false\n")
+	} else if p.AWSProfile != "" {
 		// rclone resolves a shared-config profile itself, SSO and roles
 		// included, so a delegating profile exports without any keys.
 		b.WriteString("env_auth = true\n")

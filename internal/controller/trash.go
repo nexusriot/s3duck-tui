@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rivo/tview"
+
 	cfg "github.com/nexusriot/s3duck-tui/internal/config"
 	"github.com/nexusriot/s3duck-tui/internal/model"
 	"github.com/nexusriot/s3duck-tui/internal/session"
@@ -131,7 +133,7 @@ func (c *Controller) EmptyTrash() {
 			confirm := c.view.NewConfirm()
 			confirm.SetText(fmt.Sprintf(
 				"Permanently delete the trash?\n\n%s\n\nThis removes %d object(s), %s.\nThey are not recoverable.",
-				trash, target.objects, widgets.HumanizeBytes(target.bytes)))
+				tview.Escape(trash), target.objects, widgets.HumanizeBytes(target.bytes)))
 			confirm.SetDoneFunc(func(_ int, label string) {
 				confirmLay.Close()
 				if label != widgets.ConfirmOK {
@@ -237,7 +239,7 @@ func (c *Controller) runTrashRestore(mdl *model.Model, bucket *model.Object, ops
 			}
 			i, op := i, op
 			c.shell.Do(func() {
-				progress.SetText(fmt.Sprintf("Restoring\n%d/%d\n%s", i+1, len(ops), op.dst))
+				progress.SetText(fmt.Sprintf("Restoring\n%d/%d\n%s", i+1, len(ops), tview.Escape(op.dst)))
 			})
 			moved, err := mdl.MoveKeys(ctx, bucket, bucket, op.src, op.dst, op.isFolder, skip, nil)
 			if err != nil {

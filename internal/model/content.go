@@ -406,7 +406,7 @@ func CrossCopy(ctx context.Context, src *Model, srcBucket *Object, srcKey string
 	// along in attrs, so the derivation here only fills a gap.
 	dst.writeOpts().applyPutForKey(in, dstKey)
 
-	if _, err := newUploader(dst.Client, out.ContentLength).Upload(ctx, in); err != nil {
+	if err := uploadObject(ctx, dst.Client, newUploader(dst.Client, out.ContentLength), in); err != nil {
 		return fmt.Errorf("writing %s: %w", dstKey, err)
 	}
 	return nil

@@ -623,6 +623,24 @@ func summarizeLogging(le *s3t.LoggingEnabled) ConfigItem {
 	return ConfigItem{State: ConfigSet, Value: "to s3://" + aws.ToString(le.TargetBucket) + "/" + aws.ToString(le.TargetPrefix)}
 }
 
+// SetBucketVersioning turns versioning on (Enabled) or pauses it
+// (Suspended). There is no "off": once a bucket has been versioned, S3 only
+// lets it be suspended, and the versions already written stay.
+func (m *Model) SetBucketVersioning(ctx context.Context, bucket *Object, enabled bool) error {
+	if bucket == nil || bucket.Key == nil {
+		return fmt.Errorf("bucket is nil")
+	}
+	status := s3t.BucketVersioningStatusSuspended
+	if enabled {
+		status = s3t.BucketVersioningStatusEnabled
+	}
+	_, err := m.Client.PutBucketVersioning(ctx, &s3.PutBucketVersioningInput{
+		Bucket:                  aws.String(*bucket.Key),
+		VersioningConfiguration: &s3t.VersioningConfiguration{Status: status},
+	})
+	return err
+}
+
 // PutBucketTags replaces the bucket's tag set; an empty map removes them all
 // (DeleteBucketTagging — S3 refuses an empty PutBucketTagging).
 func (m *Model) PutBucketTags(ctx context.Context, bucket *Object, tags map[string]string) error {

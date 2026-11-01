@@ -12,9 +12,17 @@ dist/
 /s3duck-tui.exe
 
 # Go tooling leftovers: `go test -c` writes <package>.test, and a coverage run
-# writes its profile wherever it is pointed.
+# writes its profile wherever it is pointed (cov/ is where the README's
+# combined unit + integration + e2e recipe puts its counters).
 *.test
 coverage.out
+/cov/
+
+# What an interrupted download leaves beside its target to resume from: a
+# hidden partial file and its record. Only here if a download directory (or
+# a local pane) points inside the checkout.
+*.s3duck-part
+*.s3duck-resume
 
 # macOS writes these into any directory it browses, and this project ships
 # darwin builds.

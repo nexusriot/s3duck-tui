@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"path"
 	"strings"
 
 	"github.com/dustin/go-humanize"
@@ -68,13 +69,24 @@ func (c *Controller) ShowVersions() {
 	if c.remoteOnly("Version history") {
 		return
 	}
+	// Several marked: one history cannot show them all, so v is the bulk
+	// version action — purge, all versions or the old ones.
+	if c.selectedCount() > 1 {
+		c.Purge()
+		return
+	}
 	_, obj, ok := c.currentObject()
 	if !ok || obj.Ot != model.File {
 		return
 	}
-	bucket := c.pane().Bucket()
-	key := *obj.FullPath
-	shortName := *obj.Key
+	c.openVersions(c.pane().Bucket(), *obj.FullPath)
+}
+
+// openVersions loads and shows one key's history. It takes the key rather
+// than a listed row, because a deleted key — the case the history exists to
+// recover — does not list.
+func (c *Controller) openVersions(bucket *model.Object, key string) {
+	shortName := path.Base(key)
 
 	wait := c.wait("Loading version history...")
 

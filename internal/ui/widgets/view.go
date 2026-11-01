@@ -10,7 +10,10 @@ import (
 	"github.com/rivo/tview"
 )
 
-const versionText = "S3Duck 🦆 TUI v.0.11.0"
+const versionText = "S3Duck 🦆 TUI v.0.14.0"
+
+// VersionText is the version line --version prints.
+func VersionText() string { return versionText }
 
 // View ...
 type View struct {
@@ -216,7 +219,15 @@ func NewView() *View {
 
 func (v *View) NewErrorMessageQ(header string, details string) *tview.Modal {
 	errorQ := tview.NewModal()
-	errorQ.SetText(header + ": " + details).
+	// Escaped: a Modal parses colour tags, and these messages name keys,
+	// buckets and server responses verbatim — "logs/[draft]/x.txt" was shown
+	// as "logs//x.txt", which is worst in the clipboard fallbacks, where the
+	// text on screen is what the user copies by hand.
+	// Escaped: a Modal parses colour tags, and these messages name keys,
+	// buckets and server responses verbatim — "logs/[draft]/x.txt" was shown
+	// as "logs//x.txt", which is worst in the clipboard fallbacks, where the
+	// text on screen is what the user copies by hand.
+	errorQ.SetText(tview.Escape(header + ": " + details)).
 		SetBackgroundColor(tcell.ColorRed).
 		AddButtons([]string{"ok"})
 	return errorQ
@@ -246,6 +257,19 @@ func (v *View) Beep() {
 	}
 }
 
+// WriteTerminal writes raw bytes to the terminal — an escape sequence the
+// screen model knows nothing about, such as a notification. Call it from the
+// UI goroutine, where it cannot interleave with a frame being drawn.
+func (v *View) WriteTerminal(seq string) {
+	s, ok := v.screen.Load().(tcell.Screen)
+	if !ok || s == nil {
+		return
+	}
+	if tty, ok := s.Tty(); ok && tty != nil {
+		_, _ = tty.Write([]byte(seq))
+	}
+}
+
 // SetStatus sets the top-right status field: the background-transfer badge.
 func (v *View) SetStatus(status string) {
 	v.chromeStatus = status
@@ -265,11 +289,14 @@ func (v *View) redrawChrome() {
 		if v.chromeWarn {
 			colour = tcell.ColorRed
 		}
-		v.Frame.AddText(v.chromeIdentity, true, tview.AlignLeft, colour)
+		// Escaped: the frame parses colour tags, so a "[ANONYMOUS]" marker
+		// — or a profile named "[red]prod" — would be swallowed as one.
+		v.Frame.AddText(tview.Escape(v.chromeIdentity), true, tview.AlignLeft, colour)
 	}
 	v.Frame.AddText(versionText, true, tview.AlignCenter, tcell.ColorGreen)
 	if v.chromeStatus != "" {
-		v.Frame.AddText(v.chromeStatus, true, tview.AlignRight, tcell.ColorYellow)
+		// Escaped like the identity: notices name objects ("✓ restored: x").
+		v.Frame.AddText(tview.Escape(v.chromeStatus), true, tview.AlignRight, tcell.ColorYellow)
 	}
 	if v.chromeHelp != "" {
 		v.Frame.AddText(v.chromeHelp, false, tview.AlignCenter, tcell.ColorWhite)
@@ -333,6 +360,8 @@ func (v *View) NewInputForm(header, label, value string) *tview.Form {
 // against it — also keeps each form readable.
 const (
 	FieldOptAWSProfile = "AWS profile (delegate credentials)"
+	FieldOptAnonymous  = "Anonymous (no credentials, public buckets)"
+	FieldOptPublic     = "Public buckets (comma-separated)"
 	FieldOptReadOnly   = "Read-only (refuse every write)"
 	FieldOptTrash      = "Safe delete (move to trash instead)"
 	FieldOptTrashPfx   = "Trash prefix"
@@ -347,15 +376,18 @@ const (
 // ProfileOptions is the value the options form edits, kept as a plain struct
 // so the view stays free of the config package.
 type ProfileOptions struct {
-	AWSProfile  string
-	ReadOnly    bool
-	Trash       bool
-	TrashPrefix string
-	DetectMime  bool
-	SSE         string
-	KMSKey      string
-	Checksum    string
-	Verify      bool
+	AWSProfile string
+	Anonymous  bool
+	// PublicBuckets is the anonymous profile's bucket list as typed.
+	PublicBuckets string
+	ReadOnly      bool
+	Trash         bool
+	TrashPrefix   string
+	DetectMime    bool
+	SSE           string
+	KMSKey        string
+	Checksum      string
+	Verify        bool
 	// Workers is the per-job transfer width as typed; empty means the
 	// built-in default.
 	Workers string
@@ -377,6 +409,8 @@ func (v *View) NewProfileOptionsForm(name string, opts ProfileOptions, sseChoice
 	form := tview.NewForm()
 	form.SetTitle(fmt.Sprintf(" Options: %s ", tview.Escape(name)))
 	form.AddInputField(FieldOptAWSProfile, opts.AWSProfile, 40, nil, nil)
+	form.AddCheckbox(FieldOptAnonymous, opts.Anonymous, nil)
+	form.AddInputField(FieldOptPublic, opts.PublicBuckets, 40, nil, nil)
 	form.AddCheckbox(FieldOptReadOnly, opts.ReadOnly, nil)
 	form.AddCheckbox(FieldOptTrash, opts.Trash, nil)
 	form.AddInputField(FieldOptTrashPfx, opts.TrashPrefix, 40, nil, nil)
@@ -406,7 +440,7 @@ func sseLabels(choices []string) []string {
 
 // ProfileOptionsHeight sizes the options dialog: one row per field plus the
 // buttons and the border.
-const ProfileOptionsHeight = 18
+const ProfileOptionsHeight = 20
 
 // NewSearchForm builds the recursive-search form: a query input (item 0) and an
 // "All buckets" checkbox (item 1). The caller owns the overlay, so the caller installs Esc.
@@ -593,7 +627,8 @@ func (v *View) NewCreateLocalFileListForm() (tview.Primitive, *tview.List) {
 
 func (v *View) NewSuccessMessageQ(header string) *tview.Modal {
 	successQ := tview.NewModal()
-	successQ.SetText(header).
+	// Escaped for the reason NewErrorMessageQ gives.
+	successQ.SetText(tview.Escape(header)).
 		SetBackgroundColor(tcell.ColorLime).
 		AddButtons([]string{"ok"})
 	return successQ

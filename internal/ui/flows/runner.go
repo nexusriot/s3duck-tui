@@ -69,7 +69,7 @@ func (r *Runner) launch(op ops.Operation, d ops.Descriptor) {
 
 	var lay *shell.Layer
 	progress := tview.NewModal().
-		SetText(fmt.Sprintf("Starting %s...\n", d.Kind)).
+		SetText(tview.Escape(fmt.Sprintf("Starting %s...\n", d.Kind))).
 		AddButtons([]string{"Background", "Cancel"})
 	progress.SetDoneFunc(func(_ int, label string) {
 		switch label {
@@ -152,8 +152,15 @@ func (r *Runner) showSummary(lay *shell.Layer, modal *tview.Modal, d ops.Descrip
 	}
 
 	modal.ClearButtons()
-	modal.SetText(report)
+	// Escaped here and in every SetText below: these modals name object keys
+	// (failures, files in flight), and a Modal parses colour tags, so a key
+	// like "logs/[draft]/x" lost its middle in the report meant to name it.
+	modal.SetText(tview.Escape(report))
 	modal.AddButtons(buttons)
+	// The summary reuses the progress modal, whose focused button index
+	// survives ClearButtons: after pressing Cancel (the second button), Enter
+	// on the summary pressed its second one — Copy report — instead of Done.
+	modal.SetFocus(0)
 	modal.SetDoneFunc(func(_ int, label string) {
 		switch {
 		case label == "Copy report":
@@ -163,10 +170,10 @@ func (r *Runner) showSummary(lay *shell.Layer, modal *tview.Modal, d ops.Descrip
 			// Said on the modal either way: a silent button that may or may
 			// not have done anything is the same as one that did nothing.
 			if err := r.CopyText(report); err != nil {
-				modal.SetText(report + "\nCopy failed: " + err.Error())
+				modal.SetText(tview.Escape(report + "\nCopy failed: " + err.Error()))
 				return
 			}
-			modal.SetText(report + "\nCopied to the clipboard.")
+			modal.SetText(tview.Escape(report + "\nCopied to the clipboard."))
 		case strings.HasPrefix(label, "Retry failed"):
 			lay.Close()
 			// Inline, not in a goroutine: Start builds widgets and must run on
@@ -178,17 +185,24 @@ func (r *Runner) showSummary(lay *shell.Layer, modal *tview.Modal, d ops.Descrip
 			}
 			path, err := r.ExportFailures(string(d.Kind), res.Failures)
 			if err != nil {
-				modal.SetText(report + "\nExport failed: " + err.Error())
+				modal.SetText(tview.Escape(report + "\nExport failed: " + err.Error()))
 				return
 			}
 			// Keep the report on screen: the user may still want Retry.
-			modal.SetText(report + "\nWritten to " + path)
+			modal.SetText(tview.Escape(report + "\nWritten to " + path))
 		default:
 			lay.Close()
 			r.finished(d)
 		}
 	})
-	r.Shell.Focus(modal)
+	// Only take focus from the top of the stack. A dialog that opened over
+	// this one while the job ran (an overwrite question, an error toast) still
+	// has the user's attention, and focusing the hidden summary routed their
+	// next Enter to its Done button instead. When the layers above close,
+	// focus comes down to this one by itself.
+	if r.Shell.IsTop(lay) {
+		r.Shell.Focus(modal)
+	}
 }
 
 // finished runs the post-operation refresh, for the operations that ask for
@@ -290,7 +304,7 @@ func (u *uiReporter) Queued(waiting bool) {
 		return
 	}
 	text := fmt.Sprintf("%s queued\n\nWaiting for a transfer slot — at most %d run at once.\n", titleCase(string(u.desc.Kind)), u.runner.Queue.Slots())
-	u.runner.Shell.Do(func() { u.modal.SetText(text) })
+	u.runner.Shell.Do(func() { u.modal.SetText(tview.Escape(text)) })
 }
 
 func (u *uiReporter) Progress(p ops.Progress) {
@@ -325,7 +339,7 @@ func (u *uiReporter) Progress(p ops.Progress) {
 	u.mu.Unlock()
 
 	text := ProgressText(u.desc, p, time.Since(started))
-	u.runner.Shell.Do(func() { u.modal.SetText(text) })
+	u.runner.Shell.Do(func() { u.modal.SetText(tview.Escape(text)) })
 }
 
 func (u *uiReporter) Ask(q ops.Question) ops.Answer {

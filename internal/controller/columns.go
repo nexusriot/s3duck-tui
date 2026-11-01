@@ -228,7 +228,7 @@ func listRowRestore(o *model.Object, selected bool, cols listColumns, restore re
 	}
 	if cols.class {
 		b.WriteString(colGapStr)
-		class := truncateDisplay(rowClass(o), colClassWidth)
+		class := tview.Escape(truncateDisplay(rowClass(o), colClassWidth)) // server text
 		if class != "" {
 			class = "[yellow]" + class + "[-]"
 		}

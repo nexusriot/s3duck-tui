@@ -124,7 +124,7 @@ func TestFinishSetsTerminalStatus(t *testing.T) {
 // backgrounded one should raise a notice or ring the bell.
 func TestOnlyBackgroundedJobsAreAnnounced(t *testing.T) {
 	bells := 0
-	q := NewQueue(1, nil, func() { bells++ })
+	q := NewQueue(1, nil, func(View) { bells++ })
 
 	fg := q.Add("download", "fg", 0, 0, nil)
 	q.Finish(fg, false, 0)
@@ -149,7 +149,7 @@ func TestOnlyBackgroundedJobsAreAnnounced(t *testing.T) {
 // Cancelling is the user's own decision; it should not also ring at them.
 func TestCancelDoesNotRing(t *testing.T) {
 	bells := 0
-	q := NewQueue(1, nil, func() { bells++ })
+	q := NewQueue(1, nil, func(View) { bells++ })
 	j := q.Add("upload", "x", 0, 0, nil)
 	j.SetBackgrounded()
 	q.Finish(j, true, 0)
@@ -280,4 +280,52 @@ func TestConcurrentProgressIsRaceFree(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// The announcement carries the job, so the desktop notification can say which
+// transfer finished and how — not just that something did.
+func TestAnnouncementCarriesTheJob(t *testing.T) {
+	var got []View
+	q := NewQueue(1, nil, func(v View) { got = append(got, v) })
+	j := q.Add("sync", "local → b/p", 0, 3, nil)
+	j.SetBackgrounded()
+	q.Finish(j, false, 2)
+	if len(got) != 1 {
+		t.Fatalf("announced %d time(s), want 1", len(got))
+	}
+	v := got[0]
+	if v.Kind != "sync" || v.Desc != "local → b/p" || v.Status != Failed || v.Failed != 2 || !v.Bg {
+		t.Errorf("announced %+v", v)
+	}
+}
+
+// Quitting cancels what is still active — and only that — so each job's own
+// cleanup runs, then waits for them to report finished.
+func TestCancelAllAndWaitIdle(t *testing.T) {
+	q := NewQueue(2, nil, nil)
+	var cancelled []string
+	mk := func(name string) *Job {
+		return q.Add("download", name, 0, 0, func() { cancelled = append(cancelled, name) })
+	}
+	done := mk("done")
+	q.Finish(done, false, 0)
+	a, b := mk("a"), mk("b")
+
+	if n := q.ActiveCount(); n != 2 {
+		t.Fatalf("ActiveCount = %d, want 2", n)
+	}
+	if n := q.CancelAll(); n != 2 || strings.Join(cancelled, ",") != "a,b" {
+		t.Errorf("CancelAll = %d, cancelled %v; want the two active jobs only", n, cancelled)
+	}
+	if q.WaitIdle(30 * time.Millisecond) {
+		t.Error("idle while two jobs have not reported finished")
+	}
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		q.Finish(a, true, 0)
+		q.Finish(b, true, 0)
+	}()
+	if !q.WaitIdle(2 * time.Second) {
+		t.Error("never idle after both jobs finished")
+	}
 }

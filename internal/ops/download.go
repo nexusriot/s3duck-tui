@@ -275,16 +275,24 @@ func (d *Download) one(
 	delete(live, key)
 	mu.Unlock()
 
+	// The download's own result first: one that completed just as Cancel
+	// landed has already written (and maybe replaced) the file, and booking
+	// it as a cancel made the summary say nothing was written.
 	switch {
-	case ctx.Err() != nil:
+	case err != nil && ctx.Err() != nil:
 		led.cancel()
 		return
 	case err != nil:
 		led.fail(key, err)
 		return
 	}
+	landedLate := ctx.Err() != nil
+	if landedLate {
+		// Landed, but the run is over: counted below, not verified.
+		led.cancel()
+	}
 
-	if d.Verify {
+	if d.Verify && !landedLate {
 		if !d.verify(ctx, led, r.target) {
 			return
 		}

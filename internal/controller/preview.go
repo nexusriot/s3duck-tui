@@ -275,6 +275,18 @@ var errDiffTooLarge = errors.New("too many lines to diff")
 // Context is unlimited — every line is shown, changed or not — because a
 // version diff is usually a config file where the surrounding lines are the
 // point. Empty output with a nil error means the two versions are identical.
+// diffLabel makes a header label safe to print: escaped for the tag parser,
+// and on one line — S3 keys may hold newlines, and "x\n[green]+ fake" in a
+// label forged a diff line (and a stop for n / N) under the header.
+func diffLabel(s string) string {
+	return tview.Escape(strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return '?'
+		}
+		return r
+	}, s))
+}
+
 func unifiedDiff(a, b string, labelA, labelB string) (string, error) {
 	linesA := splitLines(a)
 	linesB := splitLines(b)
@@ -301,7 +313,7 @@ func unifiedDiff(a, b string, labelA, labelB string) (string, error) {
 	}
 
 	var b2 strings.Builder
-	fmt.Fprintf(&b2, "[gray]--- %s\n+++ %s[white]\n", labelA, labelB)
+	fmt.Fprintf(&b2, "[gray]--- %s\n+++ %s[white]\n", diffLabel(labelA), diffLabel(labelB))
 	changed := false
 	i, j := 0, 0
 	for i < len(linesA) && j < len(linesB) {

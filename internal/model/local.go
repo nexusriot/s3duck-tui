@@ -38,6 +38,9 @@ func WalkDir(dir string) ([]*Object, error) {
 		if !info.Mode().IsRegular() {
 			continue // sockets, devices and fifos are not transferable
 		}
+		if IsPartialFile(name) {
+			continue // an interrupted download's leftovers, not the user's file
+		}
 		size := info.Size()
 		mod := info.ModTime()
 		p := full
@@ -143,7 +146,7 @@ func LocalTargets(paths []string, dstPrefix string) ([]UploadTarget, int64, erro
 				}
 				return nil
 			}
-			if !fi.Mode().IsRegular() {
+			if !fi.Mode().IsRegular() || IsPartialFile(fi.Name()) {
 				return nil
 			}
 			key := dstPrefix + base + "/" + rel

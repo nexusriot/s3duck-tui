@@ -91,6 +91,11 @@ func WalkLocalTree(root string) (entries []SyncEntry, opaque []string, err error
 		if fi.IsDir() || !fi.Mode().IsRegular() {
 			return nil
 		}
+		// A partial download is not a file to mirror: an upload sync would
+		// send it, a download sync would plan deleting what a resume needs.
+		if IsPartialFile(fi.Name()) {
+			return nil
+		}
 		entries = append(entries, SyncEntry{
 			Rel:  rel,
 			Size: fi.Size(),
@@ -200,7 +205,7 @@ func (m *Model) UploadFile(ctx context.Context, localPath, key string, bucket *O
 		Body:   reader,
 	}
 	m.writeOpts().applyPut(in, localPath)
-	_, err = uploader.Upload(ctx, in)
+	err = uploadObject(ctx, m.Client, uploader, in)
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
 			return fmt.Errorf("upload canceled for %s", localPath)

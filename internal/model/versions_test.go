@@ -80,8 +80,16 @@ func TestVersionFileName(t *testing.T) {
 		{"dir/archive.tar.gz", "12345678", "archive.tar.12345678.gz"},
 		{"file.txt", "null", "file.null.txt"},
 		{"file.txt", "", "file.null.txt"},
+		// The version ID is server data: separators and dots never reach
+		// the file name, so it cannot climb out of the destination.
+		{"report.txt", "/../../xyz", "report.xyz.txt"},
+		{"report.txt", `..\..\a.b`, "report.ab.txt"},
+		{"report.txt", "./..", "report.null.txt"},
 	}
 	for _, c := range cases {
+		if got := VersionFileName(c.key, c.version); strings.ContainsAny(got, `/\`) || strings.Contains(got, "..") {
+			t.Errorf("VersionFileName(%q, %q) = %q, which can leave the directory", c.key, c.version, got)
+		}
 		if got := VersionFileName(c.key, c.version); got != c.want {
 			t.Errorf("VersionFileName(%q, %q) = %q, want %q", c.key, c.version, got, c.want)
 		}

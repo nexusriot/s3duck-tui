@@ -452,3 +452,35 @@ func TestIntegrationMultipartCopyWithChecksum(t *testing.T) {
 		t.Fatalf("single-request copy with a checksum algorithm: %v", err)
 	}
 }
+
+// A copy handed a stale size — from a listing taken before the object was
+// rewritten larger — must still copy the whole object. The ranges used to be
+// planned from that size, and the completed copy (and the move that deleted
+// its source) silently kept only the prefix.
+func TestIntegrationMultipartCopyWithAStaleSize(t *testing.T) {
+	m := testModel(t)
+	ctx := context.Background()
+	bucket := freshBucket(t, m, "s3duck-it-mpstale")
+
+	threshold, part := model.MultipartCopyThreshold, model.MultipartCopyPartSize
+	t.Cleanup(func() {
+		model.MultipartCopyThreshold, model.MultipartCopyPartSize = threshold, part
+	})
+	model.MultipartCopyThreshold = 5 << 20
+	model.MultipartCopyPartSize = 5 << 20
+
+	const listed, actual = 6 << 20, 12 << 20
+	body := strings.Repeat("0123456789abcdef", actual/16)
+	putObject(t, m, bucket, "grew.bin", body)
+	if err := m.CopyObjectSized(ctx, bucket, bucket, "grew.bin", "copy.bin", listed); err != nil {
+		t.Fatalf("copy: %v", err)
+	}
+	got, err := m.HeadObject(ctx, bucket, "copy.bin")
+	if err != nil || got.Size != actual {
+		t.Fatalf("copy is %d bytes (%v), want the whole %d", got.Size, err, actual)
+	}
+	content, err := m.GetObjectContent(ctx, bucket, "copy.bin", actual+1)
+	if err != nil || string(content.Data) != body {
+		t.Errorf("copied content differs (%v)", err)
+	}
+}

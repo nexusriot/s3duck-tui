@@ -74,10 +74,12 @@ func (c *Controller) EditProfileOptions() {
 // optionsFromConfig projects a stored profile into the form's value.
 func optionsFromConfig(p *cfg.Config) widgets.ProfileOptions {
 	return widgets.ProfileOptions{
-		AWSProfile:  p.AWSProfile,
-		ReadOnly:    p.ReadOnly,
-		Trash:       p.Trash,
-		TrashPrefix: p.TrashPrefix,
+		AWSProfile:    p.AWSProfile,
+		Anonymous:     p.Anonymous,
+		PublicBuckets: strings.Join(p.PublicBuckets, ", "),
+		ReadOnly:      p.ReadOnly,
+		Trash:         p.Trash,
+		TrashPrefix:   p.TrashPrefix,
 		// Stored inverted (NoMimeDetect) so that an existing config file,
 		// which has no such key, gets detection *on* — the behaviour being
 		// fixed rather than the one being preserved.
@@ -154,16 +156,18 @@ func readProfileOptions(form *tview.Form, sseChoices, checksumChoices []string) 
 	}
 
 	opts := widgets.ProfileOptions{
-		AWSProfile:  text(widgets.FieldOptAWSProfile),
-		ReadOnly:    checked(widgets.FieldOptReadOnly),
-		Trash:       checked(widgets.FieldOptTrash),
-		TrashPrefix: text(widgets.FieldOptTrashPfx),
-		DetectMime:  checked(widgets.FieldOptMime),
-		SSE:         choice(widgets.FieldOptSSE, sseChoices),
-		KMSKey:      text(widgets.FieldOptKMSKey),
-		Checksum:    choice(widgets.FieldOptChecksum, checksumChoices),
-		Verify:      checked(widgets.FieldOptVerify),
-		Workers:     text(widgets.FieldOptWorkers),
+		AWSProfile:    text(widgets.FieldOptAWSProfile),
+		Anonymous:     checked(widgets.FieldOptAnonymous),
+		PublicBuckets: text(widgets.FieldOptPublic),
+		ReadOnly:      checked(widgets.FieldOptReadOnly),
+		Trash:         checked(widgets.FieldOptTrash),
+		TrashPrefix:   text(widgets.FieldOptTrashPfx),
+		DetectMime:    checked(widgets.FieldOptMime),
+		SSE:           choice(widgets.FieldOptSSE, sseChoices),
+		KMSKey:        text(widgets.FieldOptKMSKey),
+		Checksum:      choice(widgets.FieldOptChecksum, checksumChoices),
+		Verify:        checked(widgets.FieldOptVerify),
+		Workers:       text(widgets.FieldOptWorkers),
 	}
 	return opts, validateProfileOptions(opts)
 }
@@ -171,6 +175,14 @@ func readProfileOptions(form *tview.Form, sseChoices, checksumChoices []string) 
 // validateProfileOptions catches the combinations that would fail later, at a
 // point where the message can still name the field.
 func validateProfileOptions(o widgets.ProfileOptions) error {
+	if o.Anonymous && o.AWSProfile != "" {
+		return fmt.Errorf("a profile is either anonymous or delegates to an AWS profile, not both")
+	}
+	for _, b := range parsePublicBuckets(o.PublicBuckets) {
+		if strings.ContainsAny(b, " /\t") {
+			return fmt.Errorf("%q is not a bucket name (separate public buckets with commas)", b)
+		}
+	}
 	if o.KMSKey != "" && o.SSE != "aws:kms" {
 		return fmt.Errorf("an SSE-KMS key id only applies when encryption is aws:kms")
 	}
@@ -196,6 +208,8 @@ func validateProfileOptions(o widgets.ProfileOptions) error {
 // applyOptionsToConfig writes the form's value back into the stored profile.
 func applyOptionsToConfig(p *cfg.Config, o widgets.ProfileOptions) {
 	p.AWSProfile = o.AWSProfile
+	p.Anonymous = o.Anonymous
+	p.PublicBuckets = parsePublicBuckets(o.PublicBuckets)
 	p.ReadOnly = o.ReadOnly
 	p.Trash = o.Trash
 	p.TrashPrefix = o.TrashPrefix
@@ -207,6 +221,22 @@ func applyOptionsToConfig(p *cfg.Config, o widgets.ProfileOptions) {
 	// Validated before this is reached; a value that still fails to parse
 	// falls back to the default rather than storing nonsense.
 	p.TransferWorkers, _ = parseWorkers(o.Workers)
+}
+
+// parsePublicBuckets splits the typed list: commas or whitespace separate,
+// blanks and repeats are dropped, order is kept.
+func parsePublicBuckets(s string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, f := range strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == ';' || r == '\n' }) {
+		f = strings.TrimSpace(f)
+		if f == "" || seen[f] {
+			continue
+		}
+		seen[f] = true
+		out = append(out, f)
+	}
+	return out
 }
 
 // optionsSummary is the one-line description used in the details pane and the

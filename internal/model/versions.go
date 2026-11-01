@@ -228,7 +228,17 @@ func VersionFileName(key, versionID string) string {
 	ext := path.Ext(base)
 	stem := strings.TrimSuffix(base, ext)
 
-	short := versionID
+	// The version ID comes from the server, and goes into a file name: only
+	// characters that are safe there are kept. A hostile or broken endpoint
+	// answering "/../../x" used to put the file one level above the
+	// destination (report./../../x.txt).
+	short := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			return r
+		}
+		return -1
+	}, versionID)
 	if len(short) > 8 {
 		short = short[:8]
 	}

@@ -140,20 +140,33 @@ func (m *Model) runCopy(ctx context.Context, sp copySpec) error {
 		return m.copySingle(ctx, sp, head)
 	}
 
+	// The multipart path plans byte ranges, so it must plan them from the
+	// object as it is now. A caller's size comes from a listing, a sync plan
+	// or the metadata editor's HEAD — any of which can be hours old — and
+	// ranges planned from a stale size complete "successfully" with the tail
+	// missing: a move then deleted the whole source, and a metadata save
+	// truncated the object in place. So this path always reads the source
+	// itself and plans from that size.
+	if head == nil {
+		h, err := m.headForCopy(ctx, sp)
+		if err != nil {
+			return fmt.Errorf("reading %s: %w", sp.srcKey, err)
+		}
+		head = &h
+	}
+	if head.Size <= MultipartCopyThreshold {
+		// It shrank below the limit since it was listed.
+		return m.copySingle(ctx, sp, head)
+	}
+
 	// The multipart path builds a brand-new object, so whatever the single
-	// path would have inherited has to be fetched and re-applied.
+	// path would have inherited has to be re-applied: the caller's attributes
+	// when it is rewriting them, the source's otherwise.
 	attrs := sp.meta
 	if attrs == nil {
-		if head == nil {
-			h, err := m.headForCopy(ctx, sp)
-			if err != nil {
-				return fmt.Errorf("reading %s: %w", sp.srcKey, err)
-			}
-			head = &h
-		}
 		attrs = head
 	}
-	return m.copyMultipart(ctx, sp, size, *attrs)
+	return m.copyMultipart(ctx, sp, head.Size, head.ETag, *attrs)
 }
 
 // headForCopy reads the source's attributes, honoring the source version.
@@ -264,7 +277,11 @@ func (sp copySpec) destinationClass() string {
 // part-copying byte ranges server-side. attrs supplies the destination's
 // attributes, which CreateMultipartUpload needs up front — after the parts are
 // in flight there is no way to add them.
-func (m *Model) copyMultipart(ctx context.Context, sp copySpec, size int64, attrs ObjectMeta) error {
+//
+// srcETag is the ETag the ranges were planned from. Every part-copy is
+// conditional on it, so a source replaced while its parts are in flight fails
+// the copy instead of assembling an object out of two versions.
+func (m *Model) copyMultipart(ctx context.Context, sp copySpec, size int64, srcETag string, attrs ObjectMeta) error {
 	parts := planCopyParts(size)
 	if len(parts) == 0 {
 		return fmt.Errorf("nothing to copy: %s is %d bytes", sp.srcKey, size)
@@ -333,7 +350,7 @@ func (m *Model) copyMultipart(ctx context.Context, sp copySpec, size int64, attr
 	}
 	uploadID := aws.ToString(started.UploadId)
 
-	done, err := m.copyParts(ctx, sp, parts, uploadID)
+	done, err := m.copyParts(ctx, sp, parts, uploadID, srcETag)
 	if err != nil {
 		m.abortMultipart(ctx, sp, uploadID)
 		return err
@@ -370,7 +387,7 @@ func (m *Model) abortMultipart(ctx context.Context, sp copySpec, uploadID string
 
 // copyParts runs the part-copies through a bounded worker pool and returns
 // them ordered by part number, as CompleteMultipartUpload requires.
-func (m *Model) copyParts(ctx context.Context, sp copySpec, parts []copyPart, uploadID string) ([]s3t.CompletedPart, error) {
+func (m *Model) copyParts(ctx context.Context, sp copySpec, parts []copyPart, uploadID, srcETag string) ([]s3t.CompletedPart, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -393,14 +410,18 @@ func (m *Model) copyParts(ctx context.Context, sp copySpec, parts []copyPart, up
 				defer wg.Done()
 				defer func() { <-sem }()
 
-				out, err := m.Client.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
+				in := &s3.UploadPartCopyInput{
 					Bucket:          aws.String(sp.dstBucket),
 					Key:             aws.String(sp.dstKey),
 					UploadId:        aws.String(uploadID),
 					PartNumber:      p.Number,
 					CopySource:      aws.String(source),
 					CopySourceRange: aws.String(fmt.Sprintf("bytes=%d-%d", p.Start, p.End)),
-				})
+				}
+				if srcETag != "" {
+					in.CopySourceIfMatch = aws.String(`"` + srcETag + `"`) // HEAD trimmed the quotes
+				}
+				out, err := m.Client.UploadPartCopy(ctx, in)
 
 				mu.Lock()
 				defer mu.Unlock()

@@ -85,6 +85,30 @@ last pair is what found the escaping bug below, and it found it through the
 harness itself: the cursor is located through the details panel's `FullPath`
 line, so a key the panel was swallowing could not be reached at all.
 
+`e2e/quickwins_test.go` does the same for the 0.12.0 round, and ends each
+scenario at the far side of the feature rather than at the screen: a `PUT`
+and a `GET` with no credentials through the links the app made, the bucket's
+versioning status read back, the options form's result read back from
+`config.json`, and the notification as the bytes the app wrote — a stand-in
+`notify-send` recording its argv, and `tmux pipe-pane -O` capturing the raw
+OSC 777 passthrough before tmux interprets it. Its `startTUIWith` passes the
+binary extra environment (an empty `DISPLAY`, so a run on a desktop host never
+touches the real clipboard and the app shows what it would have copied) and
+command-line arguments.
+
+Below the terminal, the same round's wire behaviour is unit-tested against an
+`httptest` server standing in for S3 (`internal/model/anonymous_test.go`):
+what was sent — method, query, `Authorization`, body — is recorded and
+asserted, which is the only way to tell an unsigned request from a server that
+ignores signatures.
+
+Coverage across all three suites is measured with a `-cover` build of the
+binary and one `GOCOVERDIR` (the commands are in the README's *Testing*). A
+coverage build flushes its counters only on a normal exit, so with `GOCOVERDIR`
+set the harness's cleanup closes overlays and presses `Ctrl+Q` before killing
+the tmux server; without it, the counters of every scenario that did not end in
+`quit()` were silently lost.
+
 `make e2e` runs it hermetically (`e2e/run.sh`): MinIO on a tmpfs and a runner image (Go pinned by digest, tmux, the module cache) on a private compose network with no published ports, the tree mounted read-only; containers, network and volumes are removed afterwards pass or fail, and the runner image is kept as a build cache. Run from the host against an endpoint you already have, it needs Go and tmux; without `S3DUCK_TEST_ENDPOINT` it skips.
 
 Because the tags hide them from `go build ./...`, CI runs `go vet -tags integration ./...` and `go vet -tags e2e ./...` in the fast job as well, so neither suite can silently stop compiling between the slower runs.
@@ -186,6 +210,26 @@ Phase 1 runs **outside** the transfer gate. It is user-interaction time, not ban
 
 An Overwrite decision only sets a flag on the item — **nothing is deleted at prompt time**. The transfer downloads into a temp file beside the target, `<name>.<random>.s3duck-part` (`os.CreateTemp`, then mode 0644; the name part is cut to 120 bytes, since the suffix pushed any valid name past about 232 bytes over the filesystem's 255-byte limit and such objects could not be downloaded at all), and renames it onto the target only after the body is fully on disk. The name is unique per transfer because two keys can land on one local path (`a//b` and `a/b`, or two names differing only in case on a case-insensitive filesystem); with one fixed temp name per target, two workers wrote into the same file and the interleaving was reported as a success. Renaming last means a cancel while the job is still queued (or a failed transfer) leaves every existing file intact; the ledger counts an overwrite on completion, when the file was actually replaced. (Phase 1 used to `os.Remove` at decision time: an "Overwrite All" over 200 files followed by a cancel deleted all 200 and downloaded none.)
 
+**Resume** (`internal/model/resume.go`). From `ResumeMinSize` (8 MiB) up, the
+temp file is not random but `partialPaths(target, bucket, key)` — a hidden
+sibling named by a hash of bucket and key — with a sidecar recording bucket,
+key, ETag, size and `Have`, the bytes from the start that are on disk. The
+download is parallel, so its writes land out of order; `coverage` records each
+write and `prefix` gives the contiguous run from the start, which is all a
+cancel or a failure keeps (the partial is truncated to it, so nothing past it
+is ever read back). The next download of that object finds the sidecar, checks
+it names this version and size, and fetches `bytes=Have-` into the partial at
+offset `Have` (`offsetWriterAt`). Every request of such a download carries
+`If-Match` with the ETag: a resumed tail can never come from another version,
+and a fresh download of an object replaced half-way fails (412,
+`ErrObjectChanged`) instead of being assembled from two; a kept partial whose
+version is gone is discarded and the download restarts once. A cancel that
+lands after the last range is written is a finished download, not a partial
+— the integration suite found that, cancelling a 20 MiB transfer on a local
+server that had already delivered every range. Partials are left out of
+`WalkDir`, `WalkLocalTree`, `LocalTargets`, the walk-based upload and the
+upload browser, so a sync never uploads one nor plans deleting it.
+
 **Phase 2 — `transfer`: parallel download (semaphore pool)**
 
 ```
@@ -280,7 +324,37 @@ Addressing rather than mirroring is what retired the navigation race — but onl
 - `Profiles` and `Duck` call `resetPanes` to collapse to a clean single pane, so panes never leak across profiles. `resetPanes` also moves focus to pane 0's list: collapsing from the right pane left focus on a list no longer in the layout, and tview then delivers no key at all — overlays included — so only the app-level Ctrl+Q still worked. For the same reason `shell.PushFocus` always focuses the overlay it pushes rather than relying on `Pages` to hand focus on.
 - A pane's rows belong to the location they were listed at. Moving a pane drops its object map (`session.Pane` clears it on any change of location), a listing that lands after the pane moved on is refused (`SetListing`), and a failed listing still re-renders, so the screen shows the location the pane is really at — empty — instead of the previous one's rows still resolving against the new bucket.
 - The copy/move and sync dialogs arrive after a bucket-list round trip; each captures the client before it and drops its form if the profile was switched meanwhile (`c.model != mdl`), so neither can run one profile's bucket and key names through another's client.
-- **Caveat:** both panes share one `model`/client, so region is per-client. Two panes in different-region AWS buckets would fight over the client region — the same cross-region limitation already documented below. Same-endpoint (MinIO/Ceph, same-region AWS) is unaffected.
+- **Caveat:** two panes on the same profile share one `model`/client, so region is per-client. Two panes in different-region AWS buckets would fight over the client region — the same cross-region limitation already documented below. Same-endpoint (MinIO/Ceph, same-region AWS) is unaffected, and panes on different profiles have a client each.
+
+### Panes on different profiles (`internal/controller/otherprofile.go`)
+
+Each pane carries a `session.Conn` — the client and the profile it was built
+from. `c.model` and `c.activeConfig` are kept as the *active* pane's
+(`useConnOf`, run by every `swapPane`), so the 80-odd places that read them —
+every action, and with them the read-only and safe-delete guards, bookmarks
+and the header — follow the pane the user is looking at with no change. What
+had to change is the work that outlives a Tab: a goroutine that captured its
+pane now reads the client from that pane (`clientFor`) rather than from
+`c.model`, which by then may be the other account's — `makeObjectMap`,
+`findBucketByName` and the region refreshes in `Down`, `jumpWith` and
+`navigateTo`; the flows that read `c.model` from a goroutine (create, summary,
+presign, the searches, multipart abort) capture it on entry.
+
+`SetConn` relocates a pane whose client changes: a bucket name means another
+bucket on another account, so a location carried over would be read through
+the wrong client. `connFor` reuses a pane's client when the same profile is
+opened in both, so a copy between them stays server-side; `SameAccount`
+compares clients, and only panes on different clients take the streamed path.
+
+Between accounts, Ctrl+Y / Ctrl+T run the cross-profile copy
+(`runCrossCopy`, now with a move mode): each object streamed GET-here,
+PUT-there, and for a move the source key deleted only after its copy has
+landed, the moved folders' markers only when the whole run succeeded. There
+is no undo for it. The clipboard records the client it was filled through and
+`pasteRefusal` refuses a paste through another; `=` gives the comparison a
+`dstModel`, so each side is listed by its own account. `rememberLocation`
+records each pane on its own profile — the active pane last, so it wins when
+both are on one — and `persistProfiles` saves every profile a pane is on.
 
 ## Bandwidth throttle
 
@@ -533,6 +607,68 @@ Both forms are read back with `GetFormItemByLabel` and the exported `widgets.Fie
 
 `RestoreVersion` copies the chosen version to the top of the history rather than rewinding, which is the only non-destructive way to go back in a versioned bucket; the integration suite confirms the history grows from 3 entries to 4. `DeleteVersion` is the one genuinely destructive action here — it removes the data outright and leaves no delete marker — so it is behind an explicit confirmation that says so. Downloads are saved as `name.<8-char-version>.ext` so several versions can coexist in one directory. `D` diffs the selected version against the current one (`GetVersionContent` for both bodies, then `unifiedDiff`); a delete marker has no body and is refused rather than diffed.
 
+### Purge, deleted objects and bulk edits (`internal/model/purge.go`, `internal/controller/purge.go`, `deleted.go`, `bulk.go`)
+
+On a versioned bucket an ordinary delete removes nothing: it writes a delete
+marker on top of the history. So a folder delete freed no storage, and a
+bucket could never be emptied — `EmptyBucket` deleted the current objects,
+the history survived, and `DeleteBucket` failed with BucketNotEmpty however
+often it was asked. The only final removal S3 has is a delete *by version ID*.
+
+- `ListVersionsUnder` streams every version and marker under a prefix (no
+  delimiter). A truncated page whose markers do not advance is an error, not
+  the end: a purge planned from a listing cut short would report success and
+  leave versions behind.
+- `SelectPurge` is pure. `PurgeAll` takes everything; `PurgeNoncurrent` keeps
+  each key's latest entry — even when that is a marker, so a deleted key stays
+  deleted rather than being resurrected by its history disappearing under it.
+  For a file it narrows to the exact key, since the listing is prefix-based
+  (`x` must not take `x.bak`).
+- `DeleteVersions` always sends a version ID — `"null"` included, the ID of an
+  object written while versioning was off — because a `DeleteObjects` entry
+  without one writes a marker instead. It keeps going past per-version
+  refusals (a legal hold, say) and returns them.
+- `ops.Purge` runs the planned list through the shared runner in chunks of
+  250, so the user gets the same confirmation, progress, Background/Cancel and
+  *Retry failed* (exactly the refused versions) as any transfer. The planning
+  happens first, because the confirmation is the only place the user sees
+  what goes — counts, bytes, markers — and that it is final whatever the
+  profile's safe-delete setting.
+- `EmptyBucket` is the same purge over the whole bucket, so deleting a bucket
+  now works whether or not it was ever versioned (an unversioned object is
+  its one `null` version). An endpoint with no `ListObjectVersions` falls back
+  to the old current-objects delete. The bucket's delete confirmation says the
+  history goes too.
+
+**Deleted objects** (`, D`) are keys whose latest entry is a marker.
+`FindDeleted` finds them in one pass of the version listing — a listing
+returns each key's entries together — and keeps the newest real version's
+size, which is what undelete brings back. They are a view of their own rather
+than rows in the browser: nothing there exists as an object, and every browser
+action pointed at one (download, copy, preview) could only fail. Undelete
+removes the marker and nothing else, so it is as reversible as the delete was.
+`openVersions` takes a key rather than a listed row for the same reason — the
+version browser now opens on a deleted key.
+
+**Bulk edits.** `m` and `c` with several items marked, or a folder in the
+selection, resolve it to object keys (folders expanded, folder markers and the
+trash left out) and apply one change per key through `ops.Batch`: an `Apply`
+per key, `ops.Unchanged` counted as skipped, failures retried exactly. The
+metadata form cannot show values to overwrite — the objects differ — so every
+field says what to change and blank means "keep each object's own";
+`bulkMetaEdit.applyMeta` / `applyTags` merge into each object's set, metadata
+keys are lower-cased as S3 stores them (or every pass reads as a change), and
+merged tags past S3's 10 are refused before anything is sent. A tags-only
+edit makes no metadata rewrite, which would be a full copy of every object.
+`v` with several marked is the purge.
+
+**Buckets by name.** A key scoped to some buckets is often refused
+`ListBuckets`. `findBucketByName` then takes a named bucket at its word, as
+for an anonymous profile — the first request inside says whether it is
+readable — and the bucket screen lists `knownBuckets` (the last location,
+bookmarks, public buckets) marked partial, or, with none, says how to open one
+by name.
+
 ## Duplicate finder
 
 `D` lists the current prefix recursively and groups objects by **(size, ETag)** — the strongest content signal S3 offers without downloading. For single-part uploads the ETag is the body's MD5, so a match means identical content; multipart ETags depend on the part split, so identical files uploaded differently won't group — a missed duplicate, never a false positive (and size is the second factor guarding against multipart-ETag collisions). The help line discloses this. `ObjectChecksum` (see *Integrity*) was expected to close that blind spot, and it does so only partly: a multipart object's stored checksum is a checksum-of-parts, as dependent on the split as its ETag, so a deep scan over stored checksums would only help where both copies carry a whole-object checksum of the same algorithm (SSE-KMS objects written in one request, say, whose ETags differ although their content does not). Closing it fully means hashing content, which is a download per candidate. ETag quotes are normalized because some backends omit them.
@@ -591,7 +727,7 @@ Using `FullPath` avoids collisions between a file `"x"` and a folder `"x/"` at t
 
 ## Configuration
 
-Profiles are stored in `~/.config/s3duck-tui/config.json` (mode `0600`), created on first run. Each profile is a `Config` struct serialised as JSON:
+Profiles are stored in `~/.config/s3duck-tui/config.json` (mode `0600`), created on first run, or in the file `--config` names — which must exist: a missing default is created, a missing `--config` is a typo and is refused before the TUI starts. Each profile is a `Config` struct serialised as JSON:
 
 ```json
 {
@@ -607,6 +743,8 @@ Profiles are stored in `~/.config/s3duck-tui/config.json` (mode `0600`), created
   "bookmarks":    [{"name": "photos/2024/", "bucket": "photos", "prefix": "2024/"}],
 
   "aws_profile":      "sso-dev",
+  "anonymous":        false,
+  "public_buckets":   ["noaa-ghcn-pds"],
   "read_only":        false,
   "no_mime_detect":   false,
   "sse":              "",
@@ -941,6 +1079,112 @@ user cancelled themselves), through `Screen.Beep()`, captured in the view's
 before-draw hook, because this tview version exposes no screen getter and a
 raw write would land inside the rendered frame. A modal would have been wrong:
 it would steal focus from whatever the user moved on to.
+
+## Desktop notifications (`internal/controller/desktopnotify.go`)
+
+The bell reaches someone watching this terminal; a backgrounded transfer is
+exactly the case where they are not. The queue's announcement callback now
+receives the finished `jobs.View`, so the same moment that rings the bell —
+and a Glacier restore becoming readable — also posts a notification saying
+which job and how it ended.
+
+Two delivery paths, neither of which works everywhere. A **command**
+(`notify-send`, `osascript`) is reliable on a desktop and useless over SSH,
+where there is no display. An **escape sequence** (OSC 9, OSC 777) is turned
+into a notification by the terminal itself, so it travels over SSH, but a
+terminal that does not speak it may print it. `auto` therefore takes the
+command only when its program is installed and (off macOS) `DISPLAY` or
+`WAYLAND_DISPLAY` is set, and otherwise posts nothing; the escapes are opt-in
+through `--notify` / `S3DUCK_NOTIFY`. `resolveNotifyMode` is pure, with the
+platform, environment and `LookPath` injected.
+
+Three details carry the weight:
+
+- **Text is sanitised.** A notification names a job, and a job names object
+  keys, which are arbitrary UTF-8. `cleanNotifyText` turns every C0/C1
+  control into a space before the text is placed in an escape sequence or an
+  argument, so a key holding `BEL` or `ESC` cannot end the OSC early and write
+  raw escapes to the terminal. OSC 777's `;` field separator is replaced in
+  the title; osascript gets an AppleScript string literal with its quotes and
+  backslashes escaped; `notify-send` gets argv, never a shell.
+- **Escapes are written between frames.** `View.WriteTerminal` writes through
+  tcell's `Tty()`, from `shell.Do` — the UI goroutine, which is also where
+  frames are drawn — so the sequence cannot land in the middle of one. Inside
+  tmux it is wrapped in a DCS passthrough (`allow-passthrough on`, tmux 3.3+).
+- **The command is detached from the terminal.** Its stdin, stdout and stderr
+  are nil and it has a 5-second deadline; anything it printed would be written
+  straight over the TUI. The first failure is logged once, not per job.
+
+## Command line, go-to and `s3://` URIs (`internal/cli`, `internal/controller/location.go`)
+
+`internal/cli` parses the arguments with its own loop rather than the `flag`
+package, which stops at the first positional — `s3duck-tui s3://b --profile x`
+would have dropped the profile without a word. Command-line mistakes are a
+`usageError` (`errors.Is(err, cli.ErrUsage)`), whose text is the message
+alone. `main` validates the launch against the loaded profiles
+(`ValidateLaunch` → `resolveLaunchProfile`) *before* `Run`, so a mistyped
+profile is one line on stderr with status 2, not a modal over a screen nobody
+asked for. A location needs `--profile` unless exactly one profile exists:
+guessing among several would browse the wrong account.
+
+The launch location is handed to `Duck` once (`takePendingLocation`) in place
+of the remembered one, and both it and go-to (`g`) end in `openLocation`. An
+s3:// key is ambiguous — `logs` may be an object or the folder `logs/` — so
+`openLocation` probes `HasPrefix(key + "/")` (one `ListObjectsV2` with
+`MaxKeys=1`). The probe runs inside `jumpWith`, the generalisation of `jumpTo`
+that decides the destination *after* the bucket is resolved and the client
+re-pinned to its region; probing first would send the request to the wrong
+region on AWS. A failed probe means "object": its folder is listed either way.
+`locationTarget` and `resolveGoto` (absolute URI, `/` from the bucket root,
+relative with `..`, cleaned with `path.Clean` — so odd keys with empty or dot
+segments must be typed as a URI, which is never rewritten) are pure.
+
+URIs are written as the AWS CLI writes them: raw keys, no percent-encoding
+(`cli.FormatS3URI`), a bucket root with its slash.
+
+## Anonymous profiles and presigned uploads
+
+**Anonymous** (`Config.Anonymous`) switches the credential provider to
+`aws.AnonymousCredentials`, the SDK's documented way to send unsigned
+requests; it also stops `LoadDefaultConfig` resolving — and failing on — a
+credential chain. Three things that assume credentials had to change:
+
+- *Bucket listing.* There is no anonymous `ListBuckets`. `Model.ListBuckets`
+  returns `public_buckets` instead (trimmed, de-duplicated, in order), or
+  `ErrNoPublicBuckets` — whose text says what to do — and `findBucketByName`
+  takes a bucket named by a location or bookmark at its word.
+- *Region.* `GetBucketLocation` needs `s3:GetBucketLocation` and is refused to
+  every anonymous caller, public bucket or not. `RefreshClient` uses the SDK's
+  `GetBucketRegion` (a `HEAD` whose `x-amz-bucket-region` header is sent
+  whatever the access decision) for an anonymous profile.
+- *Links.* Unsigned, the presigner still appends `X-Amz-Expires`, which grants
+  nothing and promises a deadline nothing enforces; an anonymous `Ctrl+W`
+  copies the object's plain URL instead. An upload link is refused
+  (`ErrAnonymousCannotSign`).
+
+`Ctrl+V` cannot authenticate an anonymous profile, so it lists one key of each
+named bucket instead (`checkPublicBuckets`). A unit test against an
+`httptest` server asserts the requests carry no `Authorization` header — and
+that the same call from a keyed profile does, so the test observes the switch
+rather than a server that drops headers.
+
+**Presigned upload links** (`, p`, `Model.PresignPutURL`) sign the bucket and
+key only (`X-Amz-SignedHeaders=host`). The profile's SSE, checksum and
+Content-Type settings are deliberately not signed: each would become a header
+the uploader has to reproduce exactly, and a link that fails with
+`SignatureDoesNotMatch` on a missing header is worse than one that writes
+with the bucket's defaults. The flow HEADs the key and says when the link
+would replace an existing object. The link is a credential, so the activity
+log records that one was made — key and lifetime — never the URL. A read-only
+profile refuses to make one: it is a write capability handed to someone else.
+
+**Versioning switch** (`v` on the bucket dashboard, `SetBucketVersioning`).
+`versioningChange` decides from the state the dashboard *read*: off or
+suspended → enable, enabled → suspend. An unreadable state (denied,
+unsupported, error) is refused rather than guessed, since suspending a bucket
+whose state was merely unknown is the harmful guess; MFA delete is refused
+because the call would need the root account's MFA token. The confirmation
+says that enabling cannot be undone, only suspended.
 
 ## Credentials, delegated (`GetConfig`)
 
@@ -1370,16 +1614,21 @@ directory (`w`), the latter for the SSH sessions where no clipboard exists.
 | **`CreateBucket` uses the last bucket's region** | `RefreshClient` overwrites the model's region on every bucket entry, and `CreateBucket` sends that region as its location constraint, so a new bucket is created where the last bucket entered lives, not in the profile's region. |
 | ~~Copies fail above 5 GiB~~ | **Fixed.** Sources over `MultipartCopyThreshold` are copied part by part with `UploadPartCopy` (see *Large copies*). |
 | **Multipart copies carry no additional checksum** | `UploadPartCopy` cannot send part checksums, so a copy over 5 GiB is created without `checksum_algo` (declaring it made every such copy fail). The copy is reported as not verifiable afterwards. |
-| **No download resume** | Interrupted downloads restart from byte 0. Transfers write to a temp file beside the target, `<name>.<random>.s3duck-part` (unique per transfer), that is removed on cancel/failure; the target file is only ever replaced by a completed download. |
+| **Resume is for large downloads only** | Objects of 8 MiB or more keep a partial (`.name.<hash>.s3duck-part` + `.s3duck-resume`) when cancelled, failed or quit, and resume from it; smaller ones restart, their temp file removed. A partial nobody resumes stays (hidden) until the same object is downloaded to the same place again. Two instances downloading one object to one place at once would share a partial; nothing locks it. Archives (`, z`) do not resume. |
 | ~~Sync compares size + mtime, not content~~ | **Fixed (optional).** The sync form's *Compare content by checksum* fills `SyncEntry.Sum` from the object's stored whole-object checksum (or its plain-MD5 ETag) and a locally computed one, and `planSync` compares those when both sides agree on the algorithm. It costs one request per remote object and a full read per local one, so it is a choice rather than the default; paths where either side cannot produce a comparable sum fall back to size+mtime. |
 | **An upload sync straight after a download sync re-uploads** | A downloaded file's local mtime is its download time, which is newer than the object's `LastModified`. Reversing the direction therefore sees "source is newer" for every file and re-sends them once (sizes are equal, so nothing is corrupted, and the second reversal is a no-op). This matches `aws s3 sync` semantics; the dry-run plan shows it before anything moves — and *Compare content by checksum* avoids it entirely. |
 | ~~Sync applies one operation at a time~~ | **Fixed.** `ops.Sync` uses a worker pool (4 wide, or the profile's `transfer_workers`) with a writes-then-deletes barrier (see *Sync* above). |
 | **Sync direction is one-way** | Each run treats one side as the source of truth. There is no bidirectional merge and no conflict resolution — the newer-wins rule only ever applies in the chosen direction. |
 | **Download sync and unusual keys** | A non-canonical key such as `a//b.txt` is planned as a create of `a//b.txt` *and* a delete of the local `a/b.txt` — the same file — so delete-extraneous removes what the run just downloaded. (Symlinked local subdirectories are no longer written through: sync leaves them out on both sides, see *Sync*.) |
 | **Static session tokens expire, silently** | A *stored* temporary credential is used as-is: when it expires, calls start failing with an auth error and s3duck neither refreshes it nor warns beforehand. The fix is not to store one — set the profile's `aws_profile` instead and the SDK re-resolves (and re-runs SSO / assume-role) on expiry. |
-| **Versioned buckets can't be emptied from the TUI** | `model.Delete` sends no `VersionId`, so folder deletes write delete markers only; `EmptyBucket` clears current objects but old versions survive, and `DeleteBucket` then fails with BucketNotEmpty. A version-aware purge is on the roadmap. |
+| **An ordinary delete on a versioned bucket frees nothing** | `d` (and a move's delete half) writes delete markers, as S3 defines it, so the history and its storage stay; the deleted keys are reachable with `, D`. To free the space, purge (`, X`). Deleting a bucket purges it. |
+| **The deleted-objects view is capped** | `, D` scans the whole subtree's versions and stops at 5 000 deleted keys; a deeper folder narrows it. |
+| **Bulk metadata edits rewrite each object** | A metadata change is a server-side copy per object (a new version on a versioned bucket, and the multipart path for anything over 5 GiB); a tags-only edit is not. |
 | **Whitespace keys** | Every secondary-text reader trims the key, so `"dir/report "` resolves to `"dir/report"` in lookups (wrong object if both exist, silent no-op if only the padded one does). |
-| **Versioning needs a versioned bucket** | On an unversioned bucket S3 reports a single `null` version; the browser shows exactly that rather than hiding the feature. Enabling versioning is a bucket-level operation s3duck does not perform. |
+| **Versioning needs a versioned bucket** | On an unversioned bucket S3 reports a single `null` version; the browser shows exactly that rather than hiding the feature. Turn versioning on from the bucket dashboard (`, b`, then `v`). |
+| **Anonymous profiles see only what they are told** | There is no anonymous bucket listing, so the bucket screen shows `public_buckets` and nothing else; any other public bucket is reached with `g`. Writes are not refused up front — S3 answers AccessDenied, except on the rare public-write bucket. |
+| **Notifications are best-effort** | `auto` posts nothing over SSH (no display); the OSC modes depend on the terminal, and inside tmux on `allow-passthrough`. A terminal that does not understand OSC 9 / 777 may show nothing or, rarely, stray characters — which is why they are opt-in. |
+| **A presigned upload link writes with the bucket's defaults** | The profile's SSE, checksum and Content-Type are not part of the link (see *Anonymous profiles and presigned uploads*), and the uploader's own `Content-Type` header, if any, is what the object gets. |
 | **Restores are checked only while their profile is open** | The tracker polls the open profile's restores (a HEAD per object per minute); another profile's wait out until it is opened, which then checks at once. The HEAD goes through the open client, which is pinned to the region of the last bucket entered, so on AWS a restore in a bucket of another region reads *check failed* until a bucket in that region is entered. |
 | **Archives are written one object at a time** | A tar or zip is a single stream, so `, z` cannot parallelise the way a download does, and an object that fails mid-transfer abandons the whole archive (one that cannot be opened is only left out). |
 | **The preview decodes gzip and zstd only** | bzip2 and xz heads are shown as a hexdump: a bzip2 block can be 900 KiB, past any window a preview should read. A zip cannot be listed from its head at all — its directory is at the end. |
@@ -1403,6 +1652,148 @@ directory (`w`), the latter for the SSH sessions where no clipboard exists.
 | **The version diff is bounded by line count** | `unifiedDiff`'s LCS table is quadratic in lines, so `maxDiffCells` (4 Mi cells, two ~2 000-line files) bounds it rather than the 1 MiB body cap, which would permit a multi-gigabyte table. A larger pair is declined with both line counts named; download the two versions and diff them locally. |
 
 ---
+
+## Export a listing (`internal/controller/listingexport.go`)
+
+`exportRow` is the one row type for the browser (`exportRowFor`), the search
+hits (`searchExportRows`) and a usage level (`usageExportRows`), so a column
+means the same in each file. `encodeRows` writes CSV through `encoding/csv` —
+a key holding commas, quotes or newlines stays one record — with RFC 3339 UTC
+times, or indented JSON with HTML escaping off. CSV cells starting with `=`,
+`+`, `-`, `@`, tab or CR get a leading `'`: a key is attacker-controlled on a
+shared bucket, and spreadsheets run such cells as formulas. JSON is verbatim.
+The file goes to the download directory through a temp file renamed into
+place, named after what was exported and when (`listingFileName`).
+
+## Fixed in the 0.14.0 round
+
+Found while building and end-to-end testing it:
+
+- **The summary's focused button was inherited from the progress modal.**
+  After pressing Cancel (the second button), Enter on the summary pressed its
+  second button, *Copy report*, instead of *Done*. The summary now focuses
+  Done (`TestSummaryFocusesDone`).
+- **A cancel after the last range was written kept the download as a
+  partial** (see *Resume* above).
+
+## Fixed in the 0.12.0 deep review
+
+Five independent reviews (the 0.12.0 diff, the S3 layer, the operation
+layer, the controller flows, and config/security). Each fix below has a test
+that fails without it.
+
+- **A large copy planned from a stale size truncated the object.** The
+  multipart path planned its byte ranges from the size its caller passed — a
+  folder listing, a sync plan, or the metadata editor's HEAD, any of which can
+  be hours old — and threw away the size its own fresh HEAD reported. An object
+  rewritten larger since it was listed was copied as its old length and the
+  copy reported success; a move then deleted the whole source, and a metadata
+  save truncated a >5 GiB object in place. `runCopy` now always HEADs on the
+  multipart path and plans from that size (falling back to a single request if
+  the object shrank below the threshold), and every `UploadPartCopy` is
+  conditional on that ETag (`CopySourceIfMatch`), so a source replaced while
+  its parts are in flight fails instead of assembling two versions. Unit
+  tests against a fake S3 and an integration test against MinIO.
+- **A cancelled upload left its parts on the server.** The SDK's own cleanup
+  aborts a failed multipart upload on the upload's context — the one a cancel
+  has just killed — so the abort never left the client and the parts stayed,
+  billed. Uploads now leave cleanup to `uploadObject`, which aborts on a
+  detached context with its own deadline (the rule the copy path already
+  followed).
+- **Quitting abandoned running transfers.** Ctrl+Q stopped the process under
+  them: no worker's cleanup ran, so downloads left `.s3duck-part` files and
+  uploads left open multipart uploads, with nothing logged. With transfers
+  active, quitting now asks, then cancels them all and waits (up to 15 s) for
+  each to clean up; an e2e scenario checks the download directory and
+  `ListMultipartUploads` after the exit. (Ctrl+C still bypasses `Stop`.)
+- **A short download was reported as a success.** The ranged downloader does
+  not check that each range arrived whole, so a short 206, or an object
+  replaced by a shorter one mid-transfer, renamed a truncated file over the
+  target. A byte count other than the listed size is now refused
+  (`ErrSizeMismatch`) and the temp file discarded.
+- **Two preview memory bombs.** A CSV whose one very wide row widened every
+  other row (62 KB → 1.6 GB rendered), and deeply nested JSON indented before
+  its size was checked (506 bytes gzipped → 5.8 GB). Past 64 columns a head is
+  not laid out as a table, the table stops at 1 MiB of output, and
+  `indentedSizeAtMost` bounds the indent in one scan before `json.Indent`
+  runs. Both old versions run out of memory under the tests.
+- **Colour tags in object names.** Error and success toasts, confirmations
+  (undo, the download overwrite question, presign expiry, profile copy and
+  delete, empty trash), the operation summary and every progress text, wait
+  modals, search and bookmark rows, the verify result, the activity log view, the usage
+  browser, diff headers, the header's status notice and the storage-class
+  column all passed keys and server text to tag-parsing widgets, so
+  `logs/[draft]/x.txt` was shown — and, in the clipboard fallbacks, copied by
+  hand — as `logs//x.txt`. A diff header with a newline in its key also forged
+  a diff line. All are escaped now.
+- **A render could land in the pane just tabbed to.** `renderList`
+  snapshotted the active pane off the UI goroutine and drew into whatever pane
+  was active when its closure ran, so a Tab in between put pane A's rows and
+  title into pane B's list — where Delete, resolving the highlighted name
+  against B, removed a same-named object from B's bucket while the screen
+  named A's. The render now belongs to the pane it read and is dropped if that
+  pane lost focus (it is re-fetched when focus returns).
+- **The duplicate finder counted trashed copies** as copies that remain, so
+  the live object could be deleted as redundant and the next Empty Trash lost
+  the content. The trash is left out of the scan, as sync leaves it out.
+- **The end-of-run summary took focus from a dialog above it**, so an Enter
+  meant for an overwrite question pressed the hidden summary's Done. It now
+  takes focus only from the top of the stack (`Shell.IsTop`).
+- **A launch location leaked into the next profile.** When the profile named
+  on the command line failed to open, its `s3://` location stayed pending and
+  was applied to whichever profile was opened next — another account.
+- **The config temp file** was a fixed `config.json.tmp`: written through an
+  existing file's mode, and through a symlink, so a planted one in a shared
+  `--config` directory received every secret key (and `config.json` became the
+  link). It is now `os.CreateTemp` (0600), fsynced before the rename.
+- **Smaller ones:** a server-supplied version ID could put a version download
+  one directory up (`report./../../x.txt`); archive entry names kept `\` and a
+  drive prefix, a zip-slip on Windows extractors; a download that landed just
+  as Cancel was pressed was not counted; relative go-to rewrote the current
+  folder's own empty segments; Ctrl+V checked public buckets without pinning
+  their region; notify-send bodies were not markup-escaped; an upload link
+  signed with temporary credentials did not say it dies with them; the
+  editor's lost-update guard let a copy read without an ETag through; and the
+  dashboard reopened after the user had closed it.
+
+Found and left open (now in ROADMAP's *Hardening*): a folder delete that
+cannot run on a safe-delete profile whose trash prefix is inside the folder,
+the delete confirmation not saying a delete inside the trash is permanent,
+tags dropped by a large copy when they cannot be read, upload memory for very large files, an
+archive's file/folder name collision, skipped counts in summaries, and
+case-insensitive download sync.
+
+## Fixed in the 0.12.0 round
+
+Both found by the new end-to-end scenarios, both older than the round:
+
+- **A launch into a location lost its cursor target.** `renderList` took the
+  pane's one-shot restore target on every render. The resize hook renders on
+  the first frame, and when a profile is opened straight into a location (the
+  new launch argument) that frame comes before the listing: the render spent
+  the target on an empty snapshot, and the real listing then put the cursor on
+  `..`. An empty snapshot now leaves the target pending — a navigation drops
+  the old rows, so empty means the listing has not landed. The same gap could
+  swallow any jump's target whose listing raced a resize.
+- **The header swallowed bracketed text.** The identity line went through
+  `Frame.AddText`, which parses colour tags, so `[ANONYMOUS]` vanished and a
+  profile named `[red]prod` would have been drawn as `prod` in red;
+  `[READ-ONLY]` only survived because `-` is not a tag character. It is
+  escaped now (`TestIdentityIsNotParsedAsTags`).
+
+- **`quit()` failed one run in three, on any binary.** tmux marks a pane dead
+  when its pty closes, before it reaps the process — and with a process that
+  exits as fast as this one, tmux 3.4 sometimes never reaps it at all, leaving
+  a zombie and a `#{pane_dead_status}` that stays empty. The harness read that
+  as "exited with status ''" or, waiting longer, "did not exit". A dead pane
+  with no status is now asked again, and a zombie's status is read from
+  `/proc/<pid>/stat` (its last field is the wait status the kernel keeps for
+  an unreaped child); 30 runs out of 30 pass where 8 of 25 failed on the
+  pre-round binary.
+
+And one in the round's own code before it shipped: `cli` wrapped its usage
+errors with `%w` and `main` unwrapped them to drop the prefix, which printed
+the bare sentinel — "usage" — instead of what was wrong (`TestRunRejectsBadArguments`).
 
 ## Fixed in the 2026-10-22 corner-case round
 

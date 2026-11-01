@@ -281,6 +281,14 @@ func (l *Layer) IsOpen() bool {
 	return l.open
 }
 
+// IsTop reports whether l is the topmost open overlay — the one keys go to.
+func (s *Shell) IsTop(l *Layer) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := len(s.stack)
+	return l != nil && n > 0 && s.stack[n-1] == l
+}
+
 // Focus gives keyboard focus to p. UI goroutine only — from elsewhere, wrap
 // it in Do. It exists so callers do not need the *tview.Application to move
 // focus within an overlay they already own.

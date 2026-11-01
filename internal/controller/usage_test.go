@@ -195,3 +195,14 @@ func TestUsageTitle(t *testing.T) {
 		t.Errorf("title = %q", got)
 	}
 }
+
+// A key segment is text: "a[red]b" was drawn as "ab" in the usage browser.
+func TestUsageRowEscapesTheName(t *testing.T) {
+	primary, secondary := usageRow(newUsageNode("a[red]b", "x/a[red]b", false), 10)
+	if !strings.Contains(primary, "a[red[]b") {
+		t.Errorf("primary = %q", primary)
+	}
+	if secondary != "x/a[red]b" {
+		t.Errorf("the lookup key must stay raw: %q", secondary)
+	}
+}

@@ -70,7 +70,7 @@ func (c *Controller) VerifyObject() {
 		c.logActivity("Verify %s: %s", key, res.String())
 		{
 			m := tview.NewModal().AddButtons([]string{"OK"})
-			m.SetText(fmt.Sprintf("%s\n\nlocal: %s\n\n%s", key, local, res.String()))
+			m.SetText(tview.Escape(fmt.Sprintf("%s\n\nlocal: %s\n\n%s", key, local, res.String())))
 			if res.Mismatch {
 				// A mismatch means the transfer completed and the bytes are
 				// wrong, which is the one outcome here that must not be

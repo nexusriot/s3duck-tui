@@ -298,6 +298,13 @@ type tui struct {
 // failed, the last screen is logged first, which is usually the whole story.
 func startTUI(t *testing.T, h *home) *tui {
 	t.Helper()
+	return startTUIWith(t, h, nil)
+}
+
+// startTUIWith is startTUI with extra environment (NAME=value) and
+// command-line arguments for the binary.
+func startTUIWith(t *testing.T, h *home, env []string, args ...string) *tui {
+	t.Helper()
 	u := &tui{t: t, sock: fmt.Sprintf("s3duck-e2e-%d-%d", os.Getpid(), rand.Int63())}
 
 	conf := filepath.Join(t.TempDir(), "tmux.conf")
@@ -311,13 +318,26 @@ func startTUI(t *testing.T, h *home) *tui {
 		t.Fatal(err)
 	}
 
-	cmd := fmt.Sprintf("HOME=%q XDG_STATE_HOME=%q exec %q", h.dir, h.stateDir(), binPath)
+	cmd := fmt.Sprintf("HOME=%q XDG_STATE_HOME=%q", h.dir, h.stateDir())
+	for _, e := range env {
+		name, value, _ := strings.Cut(e, "=")
+		cmd += fmt.Sprintf(" %s=%q", name, value)
+	}
+	cmd += fmt.Sprintf(" exec %q", binPath)
+	for _, a := range args {
+		cmd += fmt.Sprintf(" %q", a)
+	}
 	u.tmux("-f", conf, "new-session", "-d", "-s", "e2e",
 		"-x", fmt.Sprint(screenCols), "-y", fmt.Sprint(screenRows), cmd)
 
 	t.Cleanup(func() {
 		if t.Failed() {
 			t.Logf("last screen:\n%s", u.screen())
+		}
+		if os.Getenv("GOCOVERDIR") != "" {
+			// A coverage build writes its counters only on a normal exit;
+			// kill-server would drop them, so quit the way a user does first.
+			u.quitForCoverage()
 		}
 		_ = exec.Command("tmux", "-L", u.sock, "kill-server").Run()
 	})
@@ -445,10 +465,23 @@ func (u *tui) highlight(fullPath string) {
 func (u *tui) quit() {
 	u.t.Helper()
 	u.press("C-q")
+	u.waitForExit()
+}
+
+// waitForExit waits for the process to exit, and fails unless it exited 0.
+func (u *tui) waitForExit() {
+	u.t.Helper()
 	deadline := time.Now().Add(waitTimeout)
 	for {
-		state := strings.TrimSpace(u.tmux("display-message", "-p", "-t", "e2e", "#{pane_dead} #{pane_dead_status}"))
-		if strings.HasPrefix(state, "1") {
+		state := strings.TrimSpace(u.tmux("display-message", "-p", "-t", "e2e", "#{pane_dead} #{pane_dead_status}#{?pane_dead_signal, signal #{pane_dead_signal},}"))
+		// tmux marks the pane dead when the pty closes, before it has reaped
+		// the process — and sometimes it never does, leaving a zombie and a
+		// status that never arrives. The kernel keeps a zombie's exit code,
+		// so read it from there.
+		if state == "1" {
+			state = u.zombieState()
+		}
+		if strings.HasPrefix(state, "1") && state != "1" {
 			if state != "1 0" {
 				u.t.Fatalf("s3duck-tui exited with %q", state)
 			}
@@ -458,6 +491,50 @@ func (u *tui) quit() {
 			u.t.Fatalf("s3duck-tui did not exit after Ctrl+Q")
 		}
 		time.Sleep(80 * time.Millisecond)
+	}
+}
+
+// zombieState reports a dead pane whose process tmux has not reaped as "1 N",
+// N being the exit status from /proc/<pid>/stat (field 52, the wait status;
+// Linux 3.5+). It returns "1" while the status cannot be read yet.
+func (u *tui) zombieState() string {
+	pid := strings.TrimSpace(u.tmux("display-message", "-p", "-t", "e2e", "#{pane_pid}"))
+	data, err := os.ReadFile("/proc/" + pid + "/stat")
+	if err != nil {
+		return "1"
+	}
+	// The command name (field 2) may hold spaces; fields restart after ")".
+	fields := strings.Fields(string(data[strings.LastIndexByte(string(data), ')')+1:]))
+	if len(fields) < 50 || fields[0] != "Z" {
+		return "1"
+	}
+	var ws int
+	if _, err := fmt.Sscan(fields[len(fields)-1], &ws); err != nil {
+		return "1"
+	}
+	if ws&0x7f != 0 {
+		return fmt.Sprintf("1 signal %d", ws&0x7f)
+	}
+	return fmt.Sprintf("1 %d", ws>>8)
+}
+
+// quitForCoverage closes any overlay and presses Ctrl+Q, then waits a little
+// for the pane to die. Best effort: a test may have left the app anywhere.
+func (u *tui) quitForCoverage() {
+	tm := func(args ...string) string {
+		out, _ := exec.Command("tmux", append([]string{"-L", u.sock}, args...)...).CombinedOutput()
+		return string(out)
+	}
+	for i := 0; i < 3; i++ {
+		tm("send-keys", "-t", "e2e", "Escape")
+	}
+	tm("send-keys", "-t", "e2e", "C-q")
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if strings.HasPrefix(strings.TrimSpace(tm("display-message", "-p", "-t", "e2e", "#{pane_dead}")), "1") {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

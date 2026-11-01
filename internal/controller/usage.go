@@ -164,7 +164,7 @@ func usageRow(n *usageNode, parentBytes int64) (primary, secondary string) {
 		pct,
 		countCell(n.objects),
 		icon,
-		name)
+		tview.Escape(name)) // a key segment is text; "a[red]b" drew as "ab"
 	return primary, n.fullPath
 }
 
@@ -279,7 +279,7 @@ func (c *Controller) presentUsage(bucket *model.Object, root *usageNode, stack [
 
 	footer := tview.NewTextView().SetDynamicColors(true)
 	footer.SetText(fmt.Sprintf(
-		"[gray]%s\n[white]Enter[gray] open · [white]g[gray] go to in browser · [white]Bksp/←[gray] up · [white]Esc[gray] close",
+		"[gray]%s\n[white]Enter[gray] open · [white]g[gray] go to in browser · [white]x[gray] export this level · [white]Bksp/←[gray] up · [white]Esc[gray] close",
 		classBreakdown(node)))
 
 	layout := tview.NewFlex().SetDirection(tview.FlexRow).
@@ -327,6 +327,10 @@ func (c *Controller) presentUsage(bucket *model.Object, root *usageNode, stack [
 			open()
 			return nil
 		case tcell.KeyRune:
+			if ev.Rune() == 'x' {
+				c.askExport("usage "+*bucket.Key+"/"+node.fullPath, usageExportRows(*bucket.Key, children))
+				return nil
+			}
 			if ev.Rune() == 'g' {
 				// Hand the location to the ordinary browser: the usage view
 				// answers "where are the bytes", and every action that
@@ -352,4 +356,19 @@ func (c *Controller) presentUsage(bucket *model.Object, root *usageNode, stack [
 	lay = c.pushModalClamped(layout, 110, 30)
 	prev.Close()
 	c.view.App.SetFocus(list)
+}
+
+// usageExportRows exports one usage level: each child's path, its total size
+// and how many objects make it up.
+func usageExportRows(bucket string, children []*usageNode) []exportRow {
+	rows := make([]exportRow, 0, len(children))
+	for _, n := range children {
+		size, objects := n.bytes, n.objects
+		typ := "object"
+		if n.isDir {
+			typ = "folder"
+		}
+		rows = append(rows, exportRow{Bucket: bucket, Key: n.fullPath, Type: typ, Size: &size, Objects: &objects})
+	}
+	return rows
 }

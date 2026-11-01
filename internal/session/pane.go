@@ -18,8 +18,19 @@ package session
 import (
 	"sync"
 
+	cfg "github.com/nexusriot/s3duck-tui/internal/config"
 	"github.com/nexusriot/s3duck-tui/internal/model"
 )
+
+// Conn is what a pane talks to: the client and the profile it was built from.
+// The two panes may hold different ones — one profile per side, the
+// Midnight Commander layout across accounts — so a flow that captured its
+// pane reads the client from it, never from whichever pane is active by the
+// time a goroutine gets round to asking.
+type Conn struct {
+	Model   *model.Model
+	Profile *cfg.Config
+}
 
 // Location is where a pane is pointed. A nil Bucket means the buckets screen;
 // a non-empty LocalDir means this pane browses the filesystem instead of S3.
@@ -48,6 +59,7 @@ type Pane struct {
 	partial     bool
 	restoreNext string
 	bucketPos   int
+	conn        Conn
 
 	hist History
 }
@@ -303,6 +315,36 @@ func (p *Pane) TakeRestoreNext() string {
 	s := p.restoreNext
 	p.restoreNext = ""
 	return s
+}
+
+// Conn is the client and profile this pane browses with.
+func (p *Pane) Conn() Conn {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.conn
+}
+
+// SetConn points the pane at a client. Changing it changes what every bucket
+// name means, so the location and the listing go with it.
+func (p *Pane) SetConn(c Conn) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if c.Model != p.conn.Model {
+		p.relocateLocked(Location{})
+		p.buckets = nil
+		p.objs = nil
+		p.restoreNext = ""
+		p.bucketPos = 0
+	}
+	p.conn = c
+}
+
+// SameAccount reports whether two panes browse through the same client — so
+// a bucket name means the same bucket on both sides, and a server-side copy
+// between them is possible.
+func SameAccount(a, b *Pane) bool {
+	ca, cb := a.Conn(), b.Conn()
+	return ca.Model == cb.Model
 }
 
 // BucketPos remembers the cursor row on the buckets screen.

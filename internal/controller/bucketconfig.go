@@ -151,7 +151,7 @@ func (c *Controller) loadBucketDashboard(bucket *model.Object, mdl *model.Model)
 		}
 		c.showTextOverlay(" Bucket config — "+tview.Escape(*bucket.Key)+" ",
 			bucketDashboardText(*bucket.Key, info),
-			"[gray]↑↓/PgUp/PgDn[white] scroll · [gray]t[white] edit tags · [gray]r[white] reload · [gray]Esc/q[white] close",
+			"[gray]↑↓/PgUp/PgDn[white] scroll · [gray]t[white] edit tags · [gray]v[white] versioning on/off · [gray]r[white] reload · [gray]Esc/q[white] close",
 			func(ev *tcell.EventKey, lay *shell.Layer, _ *tview.TextView) bool {
 				if ev.Key() != tcell.KeyRune {
 					return false
@@ -163,6 +163,9 @@ func (c *Controller) loadBucketDashboard(bucket *model.Object, mdl *model.Model)
 					return true
 				case 't':
 					c.editBucketTags(bucket, mdl, info, lay)
+					return true
+				case 'v':
+					c.toggleVersioning(bucket, mdl, info, lay)
 					return true
 				}
 				return false
@@ -218,14 +221,79 @@ func (c *Controller) editBucketTags(bucket *model.Object, mdl *model.Model, info
 			}
 			c.logActivity("Bucket tags: %s now has %d tag(s)", *bucket.Key, len(tags))
 			c.shell.Do(func() {
-				dash.Close()
-				c.loadBucketDashboard(bucket, mdl)
+				// Refreshed only if it is still up: one the user closed
+				// while the call ran must not come back unasked.
+				if dash.IsOpen() {
+					dash.Close()
+					c.loadBucketDashboard(bucket, mdl)
+				}
 			})
 		}()
 	})
 	form.AddButton("Cancel", func() { lay.Close() })
 	form.SetInputCapture(escapeCloses(&lay))
 	lay = c.pushModal(form, 80, 18)
+}
+
+// versioningChange decides what the dashboard's v offers for the versioning
+// state it read: enable when versioning is off or suspended, suspend when it
+// is on. A state it could not read is refused rather than guessed — "Enable"
+// on a bucket that is really on would be harmless, but "Suspend" on one we
+// merely failed to read would not.
+func versioningChange(bucket string, item model.ConfigItem) (enable bool, prompt string, err error) {
+	switch item.State {
+	case model.ConfigUnset:
+		return true, fmt.Sprintf("Enable versioning on %s?\n\nEvery overwrite and delete will keep the previous version (billed as storage).\nVersioning cannot be turned off again, only suspended.", bucket), nil
+	case model.ConfigSet:
+	default:
+		return false, "", fmt.Errorf("the versioning state of %s could not be read (%s), so it is left as it is", bucket, bucketTagsState(item))
+	}
+	if strings.Contains(item.Value, "MFA delete") {
+		return false, "", fmt.Errorf("%s has MFA delete on: changing its versioning needs the root account's MFA device, which this app cannot supply", bucket)
+	}
+	switch {
+	case strings.HasPrefix(item.Value, "Enabled"):
+		return false, fmt.Sprintf("Suspend versioning on %s?\n\nNew writes stop creating versions; every version already stored is kept (and still billed).", bucket), nil
+	case strings.HasPrefix(item.Value, "Suspended"):
+		return true, fmt.Sprintf("Re-enable versioning on %s?\n\nEvery overwrite and delete will keep the previous version again.", bucket), nil
+	}
+	return false, "", fmt.Errorf("unrecognised versioning state %q on %s", item.Value, bucket)
+}
+
+// toggleVersioning turns the bucket's versioning on or suspends it, behind a
+// confirmation, then reopens the dashboard on the new state.
+func (c *Controller) toggleVersioning(bucket *model.Object, mdl *model.Model, info model.BucketConfigInfo, dash *shell.Layer) {
+	if c.readOnlyBlocked("change bucket versioning") {
+		return
+	}
+	enable, prompt, err := versioningChange(*bucket.Key, info.Versioning)
+	if err != nil {
+		c.error("Versioning", err)
+		return
+	}
+	c.confirmThen(prompt, func() {
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), bucketCallTimeout)
+			defer cancel()
+			if err := mdl.SetBucketVersioning(ctx, bucket, enable); err != nil {
+				c.error("Changing versioning failed", err)
+				return
+			}
+			state := "suspended"
+			if enable {
+				state = "enabled"
+			}
+			c.logActivity("Bucket versioning: %s %s", *bucket.Key, state)
+			c.shell.Do(func() {
+				// Refreshed only if it is still up: one the user closed
+				// while the call ran must not come back unasked.
+				if dash.IsOpen() {
+					dash.Close()
+					c.loadBucketDashboard(bucket, mdl)
+				}
+			})
+		}()
+	})
 }
 
 // bucketCallTimeout bounds a single bucket-level write. It has no progress to

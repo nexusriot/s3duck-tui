@@ -79,6 +79,13 @@ const (
 	actDiffLocal      actionID = "diff-local"
 	actArchive        actionID = "download-archive"
 	actRestores       actionID = "restores"
+	actGoTo           actionID = "goto"
+	actCopyURI        actionID = "copy-uri"
+	actPresignPut     actionID = "presign-upload"
+	actPurge          actionID = "purge"
+	actDeleted        actionID = "deleted-objects"
+	actOtherProfile   actionID = "other-pane-profile"
+	actExport         actionID = "export-listing"
 )
 
 // defaultBinding pairs an action with its out-of-the-box chord and the
@@ -122,6 +129,7 @@ func defaultBindings() []defaultBinding {
 		{actSearch, "Ctrl+F", false, "recursive search"},
 		{actProperties, "Ctrl+L", false, "properties"},
 		{actPresign, "Ctrl+W", false, "presigned share link"},
+		{actGoTo, "g", false, "go to a path or s3:// URI"},
 		{actSummary, "Ctrl+G", false, "size summary"},
 		{actUsage, "G", false, "usage browser (drill down by size)"},
 		{actPreview, "P", false, "preview (read-only)"},
@@ -162,6 +170,12 @@ func defaultBindings() []defaultBinding {
 		{actDiffLocal, "d", true, "diff against the local copy"},
 		{actArchive, "z", true, "download as one .tar.gz / .zip"},
 		{actRestores, "r", true, "Glacier restores (tracked)"},
+		{actCopyURI, "c", true, "copy the s3:// URI"},
+		{actPresignPut, "p", true, "presigned upload link (PUT)"},
+		{actPurge, "X", true, "purge versions (permanent)"},
+		{actDeleted, "D", true, "deleted objects (undelete)"},
+		{actOtherProfile, "o", true, "open a profile in the other pane"},
+		{actExport, "e", true, "export this listing (CSV / JSON)"},
 	}
 }
 

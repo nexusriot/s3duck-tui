@@ -584,3 +584,25 @@ func TestDownloadHonoursTheConfiguredWidth(t *testing.T) {
 		}
 	}
 }
+
+// A download that completed just as Cancel landed has written the file — and,
+// under Overwrite, replaced the user's — so the summary must count it. It was
+// booked as a plain cancel: "nothing written" while a file had changed.
+func TestDownloadThatLandsAsCancelIsCounted(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	f := &fakeFetcher{fetchHook: func(string) { cancel() }}
+	d := newDownload(t, newMemFS(), f, targets("a", 7))
+	d.Verify = true // a landed-late file is not verified: the run is over
+
+	res := d.Run(ctx, &recorder{})
+
+	if !res.Canceled {
+		t.Error("the run should still report itself cancelled")
+	}
+	if res.Done != 1 || res.Bytes != 7 {
+		t.Errorf("Done=%d Bytes=%d, want the landed object counted (1, 7)", res.Done, res.Bytes)
+	}
+	if res.Failed() != 0 {
+		t.Errorf("a landed object was reported as a failure: %v", res.Failures)
+	}
+}

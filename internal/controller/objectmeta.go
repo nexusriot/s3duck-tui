@@ -117,6 +117,10 @@ func (c *Controller) EditObjectMeta() {
 	if c.readOnlyBlocked("edit metadata or tags") {
 		return
 	}
+	if c.isBulk() {
+		c.bulkMeta()
+		return
+	}
 	_, obj, ok := c.currentObject()
 	if !ok || obj.Ot != model.File {
 		return
@@ -256,6 +260,10 @@ func (c *Controller) ChangeStorageClass() {
 		return
 	}
 	if c.readOnlyBlocked("change the storage class or request a restore") {
+		return
+	}
+	if c.isBulk() {
+		c.bulkStorageClass()
 		return
 	}
 	_, obj, ok := c.currentObject()

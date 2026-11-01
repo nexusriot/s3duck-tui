@@ -41,9 +41,19 @@ const prettyJSONMax = 1 << 20
 // csvMaxColWidth and csvMaxRows bound the table view. A free-text column would
 // otherwise push every other column off screen, and the head of a large CSV
 // holds thousands of rows nobody scrolls through in a preview.
+//
+// csvMaxCols and csvMaxOutput bound it from the other side. Every row is laid
+// out to the widest row's column count, so the output grows as rows × columns:
+// one line of 60 000 commas followed by 2 000 one-field lines — a 62 KB object
+// anyone with write access to a shared bucket can leave there — rendered as
+// 1.6 GB. Past csvMaxCols the head is not treated as a table at all (nobody
+// reads a 500-column grid in a terminal), and the rendering stops at
+// csvMaxOutput bytes whatever the shape.
 const (
 	csvMaxColWidth = 32
 	csvMaxRows     = 2000
+	csvMaxCols     = 64
+	csvMaxOutput   = 1 << 20
 )
 
 // previewInput is everything the formatter decides from.
@@ -271,13 +281,61 @@ func renderPreview(in previewInput) previewOutput {
 // token instead, which needs no closing brackets to have arrived.
 func prettyJSON(data []byte) (string, bool) {
 	data = bytes.TrimPrefix(data, []byte("\xef\xbb\xbf"))
-	if json.Valid(data) {
+	// json.Indent writes into an unbounded buffer, and its output grows as
+	// depth × values: 9 000 levels of nesting around 250 KB of [] — 506 bytes
+	// gzipped — took the process to 5.8 GB before the size check below ever
+	// ran. The bound is computed first, without building anything.
+	if json.Valid(data) && indentedSizeAtMost(data, prettyJSONMax) {
 		var buf bytes.Buffer
 		if err := json.Indent(&buf, data, "", "  "); err == nil && buf.Len() <= prettyJSONMax {
 			return buf.String(), true
 		}
 	}
 	return reindentJSON(data, prettyJSONMax), false
+}
+
+// indentedSizeAtMost reports whether json.Indent(data, "", "  ") stays within
+// max bytes. It over-counts — every structural byte is charged a newline plus
+// its indent, every colon a space — which only ever sends a borderline
+// document to the bounded re-indenter, and it stops as soon as the count
+// passes max, so it costs at most one scan of data.
+func indentedSizeAtMost(data []byte, max int) bool {
+	size, depth := 0, 0
+	inString, escaped := false, false
+	for _, c := range data {
+		size++
+		if inString {
+			switch {
+			case escaped:
+				escaped = false
+			case c == '\\':
+				escaped = true
+			case c == '"':
+				inString = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			inString = true
+		case '{', '[':
+			depth++
+			size += 1 + 2*depth
+		case '}', ']':
+			if depth > 0 {
+				depth--
+			}
+			size += 1 + 2*depth
+		case ',':
+			size += 1 + 2*depth
+		case ':':
+			size++
+		}
+		if size > max {
+			return false
+		}
+	}
+	return true
 }
 
 // reindentJSON lays JSON out one value per line without validating it. Strings
@@ -411,7 +469,7 @@ func csvTable(data []byte, comma rune, whole bool) (body string, rows int, ok bo
 			maxCols = len(rec)
 		}
 	}
-	if maxCols < 2 {
+	if maxCols < 2 || maxCols > csvMaxCols {
 		return "", 0, false
 	}
 
@@ -434,7 +492,13 @@ func csvTable(data []byte, comma rune, whole bool) (body string, rows int, ok bo
 
 	var b strings.Builder
 	sep := " [gray]│[-] "
+	cut := false
 	for i, row := range cells {
+		if b.Len() > csvMaxOutput {
+			// Rows drawn so far are kept; the header is the first of them.
+			shown, cut = shown[:i], true
+			break
+		}
 		for j := 0; j < maxCols; j++ {
 			if j > 0 {
 				b.WriteString(sep)
@@ -464,8 +528,8 @@ func csvTable(data []byte, comma rune, whole bool) (body string, rows int, ok bo
 			b.WriteByte('\n')
 		}
 	}
-	if len(records) > csvMaxRows {
-		fmt.Fprintf(&b, "[gray]… more rows than the preview shows (%d)[-]\n", csvMaxRows)
+	if cut || len(records) > csvMaxRows {
+		fmt.Fprintf(&b, "[gray]… more rows than the preview shows (%d)[-]\n", len(shown))
 	}
 	// The header is not a data row.
 	return b.String(), len(shown) - 1, true

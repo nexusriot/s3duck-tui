@@ -11,6 +11,7 @@ import (
 
 	cfg "github.com/nexusriot/s3duck-tui/internal/config"
 	"github.com/nexusriot/s3duck-tui/internal/model"
+	"github.com/nexusriot/s3duck-tui/internal/session"
 	"github.com/nexusriot/s3duck-tui/internal/ui/shell"
 	"github.com/nexusriot/s3duck-tui/internal/ui/widgets"
 	u "github.com/nexusriot/s3duck-tui/internal/utils"
@@ -196,7 +197,7 @@ func (c *Controller) CopyProfile() {
 	newName := fmt.Sprintf("%s_%s", cur, u.RandStr(4))
 
 	confirm := c.view.NewConfirm()
-	confirm.SetText(fmt.Sprintf("Do you want to copy config %s -> %s", cur, newName)).
+	confirm.SetText(fmt.Sprintf("Do you want to copy config %s -> %s", tview.Escape(cur), tview.Escape(newName))).
 		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
 			confirmLay.Close()
 
@@ -370,12 +371,57 @@ func (c *Controller) CheckProfile() {
 	// ListBuckets is a network round-trip; run it off the UI goroutine so a
 	// slow or unreachable endpoint can't freeze the TUI.
 	go func() {
+		if cf.Anonymous {
+			// Nothing to authenticate and no bucket listing to try: what can
+			// be checked is that each named public bucket answers unsigned.
+			n, err := checkPublicBuckets(context.Background(), probe, cf.PublicBuckets)
+			if err != nil {
+				c.error(fmt.Sprintf("error checking profile %s", cf.Name), err)
+				return
+			}
+			c.success(fmt.Sprintf("successfully checked profile %s: %d public bucket(s) readable", cf.Name, n))
+			return
+		}
 		if _, err := probe.ListBuckets(context.Background()); err != nil {
 			c.error(fmt.Sprintf("error checking profile %s", cf.Name), err)
 		} else {
 			c.success(fmt.Sprintf("successfully checked profile %s", cf.Name))
 		}
 	}()
+}
+
+// prefixProber is the slice of the model checkPublicBuckets needs.
+type prefixProber interface {
+	RefreshClient(bucket *string) error
+	HasPrefix(ctx context.Context, bucket *model.Object, prefix string) (bool, error)
+}
+
+// checkPublicBuckets lists one key of each public bucket, unsigned, and
+// returns how many it checked. Each is checked the way browsing reaches it:
+// the client is pinned to the bucket's region first, or on AWS a bucket in
+// another region (most open datasets) answered 301 and read as a failure.
+// Names are trimmed and repeats skipped, as the bucket list does; the first
+// failure names its bucket, and none named is ErrNoPublicBuckets.
+func checkPublicBuckets(ctx context.Context, m prefixProber, buckets []string) (int, error) {
+	seen := map[string]bool{}
+	for _, b := range buckets {
+		b = strings.TrimSpace(b)
+		if b == "" || seen[b] {
+			continue
+		}
+		seen[b] = true
+		// Best effort, as when browsing: a lookup that fails (MinIO sends no
+		// region header on a refused HEAD) leaves the client as it was, and
+		// the listing below gives the answer that matters.
+		_ = m.RefreshClient(&b)
+		if _, err := m.HasPrefix(ctx, model.BucketObject(b), ""); err != nil {
+			return 0, fmt.Errorf("public bucket %s: %w", b, err)
+		}
+	}
+	if len(seen) == 0 {
+		return 0, model.ErrNoPublicBuckets
+	}
+	return len(seen), nil
 }
 
 func (c *Controller) DeleteConfigEntry() {
@@ -388,7 +434,7 @@ func (c *Controller) DeleteConfigEntry() {
 	i := c.view.List.GetCurrentItem()
 	_, cur := c.view.List.GetItemText(i)
 	confirm := c.view.NewConfirm()
-	confirm.SetText(fmt.Sprintf("Do you want to delete %s", cur)).
+	confirm.SetText(fmt.Sprintf("Do you want to delete %s", tview.Escape(cur))).
 		SetDoneFunc(func(buttonIndex int, buttonLabel string) {
 			// No SwitchToPage here: that would hide EVERY other page,
 			// including a profile form the user was in the middle of.
@@ -556,6 +602,12 @@ func (c *Controller) Duck() {
 	if c.activeConfig == nil {
 		return
 	}
+	// Taken before anything can fail: the launch location belongs to the
+	// profile the command line named. Left pending when that profile failed
+	// to open, it was applied to whichever profile the user opened next —
+	// another account, where the bucket is missing or, worse, a different
+	// bucket of the same name.
+	loc := c.takePendingLocation()
 	mdl, err := model.NewModel(modelConfigFor(c.activeConfig))
 	if err != nil {
 		// The profile never opened, so it must not stay "active": Ctrl+Q
@@ -575,6 +627,11 @@ func (c *Controller) Duck() {
 	c.browsing = true // the browser owns the shared list widget from here on
 	c.showIdentity()  // the header now names the account being browsed
 	c.resetPanes()    // fresh single-pane browser for this profile
+	// Both panes start on this profile; one can be pointed at another with
+	// the leader o.
+	conn := session.Conn{Model: mdl, Profile: c.activeConfig}
+	c.panes[0].SetConn(conn)
+	c.panes[1].SetConn(conn)
 	c.wireListChanged(c.view.PaneList(0))
 	c.pane().SetBucket(nil)
 	c.pane().SetPath("")
@@ -585,6 +642,11 @@ func (c *Controller) Duck() {
 	// Restores this profile is waiting on may have finished while it was
 	// closed; check now rather than a poll interval from now.
 	c.scheduleRestoreCheck()
+	// A location from the command line wins over the remembered one, once.
+	if loc != nil {
+		c.openLocation(loc.Bucket, loc.Key)
+		return
+	}
 	// Land where this profile was last browsing, if it remembers.
 	if c.restoreLocation() {
 		return

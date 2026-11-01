@@ -222,3 +222,20 @@ func TestDropDupMember(t *testing.T) {
 		}
 	})
 }
+
+// A copy in the safe-delete trash is not a copy that remains: counting it
+// let the live object be deleted as "redundant", and Empty Trash then lost
+// the content. Scanning from inside the trash keeps everything.
+func TestDuplicateScanLeavesTheTrashOut(t *testing.T) {
+	obj := func(k string) s3t.Object { return s3t.Object{Key: aws.String(k), Size: 5, ETag: aws.String(`"e"`)} }
+	objs := []s3t.Object{obj("photo.jpg"), obj(".s3duck-trash/20260101-000000/photo-copy.jpg")}
+	if got := findDuplicates(withoutTrash(objs, "", ".s3duck-trash/")); len(got) != 0 {
+		t.Errorf("a live object and its trashed copy were grouped: %+v", got)
+	}
+	if got := withoutTrash(objs, ".s3duck-trash/", ".s3duck-trash/"); len(got) != 2 {
+		t.Errorf("scanning inside the trash dropped %d object(s)", 2-len(got))
+	}
+	if got := withoutTrash(objs, "", ""); len(got) != 2 {
+		t.Error("objects dropped with safe delete off")
+	}
+}

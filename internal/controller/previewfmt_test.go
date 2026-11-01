@@ -4,7 +4,9 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"encoding/json"
 	"fmt"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -277,5 +279,92 @@ func TestBinaryWithATextNameIsStillAHexdump(t *testing.T) {
 	out := renderPreview(previewInput{key: "data.json", data: []byte{0x00, 0x01, 'P', 'K'}, whole: true})
 	if !strings.Contains(out.label, "hexdump") {
 		t.Errorf("label = %q, want a hexdump for binary bytes", out.label)
+	}
+}
+
+// allocDuring reports the bytes allocated while f runs.
+func allocDuring(f func()) uint64 {
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	f()
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc
+}
+
+// A preview reads untrusted objects from shared buckets, so a small object
+// must not be able to make it allocate gigabytes. One very wide row used to
+// widen every other row of a CSV to its column count (62 KB → 1.6 GB).
+func TestPreviewWideCSVIsBounded(t *testing.T) {
+	data := strings.Repeat(",", 60000) + "\n" + strings.Repeat("a\n", 2000)
+	var out previewOutput
+	alloc := allocDuring(func() {
+		out = renderPreview(previewInput{key: "x.csv", data: []byte(data), whole: true})
+	})
+	if alloc > 64<<20 {
+		t.Errorf("rendering a %d-byte CSV allocated %d MiB", len(data), alloc>>20)
+	}
+	if len(out.body) > 2<<20 {
+		t.Errorf("body is %d bytes", len(out.body))
+	}
+	if strings.Contains(out.label, "table") {
+		t.Errorf("a 60 001-column head was laid out as a table: %q", out.label)
+	}
+}
+
+// A table that is legitimately large is cut at the output cap, says so, and
+// still starts with its header.
+func TestPreviewCSVOutputIsCapped(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(strings.Repeat("h,", csvMaxCols-1) + "h\n")
+	row := strings.Repeat(strings.Repeat("v", csvMaxColWidth)+",", csvMaxCols-1) + "v\n"
+	for i := 0; i < csvMaxRows; i++ {
+		b.WriteString(row)
+	}
+	body, _, ok := csvTable([]byte(b.String()), ',', true)
+	if !ok {
+		t.Fatal("not laid out as a table")
+	}
+	if len(body) > csvMaxOutput+64<<10 {
+		t.Errorf("body is %d bytes, cap is %d", len(body), csvMaxOutput)
+	}
+	if !strings.HasPrefix(body, "[yellow::b]h") || !strings.Contains(body, "more rows than the preview shows") {
+		t.Errorf("cut table lacks its header or the note:\n%.200s … %.200s", body, body[len(body)-200:])
+	}
+}
+
+// Deep nesting makes json.Indent's output depth × values. 9 000 levels around
+// a few hundred KB of [] — 506 bytes gzipped — took the process to 5.8 GB.
+func TestPreviewDeepJSONIsBounded(t *testing.T) {
+	doc := strings.Repeat("[", 9000) + strings.Repeat("[],", 60000) + "[]" + strings.Repeat("]", 9000)
+	var out previewOutput
+	alloc := allocDuring(func() {
+		out = renderPreview(previewInput{key: "x.json.gz", data: gzipped(t, []byte(doc)), whole: true})
+	})
+	if alloc > 128<<20 {
+		t.Errorf("rendering deep JSON allocated %d MiB", alloc>>20)
+	}
+	if len(out.body) > 2<<20 {
+		t.Errorf("body is %d bytes", len(out.body))
+	}
+}
+
+func TestIndentedSizeAtMost(t *testing.T) {
+	small := []byte(`{"a":[1,2,{"b":"x,[y]"}]}`)
+	var buf bytes.Buffer
+	if err := json.Indent(&buf, small, "", "  "); err != nil {
+		t.Fatal(err)
+	}
+	// The estimate never under-counts: the real size always fits.
+	if !indentedSizeAtMost(small, buf.Len()+64) {
+		t.Error("a small document was judged too big for its own indented size")
+	}
+	if indentedSizeAtMost(small, buf.Len()/4) {
+		t.Error("an obviously oversized result was accepted")
+	}
+	// Structure inside strings costs nothing extra.
+	str := []byte(`"` + strings.Repeat("[,", 1000) + `"`)
+	if !indentedSizeAtMost(str, len(str)) {
+		t.Error("brackets inside a string were counted as structure")
 	}
 }

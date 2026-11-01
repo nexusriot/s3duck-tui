@@ -137,15 +137,17 @@ type Queue struct {
 	// compete for it at once.
 	sem chan struct{}
 
-	// log records a finished job in the activity log; bell rings the terminal
-	// for a backgrounded outcome worth interrupting for. Both may be nil.
+	// log records a finished job in the activity log; bell announces a
+	// backgrounded outcome worth interrupting for (the terminal bell and a
+	// desktop notification), given the job so it can say which. Both may be
+	// nil.
 	log  func(format string, args ...any)
-	bell func()
+	bell func(View)
 }
 
 // NewQueue builds the queue. concurrency is how many byte-transfer phases may
 // run at once. log and bell may be nil.
-func NewQueue(concurrency int, log func(string, ...any), bell func()) *Queue {
+func NewQueue(concurrency int, log func(string, ...any), bell func(View)) *Queue {
 	if concurrency < 1 {
 		concurrency = 1
 	}
@@ -215,7 +217,7 @@ func (q *Queue) announce(v View) {
 	// The bell only for outcomes worth interrupting for: a transfer the user
 	// walked away from, or a failure. Not for their own cancel.
 	if v.Status != Canceled && q.bell != nil {
-		q.bell()
+		q.bell(v)
 	}
 	if q.log != nil {
 		q.log("%s %s finished: %s", v.Kind, v.Desc, strings.TrimSpace(v.Status.String()))
@@ -250,6 +252,54 @@ func (q *Queue) CancelAt(i int) {
 	j.mu.Unlock()
 	if active && cancel != nil {
 		cancel()
+	}
+}
+
+// ActiveCount is how many jobs are still running or waiting for a slot.
+func (q *Queue) ActiveCount() int {
+	n := 0
+	for _, v := range q.Snapshot() {
+		if v.Status.Active() {
+			n++
+		}
+	}
+	return n
+}
+
+// CancelAll cancels every active job — what quitting does, so each job's own
+// cleanup (temp files removed, multipart uploads aborted) runs before the
+// process goes away instead of being cut off by it. Returns how many it
+// cancelled.
+func (q *Queue) CancelAll() int {
+	q.mu.Lock()
+	jobs := append([]*Job(nil), q.jobs...)
+	q.mu.Unlock()
+	n := 0
+	for _, j := range jobs {
+		j.mu.Lock()
+		active, cancel := j.status.Active(), j.cancel
+		j.mu.Unlock()
+		if active && cancel != nil {
+			cancel()
+			n++
+		}
+	}
+	return n
+}
+
+// WaitIdle waits until no job is active, polling, for at most timeout.
+// It reports whether the queue went idle. Jobs finish on the UI goroutine,
+// so this must never be called from it.
+func (q *Queue) WaitIdle(timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if q.ActiveCount() == 0 {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 

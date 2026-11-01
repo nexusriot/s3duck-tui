@@ -20,6 +20,9 @@ func identityLabel(p *cfg.Config) string {
 	if p.Region != nil && *p.Region != "" {
 		label += " (" + *p.Region + ")"
 	}
+	if p.Anonymous {
+		label += "  [ANONYMOUS]"
+	}
 	if p.ReadOnly {
 		label += "  [READ-ONLY]"
 	}

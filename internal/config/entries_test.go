@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -121,5 +122,94 @@ func TestCopyConfigDoesNotShareRegion(t *testing.T) {
 	}
 	if got := *p.Config[1].Region; got != region {
 		t.Errorf("copy's region = %q, want %q", got, region)
+	}
+}
+
+// --config points the app at another profile list. The default path is
+// never touched, so a scratch config cannot clobber the real one.
+func TestNewParamsHonoursConfigPath(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	alt := filepath.Join(t.TempDir(), "team.json")
+	if err := os.WriteFile(alt, []byte(`[{"name":"shared","base_url":"http://minio:9000","anonymous":true,"public_buckets":["open"]}]`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	p := NewParams(alt)
+	if p.LoadErr != nil {
+		t.Fatalf("LoadErr: %v", p.LoadErr)
+	}
+	if p.FileName != alt {
+		t.Errorf("FileName = %q, want %q", p.FileName, alt)
+	}
+	if len(p.Config) != 1 || p.Config[0].Name != "shared" {
+		t.Fatalf("loaded %v, want [shared]", configNames(p.Config))
+	}
+	if !p.Config[0].Anonymous || len(p.Config[0].PublicBuckets) != 1 || p.Config[0].PublicBuckets[0] != "open" {
+		t.Errorf("anonymous fields not loaded: %+v", *p.Config[0])
+	}
+	if _, err := os.Stat(filepath.Join(home, ".config", "s3duck-tui", "config.json")); !os.IsNotExist(err) {
+		t.Errorf("the default config was created alongside --config (stat err %v)", err)
+	}
+
+	def := NewParams("")
+	if want := filepath.Join(home, ".config", "s3duck-tui", "config.json"); def.FileName != want {
+		t.Errorf("default FileName = %q, want %q", def.FileName, want)
+	}
+}
+
+// A copied profile must not share its public bucket list with the original.
+func TestCloneCopiesPublicBuckets(t *testing.T) {
+	src := &Config{Name: "a", Anonymous: true, PublicBuckets: []string{"x", "y"}}
+	cp := src.clone()
+	cp.PublicBuckets[0] = "changed"
+	if src.PublicBuckets[0] != "x" {
+		t.Errorf("editing the copy changed the original: %v", src.PublicBuckets)
+	}
+}
+
+// A --config that cannot be read (here a directory) is a load error shown in
+// the app, never a crash — and never replaced by an empty file.
+func TestNewParamsUnreadableConfigPath(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	dir := t.TempDir()
+	p := NewParams(dir)
+	if p.LoadErr == nil {
+		t.Fatal("a directory loaded as a profile list")
+	}
+	if fi, err := os.Stat(dir); err != nil || !fi.IsDir() {
+		t.Errorf("the path was replaced: %v %v", fi, err)
+	}
+}
+
+// A save never writes through a file already sitting at a predictable temp
+// name — a planted 0666 file or a symlink would have received every secret.
+// The config ends up 0600 and nothing is left beside it.
+func TestWriteConfigIgnoresAPlantedTempFile(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.json")
+	planted := filepath.Join(dir, "config.json.tmp")
+	elsewhere := filepath.Join(t.TempDir(), "stolen")
+	if err := os.Symlink(elsewhere, planted); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeConfigBytes(cfgPath, []byte(`[{"name":"p","secret_key":"s3cr3t"}]`)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(elsewhere); !os.IsNotExist(err) {
+		t.Errorf("the secret was written through the planted symlink (stat err %v)", err)
+	}
+	fi, err := os.Lstat(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Mode()&os.ModeSymlink != 0 || fi.Mode().Perm() != 0600 {
+		t.Errorf("config.json mode = %v, want a regular 0600 file", fi.Mode())
+	}
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".tmp") && e.Name() != "config.json.tmp" {
+			t.Errorf("temp file left behind: %s", e.Name())
+		}
 	}
 }

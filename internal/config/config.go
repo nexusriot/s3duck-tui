@@ -60,6 +60,12 @@ type Config struct {
 	// can never be. Empty means "use the keys above".
 	AWSProfile string `json:"aws_profile,omitempty"`
 
+	// Anonymous sends every request unsigned, for public buckets (open
+	// datasets): the keys above and AWSProfile are ignored. S3 has no
+	// anonymous bucket listing, so PublicBuckets is the bucket list shown.
+	Anonymous     bool     `json:"anonymous,omitempty"`
+	PublicBuckets []string `json:"public_buckets,omitempty"`
+
 	// ReadOnly blocks every mutating operation for this profile: the guard is
 	// in the controller, so a production profile can be browsed, searched and
 	// downloaded from but not written to or deleted from by accident.
@@ -173,9 +179,28 @@ func writeConfigBytes(fileName string, file []byte) error {
 	// Write-then-rename, never truncate-in-place: a crash or full disk midway
 	// through os.WriteFile would leave a partial config.json holding every
 	// profile's credentials, and the next save would wipe them all.
-	tmp := fileName + ".tmp"
-	if err := os.WriteFile(tmp, file, 0600); err != nil {
-		return fmt.Errorf("failed to write config file %s: %w", tmp, err)
+	//
+	// The temp file is a fresh one with a random name, created 0600. A fixed
+	// "config.json.tmp" was shared by two running instances, and os.WriteFile
+	// keeps the mode of — and follows a symlink at — a file already there: in
+	// a shared --config directory, a planted 0666 file or link received every
+	// secret key. It is synced before the rename, so a crash cannot leave the
+	// new name pointing at unwritten blocks.
+	fp, err := os.CreateTemp(filepath.Dir(fileName), filepath.Base(fileName)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("failed to create a temp file beside %s: %w", fileName, err)
+	}
+	tmp := fp.Name()
+	_, werr := fp.Write(file)
+	if werr == nil {
+		werr = fp.Sync()
+	}
+	if cerr := fp.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("failed to write config file %s: %w", tmp, werr)
 	}
 	if err := os.Rename(tmp, fileName); err != nil {
 		_ = os.Remove(tmp)
@@ -345,6 +370,9 @@ func (c *Config) clone() *Config {
 		out.Bookmarks = make([]Bookmark, len(c.Bookmarks))
 		copy(out.Bookmarks, c.Bookmarks)
 	}
+	if c.PublicBuckets != nil {
+		out.PublicBuckets = append([]string(nil), c.PublicBuckets...)
+	}
 	if c.Region != nil {
 		region := *c.Region
 		out.Region = &region
@@ -387,13 +415,20 @@ func CreateEmptyConfig(configFile string) error {
 	return os.WriteFile(configFile, a, 0600)
 }
 
-func NewParams() *Params {
+// NewParams loads the profile list. configFile replaces the default
+// ~/.config/s3duck-tui/config.json (the --config flag); empty means the
+// default. The other per-user files (keys.json, the activity log, the restore
+// tracker) stay under the home directory either way: --config chooses a set
+// of profiles, not a second installation.
+func NewParams(configFile string) *Params {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return &Params{LoadErr: fmt.Errorf("can't get user home dir: %w", err)}
 	}
 
-	configFile := path.Join(homeDir, configFolder, configDirName, filename)
+	if configFile == "" {
+		configFile = path.Join(homeDir, configFolder, configDirName, filename)
+	}
 	params := &Params{HomeDir: homeDir, FileName: configFile}
 
 	exists, err := FileExist(configFile)

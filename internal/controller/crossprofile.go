@@ -44,6 +44,8 @@ func modelConfigFor(p *cfg.Config) model.Config {
 		p.BaseUrl, p.Region, p.AccessKey, p.SecretKey, p.SessionToken,
 		!p.IgnoreSsl, p.MaxBytesPerSec)
 	mc.AWSProfile = p.AWSProfile
+	mc.Anonymous = p.Anonymous
+	mc.PublicBuckets = p.PublicBuckets
 	mc.Write = model.WriteOptions{
 		DetectMime:        !p.NoMimeDetect,
 		SSE:               p.SSE,
@@ -195,7 +197,7 @@ func (c *Controller) pickCrossDestination(items []copyMoveItem, src *model.Model
 				_, bucketName := form.GetFormItemByLabel("Bucket").(*tview.DropDown).GetCurrentOption()
 				prefix := model.NormalizeTypedPrefix(form.GetFormItemByLabel("Prefix").(*tview.InputField).GetText())
 				lay.Close()
-				c.runCrossCopy(items, src, srcBucket, srcPrefix, dst, dstProfile.Name, bucketName, prefix)
+				c.runCrossCopy(items, src, srcBucket, srcPrefix, dst, dstProfile.Name, bucketName, prefix, false)
 			})
 			form.AddButton("Cancel", func() { lay.Close() })
 			form.SetInputCapture(escapeCloses(&lay))
@@ -207,13 +209,20 @@ func (c *Controller) pickCrossDestination(items []copyMoveItem, src *model.Model
 
 // runCrossCopy expands folders into concrete objects, then streams every
 // object through this process as a cancellable, backgroundable transfer job.
-// The source is never modified.
-func (c *Controller) runCrossCopy(items []copyMoveItem, src *model.Model, srcBucket *model.Object, srcPrefix string, dst *model.Model, dstProfileName, dstBucketName, dstPrefix string) {
+// A copy never modifies the source. A move (between panes on different
+// profiles) deletes each source object once its copy has landed — that one
+// key, nothing else — and the folder markers of a moved folder only when
+// every object in the run made it.
+func (c *Controller) runCrossCopy(items []copyMoveItem, src *model.Model, srcBucket *model.Object, srcPrefix string, dst *model.Model, dstProfileName, dstBucketName, dstPrefix string, isMove bool) {
 	ctx, cancel := context.WithCancel(context.Background())
 	name := dstBucketName
 	dstBucket := &model.Object{Key: &name, Ot: model.Bucket}
 
-	job := c.queue.Add("xcopy", fmt.Sprintf("%s/%s → %s:%s/%s",
+	kind := "xcopy"
+	if isMove {
+		kind = "xmove"
+	}
+	job := c.queue.Add(kind, fmt.Sprintf("%s/%s → %s:%s/%s",
 		*srcBucket.Key, srcPrefix, dstProfileName, dstBucketName, dstPrefix), 0, 0, cancel)
 
 	var lay *shell.Layer
@@ -240,6 +249,7 @@ func (c *Controller) runCrossCopy(items []copyMoveItem, src *model.Model, srcBuc
 
 		// Expand folders into concrete operations.
 		var ops []crossOp
+		var markers []string // folder markers a move removes at the end
 		var total int64
 		for _, it := range items {
 			if !it.isFolder {
@@ -266,7 +276,11 @@ func (c *Controller) runCrossCopy(items []copyMoveItem, src *model.Model, srcBuc
 				return
 			}
 			for _, o := range objs {
-				if o.Key == nil || strings.HasSuffix(*o.Key, "/") {
+				if o.Key != nil && strings.HasSuffix(*o.Key, "/") {
+					markers = append(markers, *o.Key)
+					continue
+				}
+				if o.Key == nil {
 					continue
 				}
 				ops = append(ops, crossOp{
@@ -371,10 +385,10 @@ func (c *Controller) runCrossCopy(items []copyMoveItem, src *model.Model, srcBuc
 			c.shell.Do(func() {
 				progress.SetText(fmt.Sprintf(
 					"Copying to %s\n%d/%d object(s)\n%s/%s (%.1f%%)\n%s\n%s",
-					dstProfileName, i, len(ops),
+					tview.Escape(dstProfileName), i, len(ops),
 					humanize.IBytes(uint64(n)), humanize.IBytes(uint64(total)), pct,
 					flows.ByteRateETA(n, total, time.Since(start)),
-					op.SrcKey,
+					tview.Escape(op.SrcKey),
 				))
 			})
 		}
@@ -395,6 +409,13 @@ func (c *Controller) runCrossCopy(items []copyMoveItem, src *model.Model, srcBuc
 				failed = append(failed, fmt.Sprintf("%s: %v", op.SrcKey, err))
 				continue
 			}
+			if isMove {
+				// The copy is on the other side; only now may the source go.
+				if err := src.DeleteKey(ctx, op.SrcKey, srcBucket); err != nil {
+					failed = append(failed, fmt.Sprintf("%s: copied, but the source was not deleted: %v", op.SrcKey, err))
+					continue
+				}
+			}
 			okCount++
 			mu.Lock()
 			doneBytes += op.Size
@@ -402,8 +423,20 @@ func (c *Controller) runCrossCopy(items []copyMoveItem, src *model.Model, srcBuc
 			job.SetProgress(doneBytes, i+1)
 		}
 
-		c.logActivity("Cross-profile copy → %s: %d ok, %d failed (%s)",
-			dstProfileName, okCount, len(failed), humanize.IBytes(uint64(doneBytes)))
+		if isMove && !canceled && len(failed) == 0 {
+			for _, k := range markers {
+				_ = src.DeleteKey(context.Background(), k, srcBucket)
+			}
+		}
+		verb := "copy"
+		if isMove {
+			verb = "move"
+		}
+		c.logActivity("Cross-profile %s → %s: %d ok, %d failed (%s)",
+			verb, dstProfileName, okCount, len(failed), humanize.IBytes(uint64(doneBytes)))
+		if isMove {
+			go c.updateList() // the source side changed under the user
+		}
 		c.queue.Finish(job, canceled, len(failed))
 
 		if canceled || job.IsBackgrounded() {
@@ -417,12 +450,16 @@ func (c *Controller) runCrossCopy(items []copyMoveItem, src *model.Model, srcBuc
 			if job.IsBackgrounded() || !lay.IsOpen() {
 				return
 			}
-			status := "Cross-profile copy complete."
-			if len(failed) > 0 {
-				status = "Cross-profile copy finished with errors."
+			noun, done := "copy", "Copied"
+			if isMove {
+				noun, done = "move", "Moved"
 			}
-			msg := fmt.Sprintf("%s\n\nCopied: %d\nFailed: %d\nTransferred: %s",
-				status, okCount, len(failed), humanize.IBytes(uint64(doneBytes)))
+			status := fmt.Sprintf("Cross-profile %s complete.", noun)
+			if len(failed) > 0 {
+				status = fmt.Sprintf("Cross-profile %s finished with errors.", noun)
+			}
+			msg := fmt.Sprintf("%s\n\n%s: %d\nFailed: %d\nTransferred: %s",
+				status, done, okCount, len(failed), humanize.IBytes(uint64(doneBytes)))
 			for i, f := range failed {
 				if i == 8 {
 					msg += fmt.Sprintf("\n  ...and %d more", len(failed)-8)
@@ -433,7 +470,7 @@ func (c *Controller) runCrossCopy(items []copyMoveItem, src *model.Model, srcBuc
 			msg += "\n\nPress Done to return."
 
 			progress.ClearButtons()
-			progress.SetText(msg)
+			progress.SetText(tview.Escape(msg))
 			progress.AddButtons([]string{"Done"})
 			progress.SetDoneFunc(func(_ int, _ string) { lay.Close() })
 			c.view.App.SetFocus(progress)

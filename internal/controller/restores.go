@@ -388,6 +388,8 @@ func (c *Controller) checkRestores(mdl *model.Model, profile string) {
 			c.logActivity("Restore ready: s3://%s/%s%s", e.Bucket, e.Key, until)
 			c.queue.SetNotice(fmt.Sprintf(" ✓ restored: %s ", path.Base(e.Key)))
 			c.shell.Do(c.view.Beep)
+			c.notify.post(notification{title: notifyTitle,
+				body: fmt.Sprintf("Restore ready: s3://%s/%s%s", e.Bucket, e.Key, until)})
 		}
 	}
 	if changed {

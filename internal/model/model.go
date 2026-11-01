@@ -33,6 +33,11 @@ import (
 // the overwrite prompt, sync — must remove it first; errors.Is identifies it.
 var ErrFileExists = errors.New("file exists")
 
+// ErrSizeMismatch is a download whose byte count is not the size the object
+// was listed at: a short read, or an object that changed since the listing.
+// The partial file is discarded rather than renamed onto the target.
+var ErrSizeMismatch = errors.New("download size mismatch")
+
 // ErrTruncatedListing reports a listing page that said more results follow but
 // carried no new continuation token. The SDK's paginator simply stops there,
 // which handed callers a partial listing with a nil error — the shape a
@@ -81,6 +86,12 @@ type Config struct {
 	// that shared-config profile instead of using the static keys above. Empty
 	// means static credentials. See GetConfig.
 	AWSProfile string
+	// Anonymous sends every request unsigned, for public buckets: no keys,
+	// no credential chain. Such a profile cannot list its buckets (S3 has no
+	// anonymous ListBuckets), so PublicBuckets stands in for that listing.
+	Anonymous bool
+	// PublicBuckets is the bucket list an anonymous profile shows.
+	PublicBuckets []string
 	// Write holds the per-profile decisions for every object this app creates
 	// (content type, encryption, checksums). See WriteOptions.
 	Write WriteOptions
@@ -169,6 +180,10 @@ func (l *rateLimiter) wait(ctx context.Context, n int) error {
 type DownloadTarget struct {
 	Key  string
 	Size int64
+	// ETag is the listed version's, when the listing had it. A resumable
+	// download pins its ranges to it (If-Match); without it, one is read with
+	// a HEAD first.
+	ETag string
 }
 
 type Object struct {
@@ -252,14 +267,39 @@ func uploadRetryer() aws.Retryer {
 // newUploader builds the shared multipart uploader used by every upload path
 // (UploadFile, and through it UploadTargets; CrossCopy), so they can't drift
 // on part size or retry policy. size is the body's length, or <= 0 if unknown.
+//
+// It leaves a failed upload's parts in place (LeavePartsOnError): the SDK's own
+// cleanup sends AbortMultipartUpload on the upload's context, which is
+// already dead when the failure IS a cancel — so a cancelled upload left its
+// parts on the server, billed, forever. uploadObject aborts on a detached
+// context instead. Use it rather than calling Upload on this directly.
 func newUploader(client *s3.Client, size int64) *s3m.Uploader {
 	return s3m.NewUploader(client, func(u *s3m.Uploader) {
 		u.PartSize = uploadPartSize(size)
-		u.LeavePartsOnError = false
+		u.LeavePartsOnError = true
 		u.ClientOptions = append(u.ClientOptions, func(o *s3.Options) {
 			o.Retryer = uploadRetryer()
 		})
 	})
+}
+
+// uploadObject runs an upload through newUploader and, when a multipart upload
+// fails or is cancelled after it started, aborts it so its parts do not stay
+// behind. The abort gets its own short deadline, detached from ctx — the same
+// rule abortMultipart follows for copies.
+func uploadObject(ctx context.Context, client *s3.Client, up *s3m.Uploader, in *s3.PutObjectInput) error {
+	_, err := up.Upload(ctx, in)
+	var failure s3m.MultiUploadFailure
+	if err != nil && errors.As(err, &failure) && failure.UploadID() != "" {
+		abortCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), abortTimeout)
+		defer cancel()
+		_, _ = client.AbortMultipartUpload(abortCtx, &s3.AbortMultipartUploadInput{
+			Bucket:   in.Bucket,
+			Key:      in.Key,
+			UploadId: aws.String(failure.UploadID()),
+		})
+	}
+	return err
 }
 
 // uploadPartSize picks a part size that fits size into S3's 10 000-part limit.
@@ -331,9 +371,14 @@ func GetConfig(cf Config, update bool) (aws.Config, error) {
 	// SDK's own resolution chain, which runs the SSO flow, assumes the role or
 	// invokes credential_process — and re-resolves when what it handed out
 	// expires. Naming a shared-config profile stores no key material here.
-	if cf.AWSProfile != "" {
+	switch {
+	case cf.Anonymous:
+		// The SDK's documented way to send unsigned requests; it also stops
+		// LoadDefaultConfig resolving (and failing on) a credential chain.
+		opts = append(opts, config.WithCredentialsProvider(aws.AnonymousCredentials{}))
+	case cf.AWSProfile != "":
 		opts = append(opts, config.WithSharedConfigProfile(cf.AWSProfile))
-	} else {
+	default:
 		opts = append(opts, config.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider(cf.AccessKey, cf.SecretKey, cf.SessionToken)))
 	}
@@ -377,6 +422,9 @@ func GetConfig(cf Config, update bool) (aws.Config, error) {
 // CredentialSource describes where this connection's credentials come from,
 // for the profile details pane.
 func (c Config) CredentialSource() string {
+	if c.Anonymous {
+		return "anonymous (unsigned requests, public buckets only)"
+	}
 	if c.AWSProfile != "" {
 		return "aws profile " + c.AWSProfile + " (SDK-resolved, auto-refreshing)"
 	}
@@ -416,7 +464,13 @@ func NewModel(cf Config) (*Model, error) {
 // CreateBucket — to a wrong us-east-1 default, turning one denied
 // s3:GetBucketLocation into a stream of baffling redirect errors.
 func (m *Model) RefreshClient(bucket *string) error {
-	region, err := m.GetBucketLocation(bucket)
+	var region *string
+	var err error
+	if m.Cf.Anonymous {
+		region, err = m.bucketRegionUnsigned(bucket)
+	} else {
+		region, err = m.GetBucketLocation(bucket)
+	}
 	if err != nil {
 		return fmt.Errorf("resolving region of %s: %w", aws.ToString(bucket), err)
 	}
@@ -509,6 +563,21 @@ func (m *Model) GetBucketLocation(name *string) (*string, error) {
 	}
 	loc := normalizeBucketLocation(string(bl.LocationConstraint))
 	return &loc, nil
+}
+
+// bucketRegionUnsigned finds a bucket's region without GetBucketLocation,
+// which needs s3:GetBucketLocation and so is refused to every anonymous
+// caller — even on a public bucket. HEAD on the bucket answers with an
+// x-amz-bucket-region header whatever the access decision, which is what the
+// SDK's GetBucketRegion reads.
+func (m *Model) bucketRegionUnsigned(bucket *string) (*string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	region, err := s3m.GetBucketRegion(ctx, m.Client, aws.ToString(bucket))
+	if err != nil {
+		return nil, err
+	}
+	return &region, nil
 }
 
 // normalizeBucketLocation maps GetBucketLocation's constraint values onto real
@@ -656,6 +725,10 @@ func (m *Model) ListBuckets(ctx context.Context) ([]*Object, error) {
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
+	if m.Cf != nil && m.Cf.Anonymous {
+		return publicBucketObjects(m.Cf.PublicBuckets)
+	}
+
 	objs := make([]*Object, 0)
 
 	result, err := m.Client.ListBuckets(ctx, &s3.ListBucketsInput{})
@@ -677,6 +750,56 @@ func (m *Model) ListBuckets(ctx context.Context) ([]*Object, error) {
 		objs = append(objs, ko)
 	}
 	return objs, nil
+}
+
+// ErrNoPublicBuckets is what an anonymous profile with no bucket names lists:
+// there is no anonymous ListBuckets, so the profile has to say where to look.
+var ErrNoPublicBuckets = errors.New("an anonymous profile cannot list buckets: name the public buckets in the profile's options (o on the profiles screen), or go to one with g (s3://bucket/)")
+
+// publicBucketObjects is an anonymous profile's bucket list: the names it was
+// given, blank and repeated ones dropped, in the order given.
+func publicBucketObjects(names []string) ([]*Object, error) {
+	objs := make([]*Object, 0, len(names))
+	seen := map[string]bool{}
+	for _, n := range names {
+		n = strings.TrimSpace(n)
+		if n == "" || seen[n] {
+			continue
+		}
+		seen[n] = true
+		objs = append(objs, BucketObject(n))
+	}
+	if len(objs) == 0 {
+		return nil, ErrNoPublicBuckets
+	}
+	return objs, nil
+}
+
+// BucketObject is the listing row for a bucket known only by name: a public
+// bucket, or one reached by an s3:// location rather than through the list.
+func BucketObject(name string) *Object {
+	return &Object{Key: &name, Ot: Bucket}
+}
+
+// HasPrefix reports whether anything is stored under prefix — one key's
+// worth of listing. It is how an s3:// location without a trailing slash is
+// told apart: "logs" is a folder when "logs/" holds anything.
+func (m *Model) HasPrefix(ctx context.Context, bucket *Object, prefix string) (bool, error) {
+	if bucket == nil || bucket.Key == nil {
+		return false, fmt.Errorf("bucket is nil")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	out, err := m.Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:  aws.String(*bucket.Key),
+		Prefix:  aws.String(prefix),
+		MaxKeys: 1,
+	})
+	if err != nil {
+		return false, err
+	}
+	return len(out.Contents) > 0 || len(out.CommonPrefixes) > 0, nil
 }
 
 // Delete removes a single key, or every object under a folder prefix. A
@@ -751,17 +874,42 @@ func (m *Model) deleteObjectIDs(ctx context.Context, bucket *Object, objectIds [
 	return nil
 }
 
-// EmptyBucket removes every current object in the bucket, so DeleteBucket can
-// succeed afterwards — S3 only deletes empty buckets, and the delete confirm
-// has already promised the user exactly this removal. On a versioned bucket
-// this writes delete markers only: old versions survive, and the subsequent
-// DeleteBucket still fails with BucketNotEmpty (see DESIGN.md).
+// EmptyBucket removes everything in the bucket, so DeleteBucket can succeed
+// afterwards — S3 only deletes empty buckets, and the delete confirm has
+// already promised the user exactly this removal.
+//
+// Everything means every version: it purges by version ID, because on a
+// versioned bucket an ordinary delete only writes delete markers, the old
+// versions survive, and DeleteBucket then failed with BucketNotEmpty however
+// often it was asked. On an unversioned bucket each object is its one "null"
+// version, so the same purge is an ordinary delete. An endpoint with no
+// ListObjectVersions at all falls back to deleting the current objects.
 func (m *Model) EmptyBucket(ctx context.Context, bucket *Object) error {
 	if bucket == nil || bucket.Key == nil {
 		return fmt.Errorf("bucket is nil")
 	}
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	var refs []VersionRef
+	err := m.ListVersionsUnder(ctx, bucket, "", func(page []VersionRef) bool {
+		refs = append(refs, page...)
+		return true
+	})
+	switch {
+	case err == nil:
+		_, failures, err := m.DeleteVersions(ctx, bucket, refs)
+		if err != nil {
+			return err
+		}
+		if len(failures) > 0 {
+			f := failures[0]
+			return fmt.Errorf("%d version(s) could not be deleted; first: %s (version %s): %w",
+				len(failures), f.Ref.Key, f.Ref.VersionID, f.Err)
+		}
+		return nil
+	case !isNotImplemented(err):
+		return err
 	}
 	objs, err := m.ListObjects(ctx, "", bucket)
 	if err != nil {
@@ -1054,7 +1202,7 @@ func (m *Model) PrepareUpload(localPath string, currentPath string, bucket *Obje
 		// Sockets, FIFOs and devices are skipped: opening a FIFO with no
 		// writer blocks forever and the open syscall ignores ctx cancel, so
 		// one stray pipe would hang the whole upload.
-		if !fi.Mode().IsRegular() {
+		if !fi.Mode().IsRegular() || IsPartialFile(fi.Name()) {
 			return nil
 		}
 		remote := prefix + filepath.ToSlash(rel)
@@ -1118,6 +1266,7 @@ func (m *Model) ResolveDownloadObjects(ctx context.Context, key string, isFolder
 			out = append(out, DownloadTarget{
 				Key:  *obj.Key,
 				Size: obj.Size,
+				ETag: strings.Trim(aws.ToString(obj.ETag), `"`),
 			})
 			total += obj.Size
 		}
@@ -1184,6 +1333,9 @@ func (m *Model) DownloadTarget(
 			return 0, fmt.Errorf("%w: %s", ErrFileExists, downloadPath)
 		}
 	}
+	if t.Size >= ResumeMinSize && bucket != nil {
+		return m.downloadResumable(ctx, t, downloadPath, *bucket, progressCb)
+	}
 
 	// Download into a sibling temp file and rename onto the target only after
 	// the body is fully on disk: a failed or canceled transfer must never leave
@@ -1228,6 +1380,17 @@ func (m *Model) DownloadTarget(
 		fp.Close()
 		_ = os.Remove(tmpPath)
 		return n, err
+	}
+	// The ranged download does not check that each range arrived whole: a
+	// short 206 from a proxy or backend, or an object replaced by a shorter
+	// one mid-transfer, ended with n < size and err == nil — a truncated file
+	// renamed over the target and reported as downloaded. The listed size is
+	// the contract; anything else is refused, not renamed.
+	if t.Size >= 0 && n != t.Size {
+		fp.Close()
+		_ = os.Remove(tmpPath)
+		return n, fmt.Errorf("%w: %s arrived as %d bytes, but was listed at %d — re-list (r) and download it again",
+			ErrSizeMismatch, t.Key, n, t.Size)
 	}
 	if err := fp.Close(); err != nil {
 		_ = os.Remove(tmpPath)
@@ -1282,6 +1445,61 @@ func (m *Model) PresignGetURL(bucket *Object, key string, ttl time.Duration) (st
 
 	ps := s3.NewPresignClient(m.Client)
 	req, err := ps.PresignGetObject(context.TODO(), &s3.GetObjectInput{
+		Bucket: aws.String(*bucket.Key),
+		Key:    aws.String(key),
+	}, s3.WithPresignExpires(ttl))
+	if err != nil {
+		return "", err
+	}
+	if m.Cf != nil && m.Cf.Anonymous {
+		// Unsigned, the presigner still appends X-Amz-Expires, which grants
+		// nothing and suggests a deadline that does not exist. What an
+		// anonymous profile can hand out is the object's plain URL.
+		return stripQuery(req.URL)
+	}
+	return req.URL, nil
+}
+
+// stripQuery drops a URL's query string.
+func stripQuery(raw string) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	u.RawQuery = ""
+	return u.String(), nil
+}
+
+// ErrAnonymousCannotSign refuses a presigned upload on an anonymous profile:
+// with no credentials there is nothing to sign with, and an unsigned PUT URL
+// grants nothing.
+var ErrAnonymousCannotSign = errors.New("an anonymous profile has no credentials to sign an upload link with")
+
+// PresignPutURL returns a time-limited URL that lets whoever holds it upload
+// one object to key with a plain HTTP PUT (curl -T), with no credentials of
+// their own. Nothing but the bucket and key is signed: the profile's write
+// options (SSE, checksum, Content-Type) would each become a header the
+// uploader must send exactly, and a link that fails on a missing header is
+// worse than one that writes with the bucket's defaults. The TTL is capped at
+// PresignMaxTTL.
+func (m *Model) PresignPutURL(bucket *Object, key string, ttl time.Duration) (string, error) {
+	if bucket == nil || bucket.Key == nil {
+		return "", fmt.Errorf("bucket is nil")
+	}
+	if key == "" || strings.HasSuffix(key, "/") {
+		return "", fmt.Errorf("an upload link needs an object key, not a folder")
+	}
+	if ttl <= 0 {
+		return "", fmt.Errorf("ttl must be positive")
+	}
+	if m.Cf != nil && m.Cf.Anonymous {
+		return "", ErrAnonymousCannotSign
+	}
+	if ttl > PresignMaxTTL {
+		ttl = PresignMaxTTL
+	}
+	ps := s3.NewPresignClient(m.Client)
+	req, err := ps.PresignPutObject(context.TODO(), &s3.PutObjectInput{
 		Bucket: aws.String(*bucket.Key),
 		Key:    aws.String(key),
 	}, s3.WithPresignExpires(ttl))
@@ -1519,4 +1737,109 @@ func (m *Model) MoveKeys(
 		return len(copied), fmt.Errorf("copied ok, but failed to delete source: %w", err)
 	}
 	return len(copied), nil
+}
+
+// downloadResumable is DownloadTarget for an object big enough to resume:
+// what an earlier, interrupted download of this very version left is kept,
+// and only the rest is fetched. See resume.go.
+func (m *Model) downloadResumable(ctx context.Context, t DownloadTarget, target, bucket string, progressCb func(written, total int64, key string)) (int64, error) {
+	etag := strings.Trim(t.ETag, `"`)
+	if etag == "" {
+		meta, err := m.HeadObject(ctx, BucketObject(bucket), t.Key)
+		if err != nil {
+			return 0, err
+		}
+		if meta.Size != t.Size {
+			return 0, fmt.Errorf("%w: %s is %d bytes now, but was listed at %d — re-list (r) and download it again",
+				ErrSizeMismatch, t.Key, meta.Size, t.Size)
+		}
+		etag = meta.ETag
+	}
+	partial, sidecar := partialPaths(target, bucket, t.Key)
+	have := loadResume(partial, sidecar, bucket, t.Key, etag, t.Size)
+
+	n, err := m.fetchPartial(ctx, t, bucket, etag, partial, sidecar, have, progressCb)
+	if errors.Is(err, ErrObjectChanged) && have > 0 && ctx.Err() == nil {
+		// What was kept belongs to an older version: start this one afresh.
+		n, err = m.fetchPartial(ctx, t, bucket, etag, partial, sidecar, 0, progressCb)
+	}
+	if err != nil {
+		return n, err
+	}
+	if err := os.Rename(partial, target); err != nil {
+		discardPartial(partial, sidecar)
+		return n, err
+	}
+	_ = os.Remove(sidecar)
+	return n, nil
+}
+
+// fetchPartial fetches the object from byte have onward into partial and
+// reports the object's bytes now on disk. On failure or cancel it keeps the
+// contiguous prefix for a later resume; on a version change it keeps nothing.
+func (m *Model) fetchPartial(ctx context.Context, t DownloadTarget, bucket, etag, partial, sidecar string, have int64, progressCb func(written, total int64, key string)) (int64, error) {
+	flags := os.O_RDWR | os.O_CREATE
+	if have == 0 {
+		flags |= os.O_TRUNC
+	}
+	fp, err := os.OpenFile(partial, flags, 0644)
+	if err != nil {
+		return 0, err
+	}
+	cov := &coverage{}
+	if progressCb != nil && have > 0 {
+		progressCb(have, t.Size, t.Key)
+	}
+	writer := &progressWriterAt{
+		w:     &offsetWriterAt{w: fp, base: have, cov: cov},
+		total: t.Size,
+		updateFunc: func(written, total int64) {
+			if progressCb != nil {
+				progressCb(have+written, total, t.Key)
+			}
+		},
+		limiter: m.Limiter,
+		ctx:     ctx,
+	}
+	in := &s3.GetObjectInput{
+		Bucket: aws.String(bucket),
+		Key:    aws.String(t.Key),
+		// Every range of this download — the resumed tail included — must be
+		// this version: bytes of two versions are never stitched together.
+		IfMatch: aws.String(`"` + etag + `"`),
+	}
+	if have > 0 {
+		in.Range = aws.String(fmt.Sprintf("bytes=%d-", have))
+	}
+	n, err := m.Downloader.Download(ctx, writer, in)
+	closeErr := fp.Close()
+	st := resumeState{Bucket: bucket, Key: t.Key, ETag: etag, Size: t.Size, Have: cov.prefix(have)}
+
+	switch {
+	case isPreconditionFailed(err):
+		discardPartial(partial, sidecar)
+		return 0, fmt.Errorf("%w: %s", ErrObjectChanged, t.Key)
+	case closeErr == nil && st.Have == t.Size && t.Size > 0:
+		// Every byte of this version is on disk — the cancel, or the error,
+		// came after the last range landed. That is a finished download;
+		// keeping it as a partial only for the next attempt to throw away
+		// a complete file would be the worst of both.
+		return t.Size, nil
+	case ctx.Err() != nil:
+		saveResume(partial, sidecar, st)
+		return 0, ctx.Err()
+	case err != nil:
+		saveResume(partial, sidecar, st)
+		return have + n, err
+	case closeErr != nil:
+		saveResume(partial, sidecar, st)
+		return have + n, closeErr
+	}
+	if total := have + n; total != t.Size {
+		// The listing is the contract, as for any download.
+		discardPartial(partial, sidecar)
+		return total, fmt.Errorf("%w: %s arrived as %d bytes, but was listed at %d — re-list (r) and download it again",
+			ErrSizeMismatch, t.Key, total, t.Size)
+	}
+	return have + n, nil
 }

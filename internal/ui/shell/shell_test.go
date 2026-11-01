@@ -215,3 +215,23 @@ func TestNilLayerCloseIsSafe(t *testing.T) {
 		t.Fatal("a nil layer reports itself open")
 	}
 }
+
+func TestIsTop(t *testing.T) {
+	s, _ := newTestShell()
+	under := s.Push(tview.NewBox())
+	if !s.IsTop(under) {
+		t.Error("the only layer is not top")
+	}
+	over := s.Push(tview.NewBox())
+	if s.IsTop(under) || !s.IsTop(over) {
+		t.Error("the newest layer is not the only top")
+	}
+	over.Close()
+	if !s.IsTop(under) {
+		t.Error("closing the top did not make the one beneath it top")
+	}
+	under.Close()
+	if s.IsTop(under) || s.IsTop(nil) {
+		t.Error("a closed or nil layer reported as top")
+	}
+}

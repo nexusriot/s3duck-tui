@@ -206,16 +206,28 @@ func TestRoadmapDoesNotPromiseWhatShipped(t *testing.T) {
 	pending := roadmap[strings.Index(roadmap, "## Next"):]
 
 	shipped := map[string]string{
-		"Sync include/exclude globs":  "applyExcludes",
-		"Read-only profile flag":      "readOnlyBlocked",
-		"OS keyring":                  "", // still open, must NOT be flagged
-		"Summary by storage class":    "classBreakdown",
-		"Post-transfer verify":        "VerifyLocalFile",
-		"Text preview via ranged GET": "GetObjectHead",
-		"Anonymous profiles":          "", // still open
-		"Bucket policy viewer":        "summarizePolicy",
-		"Lifecycle rules viewer":      "summarizeLifecycle",
-		"reads any error as":          "classifyConfigErr",
+		"Sync include/exclude globs":   "applyExcludes",
+		"Read-only profile flag":       "readOnlyBlocked",
+		"OS keyring":                   "", // still open, must NOT be flagged
+		"Summary by storage class":     "classBreakdown",
+		"Post-transfer verify":         "VerifyLocalFile",
+		"Text preview via ranged GET":  "GetObjectHead",
+		"Anonymous profiles":           "publicBucketObjects",
+		"Presigned PUT":                "PresignPutURL",
+		"Copy `s3://` URI":             "CopyURI",
+		"Go-to-path jump":              "GoTo",
+		"CLI flags":                    "resolveLaunchProfile",
+		"Enable bucket versioning":     "SetBucketVersioning",
+		"Version-aware delete":         "DeleteVersions",
+		"Show deleted objects":         "FindDeleted",
+		"Bulk operations for metadata": "bulkMetaEdit",
+		"Reach a bucket by name":       "knownBuckets",
+		"Export listing to CSV":        "encodeRows",
+		"Download resume":              "downloadResumable",
+		"Dual panes on different":      "OpenProfileInOtherPane",
+		"Bucket policy viewer":         "summarizePolicy",
+		"Lifecycle rules viewer":       "summarizeLifecycle",
+		"reads any error as":           "classifyConfigErr",
 	}
 	for phrase, symbol := range shipped {
 		if symbol == "" {

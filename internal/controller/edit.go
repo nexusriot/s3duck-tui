@@ -34,6 +34,20 @@ func isProbablyBinary(data []byte) bool {
 	return bytes.IndexByte(data[:n], 0) >= 0
 }
 
+// editGuardRefusal is why the lost-update guard refuses a save ("" to allow
+// it): read is the ETag the edited copy was read at, current the one the
+// object has now. No ETag on the read is not "unchanged" — it is a version
+// that cannot be confirmed, and the guard fails closed on those.
+func editGuardRefusal(read, current string) string {
+	switch {
+	case read == "":
+		return "cannot be confirmed unchanged on the server (it was read without an ETag)"
+	case current != read:
+		return "changed on the server while you were editing"
+	}
+	return ""
+}
+
 // editorCommand resolves the editor to launch: $EDITOR, then $VISUAL, then vi.
 // The value may carry arguments ("emacs -nw"), so it is split into fields.
 func editorCommand(getenv func(string) string) (name string, args []string, err error) {
@@ -190,10 +204,9 @@ func (c *Controller) EditObject() {
 				"could not confirm %s is unchanged on the server (%v); your version is kept at %s", key, headErr, tmpPath))
 			return
 		}
-		if content.ETag != "" && cur != content.ETag {
+		if reason := editGuardRefusal(content.ETag, cur); reason != "" {
 			keepTemp = true
-			c.error("Edit: not saved", fmt.Errorf(
-				"%s changed on the server while you were editing; your version is kept at %s", key, tmpPath))
+			c.error("Edit: not saved", fmt.Errorf("%s %s; your version is kept at %s", key, reason, tmpPath))
 			return
 		}
 

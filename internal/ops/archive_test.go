@@ -294,6 +294,12 @@ func TestArchiveEntryName(t *testing.T) {
 		{"data/", "data/../../etc/passwd", "", true},
 		{"data/", "data/", "", true},
 		{"other/", "data/k", "data/k", false},
+		// Windows extractors treat \ as a separator and C: as a root.
+		{"", `..\..\evil.txt`, "", true},
+		{"", `a\b.txt`, "a/b.txt", false},
+		{"", `C:\Windows\x`, "", true},
+		{"", "C:/Windows/x", "", true},
+		{"", "dir/C:/x", "dir/C:/x", false},
 	}
 	for _, c := range cases {
 		got, err := ArchiveEntryName(c.prefix, c.key)

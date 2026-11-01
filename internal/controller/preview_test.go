@@ -187,3 +187,19 @@ func TestTitlesEscapeTheirData(t *testing.T) {
 		}
 	}
 }
+
+// A diff header names the object and the local file verbatim. A key may hold
+// a newline and a colour tag; neither may forge a line under the header.
+func TestUnifiedDiffHeaderCannotForgeALine(t *testing.T) {
+	out, err := unifiedDiff("a\n", "b\n", "s3://b/x\n[green]+ fake", "/tmp/[red]y")
+	if err != nil {
+		t.Fatal(err)
+	}
+	header := strings.SplitN(out, "\n", 3)
+	if !strings.Contains(header[0], "x?[green[]+ fake") || !strings.Contains(header[1], "/tmp/[red[]y") {
+		t.Errorf("header not escaped onto two lines:\n%q\n%q", header[0], header[1])
+	}
+	if strings.Count(out, "+ fake") != 1 {
+		t.Errorf("the label produced a line of its own:\n%s", out)
+	}
+}

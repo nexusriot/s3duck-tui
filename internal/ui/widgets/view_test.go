@@ -242,3 +242,66 @@ func renderScreen(t *testing.T, screen tcell.SimulationScreen) string {
 	}
 	return b.String()
 }
+
+// The header's identity is literal text: bracketed markers and profile names
+// must not be read as colour tags.
+func TestIdentityIsNotParsedAsTags(t *testing.T) {
+	screen := tcell.NewSimulationScreen("UTF-8")
+	if err := screen.Init(); err != nil {
+		t.Fatalf("init simulation screen: %v", err)
+	}
+	defer screen.Fini()
+	screen.SetSize(120, 6)
+
+	v := NewView()
+	v.SetIdentity(" [red]prod @ aws  [ANONYMOUS] ", false)
+	v.Frame.SetRect(0, 0, 120, 6)
+	v.Frame.Draw(screen)
+	screen.Show()
+
+	got := renderScreen(t, screen)
+	if !strings.Contains(got, "[red]prod @ aws  [ANONYMOUS]") {
+		t.Errorf("identity rendered as:\n%s", got)
+	}
+}
+
+// Error and success modals show object keys verbatim — a bracketed segment
+// is part of the key, not a colour tag. (The clipboard fallbacks show a URI
+// for the user to copy by hand, so a swallowed segment names another key.)
+func TestMessageModalsShowBracketsLiterally(t *testing.T) {
+	for name, m := range map[string]*tview.Modal{
+		"error":   (&View{}).NewErrorMessageQ("Clipboard unavailable", "s3://b/logs/[draft]/x.txt"),
+		"success": (&View{}).NewSuccessMessageQ("Copied s3://b/logs/[draft]/x.txt"),
+	} {
+		screen := tcell.NewSimulationScreen("UTF-8")
+		if err := screen.Init(); err != nil {
+			t.Fatal(err)
+		}
+		screen.SetSize(100, 12)
+		m.SetRect(0, 0, 100, 12)
+		m.Draw(screen)
+		screen.Show()
+		if got := renderScreen(t, screen); !strings.Contains(got, "logs/[draft]/x.txt") {
+			t.Errorf("%s modal rendered:\n%s", name, got)
+		}
+		screen.Fini()
+	}
+}
+
+// The status field carries notices that name objects; brackets in one are text.
+func TestStatusIsNotParsedAsTags(t *testing.T) {
+	screen := tcell.NewSimulationScreen("UTF-8")
+	if err := screen.Init(); err != nil {
+		t.Fatal(err)
+	}
+	defer screen.Fini()
+	screen.SetSize(120, 6)
+	v := NewView()
+	v.SetStatus(" ✓ restored: [draft].csv ")
+	v.Frame.SetRect(0, 0, 120, 6)
+	v.Frame.Draw(screen)
+	screen.Show()
+	if got := renderScreen(t, screen); !strings.Contains(got, "restored: [draft].csv") {
+		t.Errorf("status rendered as:\n%s", got)
+	}
+}

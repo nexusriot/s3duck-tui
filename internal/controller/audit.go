@@ -2,6 +2,8 @@ package controller
 
 import (
 	"fmt"
+	cfg "github.com/nexusriot/s3duck-tui/internal/config"
+	"github.com/nexusriot/s3duck-tui/internal/session"
 	"os"
 	"path/filepath"
 	"strings"
@@ -83,35 +85,59 @@ func (c *Controller) auditProfile() string {
 	return c.activeConfig.Name
 }
 
-// rememberLocation records where this profile is browsing, so reopening it
-// lands here. Kept in memory and written out with the rest of the config when
-// the app exits or the profile is closed — one config rewrite per navigation
-// would mean rewriting a file full of credentials dozens of times a minute.
+// rememberLocation records where each pane's profile is browsing, so
+// reopening a profile lands there. With both panes on one profile the active
+// pane's location wins — it is recorded last. Kept in memory and written out
+// with the rest of the config when the app exits or the profile is closed —
+// one config rewrite per navigation would mean rewriting a file full of
+// credentials dozens of times a minute.
 func (c *Controller) rememberLocation() {
-	if c.activeConfig == nil || c.localMode() {
-		return
+	if c.dual {
+		c.rememberPane(c.other())
 	}
-	if c.pane().Bucket() == nil || c.pane().Bucket().Key == nil {
-		c.activeConfig.LastBucket = ""
-		c.activeConfig.LastPrefix = ""
-		return
-	}
-	c.activeConfig.LastBucket = *c.pane().Bucket().Key
-	c.activeConfig.LastPrefix = c.pane().Path()
+	c.rememberPane(c.pane())
 }
 
-// persistProfiles saves the location rememberLocation recorded for the open
-// profile. Only those two fields of that one profile are written (see
+// rememberPane records p's location on p's own profile. A local pane, or one
+// with no profile, records nothing (its profile keeps its previous location).
+func (c *Controller) rememberPane(p *session.Pane) {
+	conf := p.Conn().Profile
+	if conf == nil && p == c.pane() {
+		conf = c.activeConfig
+	}
+	if conf == nil || p.IsLocal() {
+		return
+	}
+	loc := p.Loc()
+	if loc.Bucket == nil || loc.Bucket.Key == nil {
+		conf.LastBucket, conf.LastPrefix = "", ""
+		return
+	}
+	conf.LastBucket, conf.LastPrefix = *loc.Bucket.Key, loc.Path
+}
+
+// persistProfiles saves the locations rememberLocation recorded — for every
+// profile a pane is on. Only those two fields of each are written (see
 // config.SaveLocation): this runs on its own, at startup, on Ctrl+P and on
 // exit, so it must never rewrite the whole list. Failures are logged, not
 // shown: the user is usually on their way out when this runs.
 func (c *Controller) persistProfiles() {
-	if c.params == nil || c.activeConfig == nil {
+	if c.params == nil {
 		return
 	}
-	conf := c.activeConfig
-	if err := c.params.SaveLocation(conf.Name, conf.LastBucket, conf.LastPrefix); err != nil {
-		c.logActivity("could not save the last location: %v", err)
+	seen := map[*cfg.Config]bool{}
+	confs := []*cfg.Config{c.activeConfig}
+	for _, p := range c.panes {
+		confs = append(confs, p.Conn().Profile)
+	}
+	for _, conf := range confs {
+		if conf == nil || seen[conf] {
+			continue
+		}
+		seen[conf] = true
+		if err := c.params.SaveLocation(conf.Name, conf.LastBucket, conf.LastPrefix); err != nil {
+			c.logActivity("could not save the last location: %v", err)
+		}
 	}
 }
 

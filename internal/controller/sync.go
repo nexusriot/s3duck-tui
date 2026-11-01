@@ -238,7 +238,10 @@ type syncSpec struct {
 	srcPrefix string
 	dstBucket *model.Object
 	dstPrefix string
-	del       bool
+	// dstModel reads the destination when it is not on the source's client
+	// (the pane comparison across profiles); nil means the same client.
+	dstModel *model.Model
+	del      bool
 	// checksum asks for content comparison instead of size+mtime. It costs a
 	// request per remote object and a full read per local one, which is why
 	// it is a choice and not the default.
@@ -470,7 +473,13 @@ func (c *Controller) collectSides(ctx context.Context, mdl *model.Model, spec sy
 		if src, err = mdl.ListRemoteEntries(ctx, spec.srcPrefix, spec.srcBucket); err != nil {
 			return nil, nil, err
 		}
-		dst, err = mdl.ListRemoteEntries(ctx, spec.dstPrefix, spec.dstBucket)
+		// The destination through its own client when it has one: a pane
+		// comparison across profiles reads each side from its own account.
+		dstM := mdl
+		if spec.dstModel != nil {
+			dstM = spec.dstModel
+		}
+		dst, err = dstM.ListRemoteEntries(ctx, spec.dstPrefix, spec.dstBucket)
 	}
 	if err != nil {
 		return nil, nil, err
@@ -944,7 +953,11 @@ func (c *Controller) ComparePanes() {
 
 	left := syncSpec{dir: syncRemote,
 		srcBucket: here.Bucket, srcPrefix: model.NormalizePrefix(here.Path),
-		dstBucket: there.Bucket, dstPrefix: model.NormalizePrefix(there.Path)}
+		dstBucket: there.Bucket, dstPrefix: model.NormalizePrefix(there.Path),
+		// Each side through its own pane's client: the panes may be on
+		// different profiles, and the same bucket name means a different
+		// bucket on each.
+		dstModel: c.clientFor(c.other())}
 
 	wait, _, ctx, cancel := c.cancellableWait("Comparing both panes...")
 

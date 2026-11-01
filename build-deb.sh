@@ -7,7 +7,7 @@
 # the script still exited 0.
 set -euo pipefail
 
-version=0.11.0
+version=0.14.0
 arch="${1:-amd64}"
 
 # Every path below is relative to the repository, wherever this is run from.

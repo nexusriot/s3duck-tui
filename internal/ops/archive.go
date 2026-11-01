@@ -94,6 +94,11 @@ func ArchiveEntryName(prefix, key string) (string, error) {
 	if p := model.NormalizePrefix(prefix); p != "" && strings.HasPrefix(key, p) {
 		rel = strings.TrimPrefix(key, p)
 	}
+	// A backslash is an ordinary key character to S3 but a separator to
+	// Windows extractors, so "..\\..\\evil.txt" was stored verbatim and
+	// climbed out of the extraction folder there. Both are separators here,
+	// and a leading drive ("C:") is refused for the same reason.
+	rel = strings.ReplaceAll(rel, "\\", "/")
 	dir := strings.HasSuffix(rel, "/")
 	var segs []string
 	for _, s := range strings.Split(rel, "/") {
@@ -102,6 +107,9 @@ func ArchiveEntryName(prefix, key string) (string, error) {
 			continue
 		case "..":
 			return "", fmt.Errorf("object key %q would extract outside the archive root", key)
+		}
+		if len(segs) == 0 && len(s) == 2 && s[1] == ':' {
+			return "", fmt.Errorf("object key %q starts with a drive name, which would extract outside the archive root on Windows", key)
 		}
 		segs = append(segs, s)
 	}

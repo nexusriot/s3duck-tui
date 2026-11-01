@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	s3t "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/dustin/go-humanize"
 	"github.com/gdamore/tcell/v2"
@@ -42,6 +43,24 @@ func (g dupGroup) wasted() int64 {
 		return 0
 	}
 	return int64(len(g.Members)-1) * g.Size
+}
+
+// withoutTrash drops the safe-delete trash from a duplicate scan, as sync
+// drops it from both sides. A trashed copy is not a copy that "remains": with
+// it counted, deleting the live object said "1 other copy remains", and the
+// next Empty Trash lost the content outright. Scanning from inside the trash
+// keeps everything — that is what the user asked to look at.
+func withoutTrash(objs []s3t.Object, prefix, trash string) []s3t.Object {
+	if trash == "" || strings.HasPrefix(prefix, trash) {
+		return objs
+	}
+	out := objs[:0:0]
+	for _, o := range objs {
+		if !isTrashed(trash, aws.ToString(o.Key)) {
+			out = append(out, o)
+		}
+	}
+	return out
 }
 
 // findDuplicates groups a recursive listing by (size, ETag) and keeps only the
@@ -202,6 +221,7 @@ func (c *Controller) FindDuplicates() {
 	bucket := c.pane().Bucket()
 	prefix := model.NormalizePrefix(c.pane().Path())
 	mdl := c.model
+	trash := c.trashPrefix()
 
 	wait, scanning, ctx, cancel := c.cancellableWait("Scanning for duplicates...")
 
@@ -223,7 +243,7 @@ func (c *Controller) FindDuplicates() {
 			}
 			return
 		}
-		groups := findDuplicates(objs)
+		groups := findDuplicates(withoutTrash(objs, prefix, trash))
 
 		c.shell.Do(func() {
 			wait.Close()
