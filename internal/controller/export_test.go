@@ -116,3 +116,26 @@ func TestExportNameAndFileName(t *testing.T) {
 		t.Errorf("exportFileName = %q", got)
 	}
 }
+
+func TestExportAnonymousProfile(t *testing.T) {
+	p := &cfg.Config{Name: "open data", BaseUrl: "https://s3.amazonaws.com", Anonymous: true,
+		AccessKey: "AKIASHOULDNOTAPPEAR", PublicBuckets: []string{"noaa-ghcn-pds"}}
+	aws := exportProfile(p, exportAWS)
+	if !strings.Contains(aws, "--no-sign-request") || !strings.Contains(aws, "s3://noaa-ghcn-pds/") {
+		t.Errorf("aws export:\n%s", aws)
+	}
+	if strings.Contains(aws, "aws_access_key_id") || strings.Contains(aws, "AKIASHOULDNOTAPPEAR") {
+		t.Errorf("anonymous aws export carries credentials:\n%s", aws)
+	}
+	mc := exportProfile(p, exportMC)
+	if !strings.Contains(mc, "'' ''") || strings.Contains(mc, "AKIASHOULDNOTAPPEAR") {
+		t.Errorf("mc export:\n%s", mc)
+	}
+	rc := exportProfile(p, exportRclone)
+	if strings.Contains(rc, "access_key_id") || !strings.Contains(rc, "env_auth = false") {
+		t.Errorf("rclone export:\n%s", rc)
+	}
+	if got := anonymousExampleBucket(&cfg.Config{}); got != "BUCKET" {
+		t.Errorf("example bucket with none named = %q", got)
+	}
+}

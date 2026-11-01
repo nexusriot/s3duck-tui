@@ -24,6 +24,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3t "github.com/aws/aws-sdk-go-v2/service/s3/types"
 
+	"fmt"
+
 	"github.com/nexusriot/s3duck-tui/internal/model"
 )
 
@@ -644,5 +646,50 @@ func TestIntegrationRestoreObjectGuards(t *testing.T) {
 	// than silently succeeding.
 	if err := m.RestoreObject(ctx, bucket, "archived.bin", 1, ""); err == nil {
 		t.Log("endpoint accepted a restore of a non-archived object; nothing more to assert")
+	}
+}
+
+func TestIntegrationListStreamPagesIncrementally(t *testing.T) {
+	// The incremental listing's contract: pages arrive one at a time with a
+	// running total, and returning false stops the paging. Asserted against a
+	// server because the paginator is the thing being driven.
+	m := testModel(t)
+	ctx := context.Background()
+	bucket := freshBucket(t, m, "s3duck-it-liststream")
+
+	for i := 0; i < 12; i++ {
+		putObject(t, m, bucket, fmt.Sprintf("k%02d.txt", i), "x")
+	}
+
+	pages, seen := 0, 0
+	if err := m.ListObjectsStream(ctx, "", bucket, func(page []s3t.Object, total int) bool {
+		pages++
+		seen = total
+		return true
+	}); err != nil {
+		t.Fatalf("ListObjectsStream: %v", err)
+	}
+	if pages == 0 || seen != 12 {
+		t.Errorf("pages = %d, total = %d, want at least one page holding 12 keys", pages, seen)
+	}
+
+	// Stopping early must not keep paging: with one page requested, exactly
+	// one callback happens.
+	calls := 0
+	if err := m.ListObjectsStream(ctx, "", bucket, func([]s3t.Object, int) bool {
+		calls++
+		return false
+	}); err != nil {
+		t.Fatalf("ListObjectsStream (early stop): %v", err)
+	}
+	if calls != 1 {
+		t.Errorf("callback ran %d times after asking to stop, want 1", calls)
+	}
+
+	// A cancelled context stops the listing rather than running to the end.
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := m.ListObjectsStream(cancelled, "", bucket, func([]s3t.Object, int) bool { return true }); err == nil {
+		t.Error("a cancelled listing should report the cancellation")
 	}
 }

@@ -47,7 +47,7 @@ Three suites, split by what they can actually establish.
 
 That second half is new and is the point of `internal/ops`. An operation depends only on narrow interfaces declared by the consumer — `Fetcher`, `Pusher` (whose one method is `UploadTargets`), `Checker`, `FS` and `Gate` in `internal/ops/ports.go`, `Mover` beside its only user in `internal/ops/copy.go` — and `*model.Model` satisfies them directly. A fake therefore implements a handful of methods rather than sixty: the shared doubles — fetcher, checker, in-memory filesystem, gate and scripted reporter — are one ~240-line file (`internal/ops/fake_test.go`), with the mover and pusher fakes beside the tests that use them, and the decisions that matter run against it in milliseconds: a download's two-phase resolve, its overwrite answers, the worker pool (including that a configured width is the width actually used), cancellation draining, verification accounting and the retry set; a copy's item-versus-object accounting, that a skipped file is neither done nor recorded as moved, and the skip set it hands the undo; an upload sending exactly its target list; that a cancel mid-run is reported as a cancel rather than as failures; and — the one with the sharpest failure mode — sync's writes-then-deletes barrier, including that a failed write cancels the delete phase and says why. Those are the branches that used to be reachable only by driving the real TUI against a live endpoint, which is to say the ones most likely to be wrong were the least tested.
 
-**Integration tests** (build tag `integration`) run against a live S3-compatible endpoint, in seven files. For the calls the model makes: `internal/model/integration_test.go`, `integration_new_test.go`, `integration_browse_test.go`, `integration_archive_test.go` (the archive operation and the `OpenObject` port it streams through) and `integration_corner_test.go` (the key shapes and mid-run changes a fake store cannot produce). For the flows the controller composes from them: `internal/controller/integration_test.go` (sync in both directions, the exclude guard, safe delete's trash round trip) and `integration_corner_test.go` (the preview formatter, the restore tracker and the bucket dashboard against what a server really sends). They exist because the most important properties of this code are unobservable without a server:
+**Integration tests** (build tag `integration`) run against a live S3-compatible endpoint, in `integration*_test.go` files named for what they cover. For the calls the model makes, in `internal/model/`: `integration_test.go` (the shared setup and the core transfer, versioning and copy paths), `integration_write_test.go` (content type, SSE and the exact upload target list), `integration_checksum_test.go`, `integration_copy_test.go`, `integration_content_test.go`, `integration_versions_test.go`, `integration_browse_test.go`, `integration_archive_test.go` (the archive operation, the `OpenObject` port it streams through, and the key shapes and mid-run changes a fake store cannot produce), plus `integration_purge_test.go` and `integration_resume_test.go`. For the flows the controller composes from them, in `internal/controller/`: `integration_test.go` (sync in both directions, the exclude guard, safe delete's trash round trip) and `integration_preview_test.go`, `integration_restores_test.go`, `integration_bucketconfig_test.go` and `integration_difflocal_test.go` (the preview formatter, the restore tracker, the bucket dashboard and the local diff against what a server really sends). They exist because the most important properties of this code are unobservable without a server:
 
 - a version restore *adds* a version rather than rewinding the history
 - a `DeleteVersion` leaves no delete marker, while an ordinary delete does
@@ -76,8 +76,9 @@ They skip entirely without `S3DUCK_TEST_ENDPOINT`, so a tagged run on a machine 
 
 The scenarios are chosen by where a dialog's answer decides what happens to data — the seams the 2026-10 review found its worst bugs in: undo after *Skip existing* (file and folder), the local pane's upload of a highlighted or marked file, a config that fails to parse, a folder delete beside a same-stem sibling, and a delete-extraneous sync on a safe-delete profile with an exclude. Each data scenario was run against a binary built from the commit before its fix (`S3DUCK_E2E_BINARY`) and fails there with a statement about the bucket ("`src/a.txt` holds DST-A, want SRC-A"), not a timeout.
 
-`e2e/features_test.go` and `e2e/corner_test.go` extend the same method to the
-2026-10-22 round: each new feature through its real keys, then the inputs that
+The feature files (`e2e/preview_test.go`, `marks_test.go`, `archive_test.go`,
+`diff_test.go`, `bucketconfig_test.go`, `restores_test.go`, `profiles_test.go`)
+extend the same method: each feature through its real keys, then the inputs that
 make a dialog say something rather than do something — a pattern matching
 nothing, a regex that does not compile, a file name that is really a path, a
 zero-byte object, and a key or profile name that looks like a colour tag. That
@@ -85,13 +86,14 @@ last pair is what found the escaping bug below, and it found it through the
 harness itself: the cursor is located through the details panel's `FullPath`
 line, so a key the panel was swallowing could not be reached at all.
 
-`e2e/quickwins_test.go` does the same for the 0.12.0 round, and ends each
-scenario at the far side of the feature rather than at the screen: a `PUT`
+`e2e/links_test.go`, `profiles_test.go`, `bucketconfig_test.go` and
+`transfers_test.go` end each scenario at the far side of the feature rather
+than at the screen: a `PUT`
 and a `GET` with no credentials through the links the app made, the bucket's
 versioning status read back, the options form's result read back from
 `config.json`, and the notification as the bytes the app wrote — a stand-in
 `notify-send` recording its argv, and `tmux pipe-pane -O` capturing the raw
-OSC 777 passthrough before tmux interprets it. Its `startTUIWith` passes the
+OSC 777 passthrough before tmux interprets it. The harness's `startTUIWith` passes the
 binary extra environment (an empty `DISPLAY`, so a run on a desktop host never
 touches the real clipboard and the app shows what it would have copied) and
 command-line arguments.

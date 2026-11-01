@@ -1066,3 +1066,17 @@ func TestIntegrationConflicts(t *testing.T) {
 		}
 	})
 }
+
+// testModelWithWrites builds a model whose profile carries write options, the
+// way opening a configured profile would.
+func testModelWithWrites(t *testing.T, w model.WriteOptions) *model.Model {
+	t.Helper()
+	endpoint, region, access, secret := testCreds(t)
+	cf := model.NewConfig(endpoint, &region, access, secret, "", true, 0)
+	cf.Write = w
+	m, err := model.NewModel(cf)
+	if err != nil {
+		t.Fatalf("NewModel: %v", err)
+	}
+	return m
+}

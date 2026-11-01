@@ -556,3 +556,17 @@ func readFile(t *testing.T, path string) (string, bool) {
 	}
 	return string(b), true
 }
+
+// noClipboard keeps a run on a desktop host off the user's real clipboard:
+// with no display the copy fails and the app shows the text instead, which
+// is what the scenarios read anyway.
+var noClipboard = []string{"DISPLAY=", "WAYLAND_DISPLAY="}
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}

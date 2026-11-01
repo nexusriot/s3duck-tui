@@ -68,3 +68,40 @@ func TestSystemTagsAreFound(t *testing.T) {
 		t.Errorf("systemTags = %v, want both aws: keys whatever their case", got)
 	}
 }
+
+func TestVersioningChange(t *testing.T) {
+	tests := []struct {
+		name       string
+		item       model.ConfigItem
+		wantEnable bool
+		wantPrompt string
+		wantErr    string
+	}{
+		{"never enabled", model.ConfigItem{State: model.ConfigUnset, Value: "off"}, true, "cannot be turned off", ""},
+		{"enabled", model.ConfigItem{State: model.ConfigSet, Value: "Enabled"}, false, "Suspend", ""},
+		{"suspended", model.ConfigItem{State: model.ConfigSet, Value: "Suspended"}, true, "Re-enable", ""},
+		{"mfa delete", model.ConfigItem{State: model.ConfigSet, Value: "Enabled, MFA delete on"}, false, "", "MFA"},
+		// Suspending a bucket whose state we merely failed to read is the
+		// dangerous guess; it is refused, as is every unreadable state.
+		{"denied", model.ConfigItem{State: model.ConfigDenied}, false, "", "access denied"},
+		{"unsupported", model.ConfigItem{State: model.ConfigUnsupported}, false, "", "not supported"},
+		{"error", model.ConfigItem{State: model.ConfigError, Err: errors.New("boom")}, false, "", "could not be read"},
+		{"odd value", model.ConfigItem{State: model.ConfigSet, Value: "Weird"}, false, "", "unrecognised"},
+	}
+	for _, tt := range tests {
+		enable, prompt, err := versioningChange("b", tt.item)
+		if tt.wantErr != "" {
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("%s: err = %v, want one mentioning %q", tt.name, err, tt.wantErr)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: unexpected error %v", tt.name, err)
+			continue
+		}
+		if enable != tt.wantEnable || !strings.Contains(prompt, tt.wantPrompt) {
+			t.Errorf("%s: = (%v, %q), want (%v, …%q…)", tt.name, enable, prompt, tt.wantEnable, tt.wantPrompt)
+		}
+	}
+}

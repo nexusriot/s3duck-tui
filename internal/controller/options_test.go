@@ -206,3 +206,44 @@ func TestTrashRoundTripKeepsALeadingSlash(t *testing.T) {
 		t.Errorf("restoreKeyFrom(%q) = %q, want /abs/file", key, got)
 	}
 }
+
+func TestAnonymousOptionsRoundTrip(t *testing.T) {
+	p := &cfg.Config{Name: "pub"}
+	o := optionsFromConfig(p)
+	o.Anonymous = true
+	o.PublicBuckets = " open-data, noaa ,,open-data;\nlandsat "
+	if err := validateProfileOptions(o); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	applyOptionsToConfig(p, o)
+	if !p.Anonymous {
+		t.Error("Anonymous not stored")
+	}
+	if got := strings.Join(p.PublicBuckets, ","); got != "open-data,noaa,landsat" {
+		t.Errorf("PublicBuckets = %v", p.PublicBuckets)
+	}
+	if back := optionsFromConfig(p); back.PublicBuckets != "open-data, noaa, landsat" || !back.Anonymous {
+		t.Errorf("form shows %+v", back)
+	}
+	if !strings.Contains(optionsSummary(p), "anonymous") {
+		t.Errorf("summary = %q", optionsSummary(p))
+	}
+	if !strings.Contains(identityLabel(p), "[ANONYMOUS]") {
+		t.Errorf("identity = %q", identityLabel(p))
+	}
+}
+
+func TestAnonymousOptionsValidation(t *testing.T) {
+	both := widgets.ProfileOptions{Anonymous: true, AWSProfile: "sso"}
+	if err := validateProfileOptions(both); err == nil {
+		t.Error("anonymous + AWS profile accepted")
+	}
+	spaced := widgets.ProfileOptions{Anonymous: true, PublicBuckets: "my bucket"}
+	if err := validateProfileOptions(spaced); err == nil || !strings.Contains(err.Error(), "commas") {
+		t.Errorf("space-separated names: err = %v", err)
+	}
+	slashed := widgets.ProfileOptions{Anonymous: true, PublicBuckets: "b/prefix"}
+	if err := validateProfileOptions(slashed); err == nil {
+		t.Error("a bucket with a path accepted")
+	}
+}
